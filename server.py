@@ -1,20 +1,52 @@
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-from tools.link import evaluate_link
+from client.fastapi_client import FastAPIClient
+from tools.session import register_session_tools
+from tools.link import register_link_tools
+
+
+# ============================================================
+# Configuração
+# ============================================================
+
+FASTAPI_URL = "http://localhost:8080"
+MCP_HOST = "0.0.0.0"
+MCP_PORT = 8010
 
 
 # ============================================================
 # MCP Server
 # ============================================================
 
-mcp = FastMCP("PlanApp")
+mcp = MCPServer(
+    name="PlanApp",
+    version="1.0.0",
+)
 
 
 # ============================================================
-# Register tools
+# Cliente FastAPI
 # ============================================================
 
-mcp.tool()(evaluate_link)
+client = FastAPIClient(
+    base_url=FASTAPI_URL,
+    timeout=120,
+)
+
+
+# ============================================================
+# Registro das ferramentas
+# ============================================================
+
+register_session_tools(
+    mcp,
+    client,
+)
+
+register_link_tools(
+    mcp,
+    client,
+)
 
 
 # ============================================================
@@ -22,4 +54,9 @@ mcp.tool()(evaluate_link)
 # ============================================================
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(
+        transport="streamable-http",
+        host=MCP_HOST,
+        port=MCP_PORT,
+    )
+

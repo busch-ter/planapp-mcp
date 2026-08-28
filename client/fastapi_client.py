@@ -3,34 +3,47 @@ import requests
 
 class FastAPIClient:
     """
-    Cliente HTTP para o backend FastAPI do PlanApp.
+    Cliente HTTP para comunicação com o backend FastAPI do PlanApp.
 
-    O register() é executado uma única vez por sessão.
-    Depois disso, user_id e token são reutilizados nas
-    chamadas ao backend.
+    O usuário é registrado uma vez através de register().
+    O user_id e o token retornados pelo backend são mantidos
+    na instância e reutilizados nas chamadas seguintes.
     """
 
-    def __init__(self, base_url="http://localhost:8080", timeout=120):
+    def __init__(
+        self,
+        base_url="http://localhost:8080",
+        timeout=120,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
         self.user_id = None
         self.token = None
 
-    # ---------------------------------------------------------
-    # Session
-    # ---------------------------------------------------------
+    # ========================================================
+    # Registro
+    # ========================================================
 
     def register(self, user_id):
         """
-        Registra o usuário no backend e cria/recupera a sessão.
+        Registra o usuário no backend do PlanApp.
 
-        Retorna o user_id e token fornecidos pelo PlanApp.
+        Endpoint:
+            POST /register?user_id=<user_id>
+
+        O backend retorna:
+            user_id
+            token
+
+        Esses valores ficam armazenados na instância.
         """
 
         response = requests.post(
             f"{self.base_url}/register",
-            params={"user_id": user_id},
+            params={
+                "user_id": user_id,
+            },
             timeout=self.timeout,
         )
 
@@ -40,12 +53,12 @@ class FastAPIClient:
 
         if "user_id" not in data:
             raise RuntimeError(
-                f"Resposta de /register não contém user_id: {data}"
+                f"Resposta de /register sem user_id: {data}"
             )
 
         if "token" not in data:
             raise RuntimeError(
-                f"Resposta de /register não contém token: {data}"
+                f"Resposta de /register sem token: {data}"
             )
 
         self.user_id = data["user_id"]
@@ -53,9 +66,9 @@ class FastAPIClient:
 
         return data
 
-    # ---------------------------------------------------------
-    # Internal HTTP
-    # ---------------------------------------------------------
+    # ========================================================
+    # HTTP interno
+    # ========================================================
 
     def _request(
         self,
@@ -67,29 +80,35 @@ class FastAPIClient:
         """
         Executa uma chamada autenticada ao backend.
 
-        As chamadas, após register(), são feitas como:
+        Depois do register(), a URL segue o padrão:
 
             /{user_id}/{route}
 
-        com:
+        e o token é enviado através de:
 
             X-Token: <token>
         """
 
         if not self.user_id or not self.token:
             raise RuntimeError(
-                "Cliente não registrado. Execute register(user_id) primeiro."
+                "Usuário não registrado. "
+                "Execute register(user_id) primeiro."
             )
 
-        url = f"{self.base_url}/{self.user_id}/{route.lstrip('/')}"
+        url = (
+            f"{self.base_url}/"
+            f"{self.user_id}/"
+            f"{route.lstrip('/')}"
+        )
 
         headers = {
-            "X-Token": self.token
+            "X-Token": self.token,
         }
 
         method = method.lower()
 
         if method == "post":
+
             response = requests.post(
                 url,
                 params=params,
@@ -99,6 +118,7 @@ class FastAPIClient:
             )
 
         elif method == "get":
+
             response = requests.get(
                 url,
                 params=params,
@@ -107,15 +127,17 @@ class FastAPIClient:
             )
 
         else:
-            raise ValueError(f"Método HTTP não suportado: {method}")
+            raise ValueError(
+                f"Método HTTP não suportado: {method}"
+            )
 
         response.raise_for_status()
 
         return response.json()
 
-    # ---------------------------------------------------------
-    # PlanApp operations
-    # ---------------------------------------------------------
+    # ========================================================
+    # PlanApp - set_link
+    # ========================================================
 
     def set_link(
         self,
@@ -157,10 +179,13 @@ class FastAPIClient:
             params=params,
         )
 
+    # ========================================================
+    # PlanApp - prepare_profiles
+    # ========================================================
+
     def prepare_profiles(self):
         """
-        Prepara DTM, DSM, LULC e demais informações necessárias
-        para avaliação do enlace.
+        Prepara os perfis necessários para a análise do enlace.
         """
 
         return self._request(
@@ -168,9 +193,14 @@ class FastAPIClient:
             method="post",
         )
 
+    # ========================================================
+    # PlanApp - link_features
+    # ========================================================
+
     def link_features(self):
         """
-        Executa a avaliação do enlace e retorna os link_features.
+        Executa a avaliação do enlace e retorna os
+        link_features calculados pelo PlanApp.
         """
 
         return self._request(
