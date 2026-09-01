@@ -9,7 +9,7 @@ from tools.link import register_link_tools
 # Configuração
 # ============================================================
 
-FASTAPI_URL = "http://localhost:8080"
+FASTAPI_URL = "http://features-link-v2:8080"
 MCP_HOST = "0.0.0.0"
 MCP_PORT = 8010
 
