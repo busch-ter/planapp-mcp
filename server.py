@@ -3,7 +3,7 @@ from mcp.server.mcpserver import MCPServer
 from client.fastapi_client import FastAPIClient
 from tools.session import register_session_tools
 from tools.link import register_link_tools
-
+from tools.geocode import register_geocode_tools
 
 # ============================================================
 # Configuração
@@ -48,6 +48,9 @@ register_link_tools(
     client,
 )
 
+register_geocode_tools(
+    mcp
+)
 
 # ============================================================
 # Entry point
