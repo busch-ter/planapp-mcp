@@ -1,20 +1,19 @@
 # ============================================================
 # agent_jupyter.py
-# PlanApp AI Agent
-# Jupyter + Ollama/Qwen3 + PlanApp MCP
+# PlanApp Agent
 #
-# VERSÃO:
-# - MCP Streamable HTTP
-# - ClientSession com AsyncExitStack
-# - Ollama via httpx.AsyncClient
-# - progresso assíncrono para atualização da UI
-# - log técnico separado do progresso visual
+# Jupyter
+#   ↓
+# Ollama / Qwen
+#   ↓
+# MCP
+#   ↓
+# PlanApp
 # ============================================================
 
 import asyncio
 import json
 from contextlib import AsyncExitStack
-from typing import Any, Optional
 
 import httpx
 
@@ -31,13 +30,13 @@ OLLAMA_MODEL = "qwen3:8b"
 
 MCP_URL = "http://172.17.0.1:8010/mcp"
 
-USER_ID = "agent-jupyter"
+USER_ID = "jupyter-user"
 
-OLLAMA_TIMEOUT = 300
+OLLAMA_TIMEOUT = 300.0
 
-# Mantemos DEBUG ligado para diagnóstico.
-# O log técnico continua sendo armazenado em debug_log.
-DEBUG = True
+# True somente para depuração técnica no terminal/kernel.
+# A interface do Jupyter continua mostrando apenas o log amigável.
+DEBUG = False
 
 
 # ============================================================
@@ -50,444 +49,333 @@ class PlanAppAgent:
 
         self.progress_callback = progress_callback
 
-        self.stack = None
-        self.session = None
+        self.exit_stack = AsyncExitStack()
+
+        self.mcp_session = None
 
         self.tools = []
-        self.tools_ollama = []
+
+        self.ollama_tools = []
+
+        self.messages = []
 
         self.connected = False
 
-        self.history = []
+        self.evaluate_link_executed = False
 
-        # Log técnico completo
-        self.debug_log = []
+        self.geocoded_points = []
 
+        self.current_stage = None
 
-    # ========================================================
-    # LOG TÉCNICO
-    # ========================================================
-
-    def log(self, texto):
-
-        if texto is None:
-            return
-
-        texto = str(texto)
-
-        self.debug_log.append(texto)
-
-        # O print continua disponível para testes diretos
-        # (test_agent), mas não é usado como interface visual.
-        if DEBUG:
-            print(texto)
-
-
-    def clear_log(self):
-
-        self.debug_log = []
-
-
-    def get_log(self):
-
-        return "\n".join(self.debug_log)
-
+        self.tool_execution_count = 0
 
     # ========================================================
-    # PROGRESSO VISUAL — SÍNCRONO
+    # LOG
     # ========================================================
 
-    def progress(self, texto, tipo="processing"):
+    def log(self, message):
 
-        if texto is None:
-            return
+        if self.progress_callback:
 
-        texto = str(texto)
-
-        # IMPORTANTE:
-        # Não colocamos o progresso no debug_log aqui.
-        #
-        # O debug_log é reservado para diagnóstico técnico.
-        # Isso evita duplicação e deixa o log técnico separado
-        # do log visual.
-        #
-        # Entretanto, mantemos print() para compatibilidade
-        # com test_agent() e execução pelo terminal.
+            self.progress_callback(message)
 
         if DEBUG:
-            print(texto)
 
-        if self.progress_callback is not None:
-
-            try:
-
-                self.progress_callback(
-                    texto,
-                    tipo
-                )
-
-            except TypeError:
-
-                # Compatibilidade com callback antigo que
-                # aceita somente texto.
-
-                try:
-
-                    self.progress_callback(
-                        texto
-                    )
-
-                except Exception:
-                    pass
-
-            except Exception:
-                pass
-
+            print(message)
 
     # ========================================================
-    # PROGRESSO VISUAL — ASSÍNCRONO
-    # ========================================================
-
-    async def progress_async(
-        self,
-        texto,
-        tipo="processing"
-    ):
-        """
-        Envia uma mensagem de progresso e devolve
-        temporariamente o controle ao event loop.
-
-        Isso permite que o Jupyter/ipywidgets tenha
-        oportunidade de enviar a atualização para o
-        navegador antes da próxima operação.
-        """
-
-        self.progress(
-            texto,
-            tipo
-        )
-
-        # Pequeno yield para o event loop do Jupyter.
-        await asyncio.sleep(0.05)
-
-
-    # ========================================================
-    # CONNECT
+    # CONEXÃO MCP
     # ========================================================
 
     async def connect(self):
 
-        if self.connected and self.session is not None:
-
+        if self.connected:
             return
-
-
-        await self.progress_async(
-            "🔵 Conectando ao PlanApp MCP...",
-            "processing"
-        )
-
 
         try:
 
             # ------------------------------------------------
-            # EXIT STACK
-            # ------------------------------------------------
-
-            self.stack = AsyncExitStack()
-
-            await self.stack.__aenter__()
-
-
-            # ------------------------------------------------
-            # TRANSPORTE STREAMABLE HTTP
+            # Conecta ao MCP via Streamable HTTP
             # ------------------------------------------------
 
             read_stream, write_stream = (
-                await self.stack.enter_async_context(
-                    streamable_http_client(
-                        MCP_URL
+                await self.exit_stack.enter_async_context(
+                    streamable_http_client(MCP_URL)
+                )
+            )
+
+            self.mcp_session = (
+                await self.exit_stack.enter_async_context(
+                    ClientSession(
+                        read_stream,
+                        write_stream
                     )
                 )
             )
 
+            # ------------------------------------------------
+            # Inicializa sessão MCP
+            # ------------------------------------------------
+
+            await self.mcp_session.initialize()
 
             # ------------------------------------------------
-            # CLIENT SESSION
+            # Descobre ferramentas
             # ------------------------------------------------
 
-            self.session = ClientSession(
-                read_stream,
-                write_stream
+            tools_result = await self.mcp_session.list_tools()
+
+            self.tools = tools_result.tools
+
+            # ------------------------------------------------
+            # Converte ferramentas MCP para formato Ollama
+            # ------------------------------------------------
+
+            self.ollama_tools = (
+                self.build_ollama_tools()
             )
-
-
-            # =================================================
-            # IMPORTANTE
-            #
-            # ClientSession inicia o
-            # JSONRPCDispatcher.run()
-            # dentro de __aenter__().
-            #
-            # Portanto:
-            #
-            # 1. cria ClientSession
-            # 2. entra no contexto
-            # 3. chama initialize()
-            #
-            # Não usar:
-            #
-            # await session.initialize()
-            #
-            # antes de entrar no contexto.
-            # =================================================
-
-            await self.stack.enter_async_context(
-                self.session
-            )
-
-
-            # ------------------------------------------------
-            # INITIALIZE
-            # ------------------------------------------------
-
-            await self.session.initialize()
-
-
-            # ------------------------------------------------
-            # LIST TOOLS
-            # ------------------------------------------------
-
-            result = await self.session.list_tools()
-
-            self.tools = result.tools
-
-            self.tools_ollama = []
-
-
-            # ------------------------------------------------
-            # CONVERTE TOOLS MCP → OLLAMA
-            # ------------------------------------------------
-
-            for tool in self.tools:
-
-                schema = getattr(
-                    tool,
-                    "inputSchema",
-                    None
-                )
-
-
-                # Compatibilidade com versões que usam
-                # input_schema.
-
-                if schema is None:
-
-                    schema = getattr(
-                        tool,
-                        "input_schema",
-                        None
-                    )
-
-
-                if schema is None:
-
-                    schema = {
-                        "type": "object",
-                        "properties": {}
-                    }
-
-
-                description = getattr(
-                    tool,
-                    "description",
-                    None
-                )
-
-
-                if description is None:
-
-                    description = ""
-
-
-                self.tools_ollama.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": description,
-                            "parameters": schema,
-                        },
-                    }
-                )
-
-
-            # ------------------------------------------------
-            # CONECTADO
-            # ------------------------------------------------
 
             self.connected = True
 
-
-            await self.progress_async(
+            self.log(
                 f"🟢 MCP conectado — "
-                f"{len(self.tools)} ferramentas disponíveis.",
-                "success"
+                f"{len(self.tools)} ferramentas disponíveis."
             )
 
+            if DEBUG:
 
-            # ------------------------------------------------
-            # LISTA FERRAMENTAS — LOG TÉCNICO
-            # ------------------------------------------------
+                print()
+                print("========== MCP TOOLS ==========")
 
-            for tool in self.tools:
+                for tool in self.tools:
 
-                self.log(
-                    f"   • {tool.name}"
+                    print(
+                        f"- {tool.name}"
+                    )
+
+                print()
+                print("========== OLLAMA TOOLS ==========")
+
+                print(
+                    json.dumps(
+                        self.ollama_tools,
+                        indent=2,
+                        ensure_ascii=False
+                    )
                 )
-
 
         except Exception as e:
 
-            self.connected = False
-
-
             self.log(
-                "❌ ERRO AO CONECTAR AO MCP:"
+                f"🔴 Erro ao conectar ao MCP: {e}"
             )
-
-            self.log(
-                repr(e)
-            )
-
-
-            # ------------------------------------------------
-            # FECHA STACK SE CONEXÃO FALHOU
-            # ------------------------------------------------
-
-            try:
-
-                if self.stack is not None:
-
-                    await self.stack.__aexit__(
-                        None,
-                        None,
-                        None
-                    )
-
-            except Exception:
-                pass
-
-            finally:
-
-                self.session = None
-                self.stack = None
-
 
             raise
 
+    # ========================================================
+    # CONVERTE MCP → OLLAMA
+    # ========================================================
+
+    def build_ollama_tools(self):
+
+        tools = []
+
+        for tool in self.tools:
+
+            # ------------------------------------------------
+            # Schema de entrada MCP
+            # ------------------------------------------------
+
+            input_schema = getattr(
+                tool,
+                "inputSchema",
+                None
+            )
+
+            # Algumas versões/clientes podem usar
+            # input_schema.
+            if input_schema is None:
+
+                input_schema = getattr(
+                    tool,
+                    "input_schema",
+                    None
+                )
+
+            if input_schema is None:
+
+                input_schema = {
+                    "type": "object",
+                    "properties": {}
+                }
+
+            # ------------------------------------------------
+            # Formato esperado pelo Ollama
+            # ------------------------------------------------
+
+            ollama_tool = {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": (
+                        tool.description or ""
+                    ),
+                    "parameters": input_schema,
+                },
+            }
+
+            tools.append(
+                ollama_tool
+            )
+
+        return tools
 
     # ========================================================
-    # INITIALIZE
-    # ========================================================
-
-    async def initialize(self):
-
-        await self.connect()
-
-
-    # ========================================================
-    # FECHAR
+    # FECHAR MCP
     # ========================================================
 
     async def close(self):
 
-        self.connected = False
-
-
         try:
 
-            if self.stack is not None:
-
-                await self.stack.__aexit__(
-                    None,
-                    None,
-                    None
-                )
-
-
-        except Exception as e:
-
-            self.log(
-                f"⚠️ Erro ao fechar MCP: {repr(e)}"
-            )
-
-
-        finally:
-
-            self.session = None
-            self.stack = None
-
-
-    # ========================================================
-    # RESET
-    # ========================================================
-
-    def reset_history(self):
-
-        self.history = []
-
-        self.clear_log()
-
-
-    # ========================================================
-    # SERIALIZAÇÃO
-    # ========================================================
-
-    def _serialize_json(self, obj):
-
-        try:
-
-            return json.dumps(
-                obj,
-                ensure_ascii=False,
-                indent=2,
-                default=str
-            )
+            await self.exit_stack.aclose()
 
         except Exception:
 
-            return str(obj)
+            pass
 
+        self.connected = False
+
+        self.mcp_session = None
+
+        self.tools = []
+
+        self.ollama_tools = []
 
     # ========================================================
-    # EXTRAIR RESULTADO MCP
+    # RESET DA ANÁLISE
+    # ========================================================
+
+    def reset_state(self):
+
+        self.messages = []
+
+        self.evaluate_link_executed = False
+
+        self.geocoded_points = []
+
+        self.current_stage = None
+
+        self.tool_execution_count = 0
+
+    # ========================================================
+    # TENTA INTERPRETAR JSON
+    # ========================================================
+
+    def try_json(self, value):
+
+        if isinstance(
+            value,
+            (dict, list)
+        ):
+
+            return value
+
+        if not isinstance(
+            value,
+            str
+        ):
+
+            return None
+
+        text = value.strip()
+
+        if not text:
+
+            return None
+
+        # ----------------------------------------------------
+        # JSON direto
+        # ----------------------------------------------------
+
+        try:
+
+            return json.loads(text)
+
+        except Exception:
+
+            pass
+
+        # ----------------------------------------------------
+        # JSON dentro de texto
+        # ----------------------------------------------------
+
+        start = text.find("{")
+
+        end = text.rfind("}")
+
+        if start >= 0 and end > start:
+
+            candidate = text[
+                start:end + 1
+            ]
+
+            try:
+
+                return json.loads(
+                    candidate
+                )
+
+            except Exception:
+
+                pass
+
+        # ----------------------------------------------------
+        # Lista JSON
+        # ----------------------------------------------------
+
+        start = text.find("[")
+
+        end = text.rfind("]")
+
+        if start >= 0 and end > start:
+
+            candidate = text[
+                start:end + 1
+            ]
+
+            try:
+
+                return json.loads(
+                    candidate
+                )
+
+            except Exception:
+
+                pass
+
+        return None
+
+    # ========================================================
+    # EXTRAI RESULTADO DO MCP
     # ========================================================
 
     def extract_mcp_result(self, result):
 
-        partes = []
+        if result is None:
 
+            return None
 
         # ----------------------------------------------------
-        # isError
+        # Dict/list direto
         # ----------------------------------------------------
 
-        is_error = getattr(
+        if isinstance(
             result,
-            "isError",
-            None
-        )
+            (dict, list)
+        ):
 
-
-        if is_error is None:
-
-            is_error = getattr(
-                result,
-                "is_error",
-                False
-            )
-
+            return result
 
         # ----------------------------------------------------
         # structuredContent
@@ -499,27 +387,26 @@ class PlanAppAgent:
             None
         )
 
+        if structured:
 
-        if structured is None:
-
-            structured = getattr(
-                result,
-                "structured_content",
-                None
-            )
-
-
-        if structured is not None:
-
-            partes.append(
-                self._serialize_json(
-                    structured
-                )
-            )
-
+            return structured
 
         # ----------------------------------------------------
-        # content
+        # structured_content
+        # ----------------------------------------------------
+
+        structured = getattr(
+            result,
+            "structured_content",
+            None
+        )
+
+        if structured:
+
+            return structured
+
+        # ----------------------------------------------------
+        # Conteúdo MCP
         # ----------------------------------------------------
 
         content = getattr(
@@ -528,223 +415,734 @@ class PlanAppAgent:
             None
         )
 
+        if content is not None:
 
-        if content:
+            if isinstance(
+                content,
+                list
+            ):
 
-            for item in content:
+                for item in content:
 
-                text = getattr(
-                    item,
-                    "text",
-                    None
-                )
-
-
-                if text:
-
-                    partes.append(
-                        str(text)
+                    # TextContent
+                    text = getattr(
+                        item,
+                        "text",
+                        None
                     )
 
-                    continue
+                    if text is not None:
 
+                        parsed = self.try_json(
+                            text
+                        )
 
-                data = getattr(
-                    item,
-                    "data",
-                    None
+                        if parsed is not None:
+
+                            return parsed
+
+                        return text
+
+                    # Dict
+                    if isinstance(
+                        item,
+                        dict
+                    ):
+
+                        if "text" in item:
+
+                            parsed = self.try_json(
+                                item["text"]
+                            )
+
+                            if parsed is not None:
+
+                                return parsed
+
+                            return item["text"]
+
+                        if "json" in item:
+
+                            return item["json"]
+
+            # Content como string
+            if isinstance(
+                content,
+                str
+            ):
+
+                parsed = self.try_json(
+                    content
                 )
 
+                if parsed is not None:
 
-                if data:
+                    return parsed
 
-                    partes.append(
-                        str(data)
-                    )
-
-                    continue
-
-
-                partes.append(
-                    repr(item)
-                )
-
+                return content
 
         # ----------------------------------------------------
-        # fallback
+        # Fallback text
         # ----------------------------------------------------
 
-        if not partes:
+        text = getattr(
+            result,
+            "text",
+            None
+        )
 
-            partes.append(
-                repr(result)
+        if text is not None:
+
+            parsed = self.try_json(
+                text
             )
 
+            if parsed is not None:
 
-        resultado = "\n".join(
-            partes
-        )
+                return parsed
 
+            return text
 
-        return (
-            resultado,
-            bool(is_error)
-        )
-
+        return result
 
     # ========================================================
-    # RESUMO DO RESULTADO MCP PARA A UI
+    # BUSCA VALOR RECURSIVAMENTE
     # ========================================================
 
-    def summarize_tool_result(
+    def find_value(
         self,
-        tool_name,
-        result_text
+        obj,
+        keys
     ):
-        """
-        Gera uma mensagem curta para o painel visual.
 
-        O resultado completo continua disponível no
-        debug_log.
-        """
+        if isinstance(
+            obj,
+            dict
+        ):
 
-        texto = (
-            str(result_text)
-            .strip()
+            for key in keys:
+
+                if key in obj:
+
+                    return obj[key]
+
+            for value in obj.values():
+
+                found = self.find_value(
+                    value,
+                    keys
+                )
+
+                if found is not None:
+
+                    return found
+
+        elif isinstance(
+            obj,
+            list
+        ):
+
+            for item in obj:
+
+                found = self.find_value(
+                    item,
+                    keys
+                )
+
+                if found is not None:
+
+                    return found
+
+        return None
+
+    # ========================================================
+    # EXTRAI COORDENADAS
+    # ========================================================
+
+    def extract_coordinates(
+        self,
+        result
+    ):
+
+        data = self.extract_mcp_result(
+            result
         )
 
+        if not isinstance(
+            data,
+            dict
+        ):
+
+            return None
 
         # ----------------------------------------------------
-        # GEOCODIFICAÇÃO
+        # Formato real do seu geocode.py:
+        #
+        # {
+        #     "status": "OK",
+        #     "query": "...",
+        #     "results": [...]
+        # }
         # ----------------------------------------------------
+
+        results = data.get(
+            "results"
+        )
+
+        if not isinstance(
+            results,
+            list
+        ):
+
+            return None
+
+        if not results:
+
+            return None
+
+        candidate = results[0]
+
+        if not isinstance(
+            candidate,
+            dict
+        ):
+
+            return None
+
+        lat = candidate.get(
+            "lat"
+        )
+
+        lon = candidate.get(
+            "lon"
+        )
+
+        if lat is None or lon is None:
+
+            return None
+
+        try:
+
+            return {
+                "lat": float(lat),
+                "lon": float(lon),
+                "name": candidate.get(
+                    "name"
+                ),
+                "display_name": candidate.get(
+                    "display_name"
+                ),
+            }
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            return None
+
+    # ========================================================
+    # RESUMO GEOCODE
+    # ========================================================
+
+    def summarize_geocode(
+        self,
+        result
+    ):
+
+        data = self.extract_mcp_result(
+            result
+        )
+
+        if not isinstance(
+            data,
+            dict
+        ):
+
+            return (
+                "Resultado de geocodificação "
+                "não reconhecido."
+            )
+
+        status = data.get(
+            "status"
+        )
+
+        if status == "NOT_FOUND":
+
+            query = data.get(
+                "query",
+                ""
+            )
+
+            return (
+                f"{query} → não encontrado"
+            )
+
+        results = data.get(
+            "results"
+        )
+
+        if not isinstance(
+            results,
+            list
+        ):
+
+            query = data.get(
+                "query",
+                ""
+            )
+
+            return (
+                f"{query} → nenhum resultado"
+            )
+
+        if not results:
+
+            query = data.get(
+                "query",
+                ""
+            )
+
+            return (
+                f"{query} → nenhum resultado"
+            )
+
+        candidate = results[0]
+
+        if not isinstance(
+            candidate,
+            dict
+        ):
+
+            return (
+                "Resultado de geocodificação inválido."
+            )
+
+        name = (
+            candidate.get("name")
+            or data.get("query")
+            or "Ponto"
+        )
+
+        lat = candidate.get(
+            "lat"
+        )
+
+        lon = candidate.get(
+            "lon"
+        )
+
+        if lat is None or lon is None:
+
+            return (
+                f"{name} → "
+                "coordenadas não encontradas"
+            )
+
+        try:
+
+            lat = float(lat)
+
+            lon = float(lon)
+
+            return (
+                f"{name} → "
+                f"{lat:.7f}, {lon:.7f}"
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            return (
+                f"{name} → "
+                "coordenadas inválidas"
+            )
+
+    # ========================================================
+    # REGISTRA PONTO GEOCODIFICADO
+    # ========================================================
+
+    def register_geocoded_point(
+        self,
+        result
+    ):
+
+        point = self.extract_coordinates(
+            result
+        )
+
+        if point is None:
+
+            return None
+
+        self.geocoded_points.append(
+            point
+        )
+
+        return point
+
+    # ========================================================
+    # FORMATA NÚMERO BRASILEIRO
+    # ========================================================
+
+    def format_number(
+        self,
+        value,
+        decimals=2
+    ):
+
+        try:
+
+            text = (
+                f"{float(value):,.{decimals}f}"
+            )
+
+            return (
+                text
+                .replace(",", "X")
+                .replace(".", ",")
+                .replace("X", ".")
+            )
+
+        except Exception:
+
+            return str(value)
+
+    # ========================================================
+    # RESUMO DO EVALUATE_LINK
+    # ========================================================
+
+    def summarize_evaluate_link(
+        self,
+        result
+    ):
+
+        data = self.extract_mcp_result(
+            result
+        )
+
+        if data is None:
+
+            return (
+                "📥 Resultado do enlace recebido."
+            )
+
+        # ----------------------------------------------------
+        # Distância
+        # ----------------------------------------------------
+
+        dist = self.find_value(
+            data,
+            [
+                "dist_m",
+                "distance_m",
+                "distance",
+            ]
+        )
+
+        # ----------------------------------------------------
+        # FSPL
+        # ----------------------------------------------------
+
+        fspl = self.find_value(
+            data,
+            [
+                "fspl",
+                "fspl_db",
+            ]
+        )
+
+        # ----------------------------------------------------
+        # Difração
+        # ----------------------------------------------------
+
+        diffraction = self.find_value(
+            data,
+            [
+                "delta_diffra",
+                "diffraction",
+                "diffraction_db",
+                "diffra",
+            ]
+        )
+
+        # ----------------------------------------------------
+        # Edificações
+        # ----------------------------------------------------
+
+        buildings = self.find_value(
+            data,
+            [
+                "buildings",
+                "building",
+                "building_obstruction",
+            ]
+        )
+
+        # ----------------------------------------------------
+        # Terreno
+        # ----------------------------------------------------
+
+        terrain = self.find_value(
+            data,
+            [
+                "terrain",
+                "terrain_obstruction",
+            ]
+        )
+
+        lines = []
+
+        # ----------------------------------------------------
+        # Distância
+        # ----------------------------------------------------
+
+        if isinstance(
+            dist,
+            (int, float)
+        ):
+
+            lines.append(
+                "📥 Distância: "
+                + self.format_number(
+                    dist
+                )
+                + " m"
+            )
+
+        # ----------------------------------------------------
+        # FSPL
+        # ----------------------------------------------------
+
+        if isinstance(
+            fspl,
+            (int, float)
+        ):
+
+            lines.append(
+                "📥 FSPL: "
+                + self.format_number(
+                    fspl
+                )
+                + " dB"
+            )
+
+        # ----------------------------------------------------
+        # Difração
+        # ----------------------------------------------------
+
+        if isinstance(
+            diffraction,
+            (int, float)
+        ):
+
+            if diffraction > 0:
+
+                lines.append(
+                    "📥 Difração: "
+                    + self.format_number(
+                        diffraction
+                    )
+                    + " dB"
+                )
+
+        # ----------------------------------------------------
+        # Edificações
+        # ----------------------------------------------------
+
+        if self.has_obstruction(
+            buildings
+        ):
+
+            lines.append(
+                "📥 Obstrução por edifícios detectada"
+            )
+
+        # ----------------------------------------------------
+        # Terreno
+        # ----------------------------------------------------
+
+        if self.has_obstruction(
+            terrain
+        ):
+
+            lines.append(
+                "📥 Obstrução por terreno detectada"
+            )
+
+        # ----------------------------------------------------
+        # Fallback
+        # ----------------------------------------------------
+
+        if not lines:
+
+            lines.append(
+                "📥 Resultado do enlace recebido."
+            )
+
+        return "\n".join(lines)
+
+    # ========================================================
+    # DETECTA OBSTRUÇÃO
+    # ========================================================
+
+    def has_obstruction(
+        self,
+        value
+    ):
+
+        if value is None:
+
+            return False
+
+        # ----------------------------------------------------
+        # Número
+        # ----------------------------------------------------
+
+        if isinstance(
+            value,
+            (int, float)
+        ):
+
+            return value > 0
+
+        # ----------------------------------------------------
+        # String
+        # ----------------------------------------------------
+
+        if isinstance(
+            value,
+            str
+        ):
+
+            text = value.lower()
+
+            negative = [
+                "false",
+                "none",
+                "no",
+                "não",
+                "nao",
+                "clear",
+                "livre",
+            ]
+
+            for item in negative:
+
+                if item in text:
+
+                    return False
+
+            positive = [
+                "true",
+                "obstruction",
+                "obstru",
+                "blocked",
+                "bloque",
+            ]
+
+            for item in positive:
+
+                if item in text:
+
+                    return True
+
+            try:
+
+                return (
+                    float(value) > 0
+                )
+
+            except Exception:
+
+                return False
+
+        # ----------------------------------------------------
+        # Dict
+        # ----------------------------------------------------
+
+        if isinstance(
+            value,
+            dict
+        ):
+
+            for key in [
+                "core",
+                "fresnel",
+                "boundary",
+                "value",
+            ]:
+
+                v = value.get(
+                    key
+                )
+
+                if isinstance(
+                    v,
+                    (int, float)
+                ):
+
+                    if v > 0:
+
+                        return True
+
+            for v in value.values():
+
+                if self.has_obstruction(
+                    v
+                ):
+
+                    return True
+
+            return False
+
+        # ----------------------------------------------------
+        # Lista
+        # ----------------------------------------------------
+
+        if isinstance(
+            value,
+            list
+        ):
+
+            for item in value:
+
+                if self.has_obstruction(
+                    item
+                ):
+
+                    return True
+
+        return False
+
+    # ========================================================
+    # DETERMINA ETAPA
+    # ========================================================
+
+    def stage_for_tool(
+        self,
+        tool_name
+    ):
 
         if tool_name == "geocode_place":
 
-            # Tenta localizar latitude/longitude no texto.
-            try:
-
-                data = json.loads(texto)
-
-                if isinstance(data, dict):
-
-                    lat = (
-                        data.get("lat")
-                        or data.get("latitude")
-                    )
-
-                    lon = (
-                        data.get("lon")
-                        or data.get("longitude")
-                    )
-
-                    if lat is not None and lon is not None:
-
-                        return (
-                            f"📥 Coordenadas: "
-                            f"{lat}, {lon}"
-                        )
-
-            except Exception:
-                pass
-
-
-            # Resultado textual
-            primeira_linha = (
-                texto.splitlines()[0]
-                if texto
-                else ""
-            )
-
-            if len(primeira_linha) > 180:
-
-                primeira_linha = (
-                    primeira_linha[:180]
-                    + "..."
-                )
-
             return (
-                f"📥 {primeira_linha}"
-                if primeira_linha
-                else "📥 Resultado recebido."
+                "🔵 Etapa 1 — Localizando os pontos"
             )
-
-
-        # ----------------------------------------------------
-        # EVALUATE LINK
-        # ----------------------------------------------------
 
         if tool_name == "evaluate_link":
 
-            # Procura distância no resultado.
-
-            try:
-
-                # Pode ser JSON
-                data = json.loads(texto)
-
-                if isinstance(data, dict):
-
-                    dist = (
-                        data.get("dist_m")
-                        or data.get("distance_m")
-                        or data.get("distance")
-                    )
-
-                    if dist is not None:
-
-                        return (
-                            f"📥 Análise concluída — "
-                            f"{float(dist):,.2f} m"
-                            .replace(",", "X")
-                            .replace(".", ",")
-                            .replace("X", ".")
-                        )
-
-            except Exception:
-                pass
-
-
-            # Procura "dist_m" em texto bruto.
-            if "dist_m" in texto:
-
-                return (
-                    "📥 Análise do enlace concluída."
-                )
-
-
             return (
-                "📥 Análise do enlace concluída."
+                "🔵 Etapa 2 — Avaliando o enlace"
             )
 
-
-        # ----------------------------------------------------
-        # OUTRAS FERRAMENTAS
-        # ----------------------------------------------------
-
-        primeira_linha = (
-            texto.splitlines()[0]
-            if texto
-            else ""
-        )
-
-
-        if len(primeira_linha) > 180:
-
-            primeira_linha = (
-                primeira_linha[:180]
-                + "..."
-            )
-
-
-        return (
-            f"📥 {primeira_linha}"
-            if primeira_linha
-            else "📥 Resultado recebido."
-        )
-
+        return None
 
     # ========================================================
-    # EXECUTAR FERRAMENTA MCP
+    # EXECUTA FERRAMENTA MCP
     # ========================================================
 
     async def execute_mcp_tool(
@@ -753,537 +1151,502 @@ class PlanAppAgent:
         arguments
     ):
 
-        # ----------------------------------------------------
-        # PROGRESSO VISUAL
-        # ----------------------------------------------------
+        if self.mcp_session is None:
 
-        await self.progress_async(
-            f"🔧 MCP: {tool_name}",
-            "processing"
-        )
-
-
-        # ----------------------------------------------------
-        # LOG TÉCNICO
-        # ----------------------------------------------------
-
-        self.log(
-            "────────────────────────────────────────"
-        )
-
-        self.log(
-            f"MCP TOOL: {tool_name}"
-        )
-
-        self.log(
-            "ARGUMENTOS:"
-        )
-
-        self.log(
-            self._serialize_json(
-                arguments
-            )
-        )
-
-
-        # ----------------------------------------------------
-        # CALL TOOL
-        # ----------------------------------------------------
-
-        try:
-
-            result = await self.session.call_tool(
-                tool_name,
-                arguments=arguments
+            raise RuntimeError(
+                "Sessão MCP não inicializada."
             )
 
-
-        except Exception as e:
-
-            self.log(
-                "❌ EXCEÇÃO DURANTE call_tool:"
-            )
-
-            self.log(
-                repr(e)
-            )
-
-            raise
-
-
-        # ====================================================
-        # DEBUG RESULTADO MCP
-        # ====================================================
-
-        self.log(
-            "DEBUG MCP RESULT"
-        )
-
-        self.log(
-            f"TIPO: {type(result)}"
-        )
-
-
-        is_error = getattr(
-            result,
-            "isError",
-            None
-        )
-
-
-        if is_error is None:
-
-            is_error = getattr(
-                result,
-                "is_error",
-                None
-            )
-
-
-        self.log(
-            f"isError: {is_error}"
-        )
-
-
         # ----------------------------------------------------
-        # STRUCTURED CONTENT
+        # Etapa visual
         # ----------------------------------------------------
 
-        structured = getattr(
-            result,
-            "structuredContent",
-            None
+        stage = self.stage_for_tool(
+            tool_name
         )
 
+        if (
+            stage
+            and stage != self.current_stage
+        ):
 
-        if structured is None:
+            self.current_stage = stage
 
-            structured = getattr(
-                result,
-                "structured_content",
-                None
-            )
-
-
-        self.log(
-            "structuredContent:"
-        )
-
-
-        self.log(
-            self._serialize_json(
-                structured
-            )
-            if structured is not None
-            else "None"
-        )
-
+            self.log(stage)
 
         # ----------------------------------------------------
-        # CONTENT
+        # Log ferramenta
         # ----------------------------------------------------
 
-        content = getattr(
-            result,
-            "content",
-            None
-        )
-
-
         self.log(
-            "content:"
+            f"🔧 MCP: {tool_name}"
         )
 
+        self.tool_execution_count += 1
 
-        if content:
+        # ----------------------------------------------------
+        # Executa MCP
+        # ----------------------------------------------------
 
-            for i, item in enumerate(
-                content
-            ):
+        result = await self.mcp_session.call_tool(
+            tool_name,
+            arguments=arguments
+        )
 
-                self.log(
-                    f"  [{i}] "
-                    f"tipo={type(item)}"
+        # ----------------------------------------------------
+        # GEOCODE
+        # ----------------------------------------------------
+
+        if tool_name == "geocode_place":
+
+            summary = (
+                self.summarize_geocode(
+                    result
                 )
-
-                self.log(
-                    f"  [{i}] repr="
-                    f"{repr(item)}"
-                )
-
-
-                text = getattr(
-                    item,
-                    "text",
-                    None
-                )
-
-
-                if text is not None:
-
-                    self.log(
-                        f"  [{i}] text="
-                        f"{text}"
-                    )
-
-        else:
-
-            self.log(
-                "  None"
             )
 
-
-        # ====================================================
-        # EXTRAIR RESULTADO
-        # ====================================================
-
-        result_text, is_error = (
-            self.extract_mcp_result(
+            self.register_geocoded_point(
                 result
             )
-        )
 
-
-        self.log(
-            "RESULTADO NORMALIZADO:"
-        )
-
-        self.log(
-            result_text
-        )
-
-        self.log(
-            "────────────────────────────────────────"
-        )
-
-
-        # ----------------------------------------------------
-        # ERRO MCP
-        # ----------------------------------------------------
-
-        if is_error:
-
-            raise RuntimeError(
-                f"MCP retornou isError=True "
-                f"para {tool_name}:\n"
-                f"{result_text}"
+            self.log(
+                f"📥 {summary}"
             )
 
-
         # ----------------------------------------------------
-        # RESULTADO VAZIO
+        # EVALUATE LINK
         # ----------------------------------------------------
 
-        if not result_text.strip():
+        elif tool_name == "evaluate_link":
 
-            raise RuntimeError(
-                f"O MCP retornou resultado vazio "
-                f"para {tool_name}."
+            self.evaluate_link_executed = True
+
+            summary = (
+                self.summarize_evaluate_link(
+                    result
+                )
             )
 
+            self.log(summary)
 
-        # ----------------------------------------------------
-        # PROGRESSO VISUAL — RESULTADO
-        # ----------------------------------------------------
-
-        await self.progress_async(
-            self.summarize_tool_result(
-                tool_name,
-                result_text
-            ),
-            "processing"
-        )
-
-
-        return result_text
-
+        return result
 
     # ========================================================
-    # CHAMAR OLLAMA
+    # CHAMADA OLLAMA
+    #
+    # AQUI ESTÁ A CORREÇÃO PRINCIPAL:
+    #
+    # "tools": self.ollama_tools
+    #
+    # Assim o Qwen recebe os schemas das ferramentas MCP.
     # ========================================================
 
     async def call_ollama(
         self,
-        messages,
-        tools=None
+        messages
     ):
 
+        url = (
+            f"{OLLAMA_URL}/api/chat"
+        )
+
         payload = {
-
             "model": OLLAMA_MODEL,
-
             "messages": messages,
+
+            # =================================================
+            # CORREÇÃO FUNDAMENTAL
+            # =================================================
+            "tools": self.ollama_tools,
 
             "stream": False,
 
-            "think": False,
-
+            "options": {
+                "temperature": 0.1,
+            },
         }
 
+        if DEBUG:
 
-        if tools:
-
-            payload["tools"] = tools
-
-
-        # ====================================================
-        # LOG TÉCNICO — REQUEST
-        # ====================================================
-
-        self.log(
-            "================================================"
-        )
-
-        self.log(
-            "OLLAMA REQUEST"
-        )
-
-        self.log(
-            f"MODEL: {OLLAMA_MODEL}"
-        )
-
-        self.log(
-            "THINK: False"
-        )
-
-        self.log(
-            f"TOOLS: "
-            f"{len(tools) if tools else 0}"
-        )
-
-        self.log(
-            "MESSAGES:"
-        )
-
-        self.log(
-            self._serialize_json(
-                messages
+            print()
+            print(
+                "========== OLLAMA REQUEST =========="
             )
-        )
 
-        self.log(
-            "================================================"
-        )
-
-
-        # ----------------------------------------------------
-        # REQUEST
-        # ----------------------------------------------------
-
-        try:
-
-            async with httpx.AsyncClient(
-                timeout=OLLAMA_TIMEOUT
-            ) as client:
-
-                response = await client.post(
-                    f"{OLLAMA_URL}/api/chat",
-                    json=payload
+            print(
+                json.dumps(
+                    payload,
+                    indent=2,
+                    ensure_ascii=False
                 )
-
-                response.raise_for_status()
-
-                data = response.json()
-
-
-        except Exception as e:
-
-            self.log(
-                "❌ ERRO OLLAMA:"
             )
 
-            self.log(
-                repr(e)
+        async with httpx.AsyncClient(
+            timeout=OLLAMA_TIMEOUT
+        ) as client:
+
+            response = await client.post(
+                url,
+                json=payload
             )
 
-            raise
+            response.raise_for_status()
 
+            data = response.json()
 
-        # ====================================================
-        # LOG TÉCNICO — RESPONSE
-        # ====================================================
+        if DEBUG:
 
-        self.log(
-            "OLLAMA RESPONSE"
-        )
-
-        self.log(
-            self._serialize_json(
-                data
+            print()
+            print(
+                "========== OLLAMA RESPONSE =========="
             )
+
+            print(
+                json.dumps(
+                    data,
+                    indent=2,
+                    ensure_ascii=False
+                )
+            )
+
+        return data.get(
+            "message",
+            {}
         )
-
-        self.log(
-            "================================================"
-        )
-
-
-        return data
-
 
     # ========================================================
-    # PROMPT
+    # SYSTEM PROMPT
     # ========================================================
 
     def system_prompt(self):
 
         return """
-Você é o PlanApp AI, um agente especializado em
-planejamento e avaliação de enlaces de rádio.
+Você é o agente de planejamento de enlaces de rádio do PlanApp.
 
-Você possui acesso às ferramentas MCP do PlanApp.
+Você deve utilizar obrigatoriamente as ferramentas MCP disponíveis
+para realizar a análise técnica.
 
-REGRAS IMPORTANTES:
+FERRAMENTAS:
 
-1. Quando o usuário informar nomes de lugares, NÃO invente
-   coordenadas.
+- geocode_place:
+  Localiza endereços, cidades e pontos de interesse e retorna
+  coordenadas geográficas.
 
-2. Para transformar nomes de lugares em coordenadas,
-   utilize obrigatoriamente a ferramenta geocode_place.
+- evaluate_link:
+  Executa a análise real do enlace através do PlanApp.
 
-3. O resultado retornado por geocode_place é a fonte correta
-   das coordenadas.
+- register:
+  Ferramenta auxiliar de sessão. Não é necessário chamá-la
+  para uma análise normal se a sessão já estiver funcionando.
 
-4. Quando geocode_place retornar latitude e longitude,
-   utilize exatamente esses valores.
+============================================================
+FLUXO OBRIGATÓRIO
+============================================================
 
-5. NÃO peça ao usuário para fornecer coordenadas se
-   geocode_place já tiver conseguido localizar o lugar.
+Quando o usuário pedir uma análise entre dois locais:
 
-6. Depois de obter as coordenadas dos dois pontos, utilize
-   as ferramentas disponíveis para realizar a análise do
-   enlace.
+1. Identifique o TX.
+2. Identifique o RX.
+3. Execute geocode_place para o TX.
+4. Execute geocode_place para o RX.
+5. Aguarde os resultados reais das duas geocodificações.
+6. Execute obrigatoriamente evaluate_link.
+7. Aguarde o resultado real do PlanApp.
+8. Somente então produza a análise técnica.
 
-7. Não diga que houve erro ao obter coordenadas apenas porque
-   o resultado da ferramenta possui JSON, structuredContent,
-   texto ou outro formato técnico. Interprete o resultado
-   retornado pela ferramenta.
+NÃO produza uma análise técnica antes de executar evaluate_link.
 
-8. Não invente resultados técnicos.
+============================================================
+PARÂMETROS PADRÃO
+============================================================
 
-9. Explique o resultado final de forma objetiva.
+Se o usuário não informar parâmetros de rádio, utilize:
 
-10. Se uma ferramenta retornar erro real, informe qual
-    ferramenta falhou e qual foi o erro.
+frequência:
+900 MHz
 
-11. Quando houver necessidade de chamar uma ferramenta,
-    chame-a. Não descreva simplesmente o que deveria ser feito.
+altura TX:
+7 metros
+
+altura RX:
+7 metros
+
+on_rooftop:
+false
+
+Não pergunte esses parâmetros ao usuário quando eles não forem
+informados.
+
+============================================================
+REGRA ABSOLUTA SOBRE RESULTADOS
+============================================================
+
+Nunca invente resultados do PlanApp.
+
+Nunca estime ou simule:
+
+- distância;
+- FSPL;
+- difração;
+- obstrução;
+- Fresnel;
+- folga;
+- ganho de antena;
+- potência;
+- margem;
+- alturas;
+- qualquer outro indicador técnico.
+
+Use somente valores efetivamente retornados pelo evaluate_link.
+
+Se um valor não estiver no resultado do PlanApp, diga que ele
+não foi fornecido.
+
+============================================================
+INTERPRETAÇÃO
+============================================================
+
+Analise tecnicamente os resultados reais retornados pelo PlanApp.
+
+Considere, quando disponíveis:
+
+- distância;
+- FSPL;
+- difração;
+- terreno;
+- edificações;
+- zona de Fresnel;
+- folga;
+- obstáculos;
+- demais indicadores retornados.
+
+Se houver obstrução por edifícios, mencione explicitamente.
+
+Se houver obstrução por terreno, mencione explicitamente.
+
+Não declare que um enlace é viável simplesmente porque a distância
+é pequena.
+
+Não declare que um enlace é inviável sem base nos resultados.
+
+============================================================
+FREQUÊNCIA E FSPL
+============================================================
+
+Para a mesma distância, frequências maiores produzem maior perda
+de espaço livre.
+
+Portanto, nunca diga que aumentar a frequência reduz a FSPL.
+
+============================================================
+RESPOSTA FINAL
+============================================================
+
+Depois que evaluate_link for executado, apresente uma conclusão
+técnica objetiva.
+
+Não invente dados ausentes.
+
+Não chame ferramentas desnecessariamente.
+
+Não peça parâmetros que possuem valores padrão.
 """
 
-
     # ========================================================
-    # AGENT TURN
+    # GARANTE EVALUATE_LINK
+    #
+    # Segurança adicional:
+    # se o Qwen geocodificar os dois pontos mas não chamar
+    # evaluate_link, executamos automaticamente.
     # ========================================================
 
-    async def agent_turn(
-        self,
-        user_input
-    ):
+    async def ensure_evaluate_link(self):
 
-        messages = [
+        if self.evaluate_link_executed:
 
-            {
-                "role": "system",
-                "content": self.system_prompt(),
-            },
+            return None
 
-            {
-                "role": "user",
-                "content": user_input,
-            },
+        # ----------------------------------------------------
+        # Necessários dois pontos
+        # ----------------------------------------------------
 
-        ]
+        if len(
+            self.geocoded_points
+        ) < 2:
 
+            return None
 
-        max_iterations = 8
+        tx = self.geocoded_points[0]
 
+        rx = self.geocoded_points[1]
 
-        for iteration in range(
-            1,
-            max_iterations + 1
+        # ----------------------------------------------------
+        # Mensagem de etapa
+        # ----------------------------------------------------
+
+        if self.current_stage != (
+            "🔵 Etapa 2 — Avaliando o enlace"
         ):
 
-            await self.progress_async(
-                f"🔵 Processando etapa "
-                f"{iteration}...",
-                "processing"
-            )
-
-
-            # ------------------------------------------------
-            # QWEN
-            # ------------------------------------------------
-
-            data = await self.call_ollama(
-                messages,
-                tools=self.tools_ollama
-            )
-
-
-            message = data.get(
-                "message",
-                {}
-            )
-
-
-            # ------------------------------------------------
-            # LOG QWEN
-            # ------------------------------------------------
-
-            self.log(
-                "MENSAGEM QWEN:"
+            self.current_stage = (
+                "🔵 Etapa 2 — Avaliando o enlace"
             )
 
             self.log(
-                self._serialize_json(
-                    message
+                "🔵 Etapa 2 — Avaliando o enlace"
+            )
+
+        # ----------------------------------------------------
+        # Parâmetros padrão
+        # ----------------------------------------------------
+
+        arguments = {
+
+            "tx_lat": tx["lat"],
+            "tx_lon": tx["lon"],
+
+            "rx_lat": rx["lat"],
+            "rx_lon": rx["lon"],
+
+            "tx_ha": 7,
+            "rx_ha": 7,
+
+            "freq_mhz": 900,
+
+            "on_rooftop": False,
+        }
+
+        # ----------------------------------------------------
+        # Executa
+        # ----------------------------------------------------
+
+        result = await self.execute_mcp_tool(
+            "evaluate_link",
+            arguments
+        )
+
+        # ----------------------------------------------------
+        # Resultado real para o Qwen
+        # ----------------------------------------------------
+
+        extracted = (
+            self.extract_mcp_result(
+                result
+            )
+        )
+
+        # ----------------------------------------------------
+        # Adiciona chamada de ferramenta ao histórico
+        # ----------------------------------------------------
+
+        self.messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "evaluate_link",
+                            "arguments": arguments,
+                        }
+                    }
+                ],
+            }
+        )
+
+        self.messages.append(
+            {
+                "role": "tool",
+                "content": json.dumps(
+                    extracted,
+                    ensure_ascii=False
+                ),
+            }
+        )
+
+        return result
+
+    # ========================================================
+    # PROCESSA UMA RODADA DO AGENTE
+    # ========================================================
+
+    async def agent_turn(self):
+
+        max_iterations = 12
+
+        for iteration in range(
+            max_iterations
+        ):
+
+            if DEBUG:
+
+                print(
+                    f"\n========== "
+                    f"AGENT ITERATION "
+                    f"{iteration + 1}"
+                    f" =========="
+                )
+
+            # ------------------------------------------------
+            # Qwen
+            # ------------------------------------------------
+
+            assistant_message = (
+                await self.call_ollama(
+                    self.messages
                 )
             )
 
+            if not isinstance(
+                assistant_message,
+                dict
+            ):
+
+                assistant_message = {}
 
             # ------------------------------------------------
-            # TOOL CALLS
+            # Guarda mensagem
             # ------------------------------------------------
 
-            tool_calls = message.get(
-                "tool_calls"
+            self.messages.append(
+                assistant_message
             )
 
+            # ------------------------------------------------
+            # Tool calls
+            # ------------------------------------------------
+
+            tool_calls = (
+                assistant_message.get(
+                    "tool_calls"
+                )
+            )
 
             if tool_calls:
 
-                self.log(
-                    f"🔧 Qwen solicitou "
-                    f"{len(tool_calls)} ferramenta(s)."
-                )
-
-
-                messages.append(
-                    message
-                )
-
-
                 for tool_call in tool_calls:
 
-                    function = tool_call.get(
-                        "function",
-                        {}
+                    function = (
+                        tool_call.get(
+                            "function",
+                            {}
+                        )
                     )
 
-
-                    tool_name = function.get(
-                        "name"
+                    tool_name = (
+                        function.get(
+                            "name"
+                        )
                     )
 
-
-                    arguments = function.get(
-                        "arguments",
-                        {}
+                    arguments = (
+                        function.get(
+                            "arguments",
+                            {}
+                        )
                     )
-
 
                     # ----------------------------------------
-                    # ARGUMENTOS STRING → JSON
+                    # Argumentos podem vir como string JSON
                     # ----------------------------------------
 
                     if isinstance(
@@ -1297,98 +1660,137 @@ REGRAS IMPORTANTES:
                                 arguments
                             )
 
+                        except Exception:
 
-                        except json.JSONDecodeError:
-
-                            raise RuntimeError(
-                                "O Qwen retornou argumentos "
-                                f"inválidos para {tool_name}:\n"
-                                f"{arguments}"
-                            )
-
-
-                    # ----------------------------------------
-                    # VALIDAR ARGUMENTOS
-                    # ----------------------------------------
+                            arguments = {}
 
                     if not isinstance(
                         arguments,
                         dict
                     ):
 
-                        raise RuntimeError(
-                            f"Argumentos inválidos para "
-                            f"{tool_name}: "
-                            f"{repr(arguments)}"
-                        )
+                        arguments = {}
 
+                    if not tool_name:
+
+                        continue
 
                     # ----------------------------------------
-                    # EXECUTAR MCP
+                    # Segurança:
+                    # só executa ferramentas realmente
+                    # descobertas no MCP.
                     # ----------------------------------------
 
-                    result_text = (
+                    available_names = {
+                        tool.name
+                        for tool in self.tools
+                    }
+
+                    if (
+                        tool_name
+                        not in available_names
+                    ):
+
+                        if DEBUG:
+
+                            print(
+                                "Ferramenta solicitada "
+                                "pelo Qwen não encontrada "
+                                f"no MCP: {tool_name}"
+                            )
+
+                        continue
+
+                    # ----------------------------------------
+                    # Executa MCP
+                    # ----------------------------------------
+
+                    result = (
                         await self.execute_mcp_tool(
                             tool_name,
                             arguments
                         )
                     )
 
-
                     # ----------------------------------------
-                    # RESULTADO PARA QWEN
+                    # Resultado para Qwen
                     # ----------------------------------------
 
-                    messages.append(
+                    extracted = (
+                        self.extract_mcp_result(
+                            result
+                        )
+                    )
+
+                    self.messages.append(
                         {
                             "role": "tool",
-                            "content": result_text,
+                            "content": json.dumps(
+                                extracted,
+                                ensure_ascii=False
+                            ),
                         }
                     )
 
+                # ------------------------------------------------
+                # Depois de qualquer rodada de ferramentas,
+                # verificar se temos os dois pontos.
+                # ------------------------------------------------
 
-                # ------------------------------------------------
-                # PRÓXIMA RODADA
-                # ------------------------------------------------
+                if (
+                    len(
+                        self.geocoded_points
+                    ) >= 2
+                    and not self.evaluate_link_executed
+                ):
+
+                    await self.ensure_evaluate_link()
 
                 continue
 
+            # ------------------------------------------------
+            # Qwen não chamou ferramenta.
+            #
+            # Se já temos os dois pontos, não permitimos
+            # que ele finalize sem evaluate_link.
+            # ------------------------------------------------
+
+            if (
+                len(
+                    self.geocoded_points
+                ) >= 2
+                and not self.evaluate_link_executed
+            ):
+
+                await self.ensure_evaluate_link()
+
+                continue
 
             # ------------------------------------------------
-            # RESPOSTA FINAL
+            # Se evaluate_link foi executado, pode finalizar.
             # ------------------------------------------------
 
-            resposta = message.get(
+            if self.evaluate_link_executed:
+
+                return assistant_message.get(
+                    "content",
+                    ""
+                )
+
+            # ------------------------------------------------
+            # Caso não tenha conseguido geocodificar os dois
+            # pontos, retorna a resposta do Qwen.
+            # ------------------------------------------------
+
+            return assistant_message.get(
                 "content",
                 ""
             )
 
-
-            if resposta is None:
-
-                resposta = ""
-
-
-            resposta = str(
-                resposta
-            ).strip()
-
-
-            if resposta:
-
-                return resposta
-
-
-            raise RuntimeError(
-                "O Qwen retornou uma resposta vazia."
-            )
-
-
-        raise RuntimeError(
-            f"O agente atingiu o limite de "
-            f"{max_iterations} etapas."
+        return (
+            "Não foi possível concluir a análise "
+            "dentro do número máximo de etapas."
         )
-
 
     # ========================================================
     # ASK
@@ -1396,115 +1798,78 @@ REGRAS IMPORTANTES:
 
     async def ask(
         self,
-        user_input
+        user_text
     ):
 
-        self.clear_log()
+        # ----------------------------------------------------
+        # Conecta MCP
+        # ----------------------------------------------------
 
+        await self.connect()
 
-        await self.progress_async(
-            "🔵 Iniciando agente Qwen...",
-            "processing"
+        # ----------------------------------------------------
+        # Limpa estado da análise
+        # ----------------------------------------------------
+
+        self.reset_state()
+
+        # ----------------------------------------------------
+        # Mensagens
+        # ----------------------------------------------------
+
+        self.messages = [
+
+            {
+                "role": "system",
+                "content": self.system_prompt(),
+            },
+
+            {
+                "role": "user",
+                "content": user_text,
+            },
+
+        ]
+
+        # ----------------------------------------------------
+        # Executa
+        # ----------------------------------------------------
+
+        answer = await self.agent_turn()
+
+        # ----------------------------------------------------
+        # Etapa 3
+        # ----------------------------------------------------
+
+        if self.evaluate_link_executed:
+
+            self.current_stage = (
+                "🔵 Etapa 3 — Interpretando resultados"
+            )
+
+            self.log(
+                "🔵 Etapa 3 — Interpretando resultados"
+            )
+
+            self.log(
+                "🟢 Análise concluída"
+            )
+
+        return answer
+
+    # ========================================================
+    # TESTE
+    # ========================================================
+
+    async def test_agent(self):
+
+        return await self.ask(
+            "Analise um enlace entre "
+            "a Praça da Sé e o Largo do Paissandu "
+            "em São Paulo."
         )
 
 
-        try:
-
-            # ------------------------------------------------
-            # MCP
-            # ------------------------------------------------
-
-            await self.connect()
-
-
-            # ------------------------------------------------
-            # AGENTE
-            # ------------------------------------------------
-
-            resultado = await self.agent_turn(
-                user_input
-            )
-
-
-            await self.progress_async(
-                "🟢 Análise concluída",
-                "success"
-            )
-
-
-            # ------------------------------------------------
-            # RETORNO
-            # ------------------------------------------------
-
-            # IMPORTANTE:
-            # Não montamos mais o <details> aqui.
-            #
-            # O agente retorna somente a resposta.
-            # A interface Jupyter decide como apresentar
-            # o resultado e o log técnico.
-            #
-
-            return resultado
-
-
-        except Exception as e:
-
-            self.log(
-                "================================================"
-            )
-
-            self.log(
-                "❌ ERRO FINAL DO AGENTE"
-            )
-
-            self.log(
-                repr(e)
-            )
-
-            self.log(
-                "================================================"
-            )
-
-
-            # ------------------------------------------------
-            # IMPORTANTE
-            #
-            # Mantemos a exceção para a interface tratar.
-            # Não misturamos o log técnico com o resultado.
-            # ------------------------------------------------
-
-            raise
-
-
 # ============================================================
-# TESTE DIRETO
+# FIM
 # ============================================================
-
-async def test_agent():
-
-    agent = PlanAppAgent()
-
-    try:
-
-        await agent.connect()
-
-        resultado = await agent.ask(
-            "Analise um enlace entre a Praça da Sé "
-            "e o Largo do Paissandu em São Paulo."
-        )
-
-        print()
-        print("=" * 70)
-        print("RESULTADO")
-        print("=" * 70)
-        print(resultado)
-
-        print()
-        print("=" * 70)
-        print("LOG TÉCNICO")
-        print("=" * 70)
-        print(agent.get_log())
-
-    finally:
-
-        await agent.close()
