@@ -2,14 +2,6 @@ from client.fastapi_client import FastAPIClient
 
 
 def register_link_tools(mcp, client: FastAPIClient):
-    """
-    Registra no MCP as ferramentas relacionadas à avaliação
-    de enlaces do PlanApp.
-    """
-
-    # ========================================================
-    # Evaluate Link
-    # ========================================================
 
     @mcp.tool()
     def evaluate_link(
@@ -20,14 +12,12 @@ def register_link_tools(mcp, client: FastAPIClient):
         tx_ha: float = 7,
         rx_ha: float = 7,
         freq_mhz: float = 900,
-        tx_ha_abs: float | None = None,
-        rx_ha_abs: float | None = None,
         on_rooftop: bool = False,
     ) -> dict:
         """
         Avalia um enlace ponto-a-ponto no PlanApp.
 
-        O processo executado é:
+        Executa:
 
             set_link
                 ↓
@@ -35,43 +25,81 @@ def register_link_tools(mcp, client: FastAPIClient):
                 ↓
             link_features
 
-        Retorna os link_features calculados pelo PlanApp.
+        Retorna os resultados calculados pelo PlanApp.
+
+        Em caso de erro, retorna também a etapa e a exceção
+        original para facilitar o diagnóstico.
         """
 
-        # ----------------------------------------------------
-        # 1. Define o enlace
-        # ----------------------------------------------------
+        # ====================================================
+        # 1. SET LINK
+        # ====================================================
 
-        set_result = client.set_link(
-            tx_lat=tx_lat,
-            tx_lon=tx_lon,
-            rx_lat=rx_lat,
-            rx_lon=rx_lon,
-            tx_ha=tx_ha,
-            rx_ha=rx_ha,
-            freq_mhz=freq_mhz,
-            tx_ha_abs=tx_ha_abs,
-            rx_ha_abs=rx_ha_abs,
-            on_rooftop=on_rooftop,
-        )
+        try:
 
-        # ----------------------------------------------------
-        # 2. Prepara os perfis
-        # ----------------------------------------------------
+            set_result = client.set_link(
+                tx_lat=tx_lat,
+                tx_lon=tx_lon,
+                rx_lat=rx_lat,
+                rx_lon=rx_lon,
+                tx_ha=tx_ha,
+                rx_ha=rx_ha,
+                freq_mhz=freq_mhz,
+                on_rooftop=on_rooftop,
+            )
 
-        prepare_result = client.prepare_profiles()
+        except Exception as e:
 
-        # ----------------------------------------------------
-        # 3. Avalia o enlace
-        # ----------------------------------------------------
+            return {
+                "status": "ERROR",
+                "stage": "set_link",
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
 
-        features_result = client.link_features()
+        # ====================================================
+        # 2. PREPARE PROFILES
+        # ====================================================
 
-        # ----------------------------------------------------
-        # 4. Retorna resultado
-        # ----------------------------------------------------
+        try:
+
+            prepare_result = client.prepare_profiles()
+
+        except Exception as e:
+
+            return {
+                "status": "ERROR",
+                "stage": "prepare_profiles",
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "set_link": set_result,
+            }
+
+        # ====================================================
+        # 3. LINK FEATURES
+        # ====================================================
+
+        try:
+
+            features_result = client.link_features()
+
+        except Exception as e:
+
+            return {
+                "status": "ERROR",
+                "stage": "link_features",
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "set_link": set_result,
+                "prepare_profiles": prepare_result,
+            }
+
+        # ====================================================
+        # SUCESSO
+        # ====================================================
 
         return {
+            "status": "OK",
             "set_link": set_result,
             "prepare_profiles": prepare_result,
             "link_features": features_result,

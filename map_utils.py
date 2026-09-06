@@ -1,71 +1,13 @@
 # ============================================================
-# map_utils.py — Utilitários para visualização de enlaces
+# PLANAPP AI
+# map_utils.py
 # ============================================================
 
-from ipyleaflet import Map, Marker, Polyline
-from IPython.display import display
-
-
-def _extrair_coordenadas_enlace(agent):
-    """
-    Procura as duas coordenadas geocodificadas armazenadas pelo agente.
-
-    Retorna:
-        tx = (lat, lon)
-        rx = (lat, lon)
-
-    Levanta ValueError caso não encontre um enlace válido.
-    """
-
-    pontos = getattr(agent, "geocoded_points", None)
-
-    if not pontos:
-        raise ValueError(
-            "Nenhum ponto geocodificado foi encontrado no agente."
-        )
-
-    if len(pontos) < 2:
-        raise ValueError(
-            "O agente possui menos de dois pontos geocodificados."
-        )
-
-    def extrair_lat_lon(ponto):
-        """
-        Aceita diferentes formatos possíveis de ponto.
-        """
-
-        if isinstance(ponto, dict):
-
-            # Formato direto:
-            # {"lat": ..., "lon": ...}
-            if "lat" in ponto and "lon" in ponto:
-                return (
-                    float(ponto["lat"]),
-                    float(ponto["lon"]),
-                )
-
-            # Formato latitude/longitude
-            if "latitude" in ponto and "longitude" in ponto:
-                return (
-                    float(ponto["latitude"]),
-                    float(ponto["longitude"]),
-                )
-
-        # Caso o ponto seja uma tupla/lista
-        if isinstance(ponto, (tuple, list)) and len(ponto) >= 2:
-            return (
-                float(ponto[0]),
-                float(ponto[1]),
-            )
-
-        raise ValueError(
-            f"Formato de coordenada não reconhecido: {ponto!r}"
-        )
-
-    tx = extrair_lat_lon(pontos[0])
-    rx = extrair_lat_lon(pontos[1])
-
-    return tx, rx
+from ipyleaflet import (
+    Map,
+    Marker,
+    Polyline,
+)
 
 
 def mostrar_mapa_enlace(
@@ -76,155 +18,217 @@ def mostrar_mapa_enlace(
     max_zoom=18,
 ):
     """
-    Mostra o último enlace analisado pelo agente.
+    Cria e retorna o mapa do enlace.
 
-    Parâmetros
-    ----------
-    agent :
-        Instância atual de PlanAppAgent.
-
-    margin :
-        Margem proporcional ao redor do enlace.
-        0.20 = 20%.
-
-    min_span :
-        Extensão geográfica mínima para evitar zoom excessivo
-        em enlaces muito curtos.
-
-    min_zoom :
-        Zoom mínimo permitido.
-
-    max_zoom :
-        Zoom máximo permitido.
-
-    Retorna
-    -------
-    Map
-        Objeto ipyleaflet.Map criado.
+    Esta função NÃO executa display().
     """
 
-    # --------------------------------------------------------
-    # 1. Recupera TX e RX
-    # --------------------------------------------------------
+    points = getattr(
+        agent,
+        "geocoded_points",
+        []
+    )
 
-    tx, rx = _extrair_coordenadas_enlace(agent)
+    if len(points) < 2:
 
-    tx_lat, tx_lon = tx
-    rx_lat, rx_lon = rx
+        raise ValueError(
+            "São necessários pelo menos dois "
+            "pontos geocodificados."
+        )
 
-    # --------------------------------------------------------
-    # 2. Calcula o bounding box do enlace
-    # --------------------------------------------------------
+    # ========================================================
+    # TX / RX
+    # ========================================================
 
-    lat_min = min(tx_lat, rx_lat)
-    lat_max = max(tx_lat, rx_lat)
+    tx = points[0]
+    rx = points[1]
 
-    lon_min = min(tx_lon, rx_lon)
-    lon_max = max(tx_lon, rx_lon)
+    tx_lat = float(
+        tx["lat"]
+    )
 
-    lat_span = lat_max - lat_min
-    lon_span = lon_max - lon_min
+    tx_lon = float(
+        tx["lon"]
+    )
 
-    # --------------------------------------------------------
-    # 3. Garante uma dimensão mínima
-    # --------------------------------------------------------
+    rx_lat = float(
+        rx["lat"]
+    )
 
-    lat_span = max(lat_span, min_span)
-    lon_span = max(lon_span, min_span)
+    rx_lon = float(
+        rx["lon"]
+    )
 
-    # --------------------------------------------------------
-    # 4. Adiciona margem proporcional
-    # --------------------------------------------------------
+    # ========================================================
+    # CENTRO
+    # ========================================================
 
-    lat_margin = lat_span * margin
-    lon_margin = lon_span * margin
+    center_lat = (
+        tx_lat + rx_lat
+    ) / 2.0
 
-    south = lat_min - lat_margin
-    north = lat_max + lat_margin
+    center_lon = (
+        tx_lon + rx_lon
+    ) / 2.0
 
-    west = lon_min - lon_margin
-    east = lon_max + lon_margin
+    # ========================================================
+    # BOUNDS
+    # ========================================================
+
+    lat_min = min(
+        tx_lat,
+        rx_lat
+    )
+
+    lat_max = max(
+        tx_lat,
+        rx_lat
+    )
+
+    lon_min = min(
+        tx_lon,
+        rx_lon
+    )
+
+    lon_max = max(
+        tx_lon,
+        rx_lon
+    )
+
+    lat_span = max(
+        lat_max - lat_min,
+        min_span
+    )
+
+    lon_span = max(
+        lon_max - lon_min,
+        min_span
+    )
+
+    lat_margin = (
+        lat_span * margin
+    )
+
+    lon_margin = (
+        lon_span * margin
+    )
 
     bounds = [
-        [south, west],
-        [north, east],
+        [
+            lat_min - lat_margin,
+            lon_min - lon_margin,
+        ],
+        [
+            lat_max + lat_margin,
+            lon_max + lon_margin,
+        ],
     ]
 
-    # --------------------------------------------------------
-    # 5. Centro inicial
-    # --------------------------------------------------------
-
-    center = (
-        (south + north) / 2,
-        (west + east) / 2,
-    )
-
-    # --------------------------------------------------------
-    # 6. Cria o mapa
-    # --------------------------------------------------------
+    # ========================================================
+    # MAPA
+    # ========================================================
 
     m = Map(
-        center=center,
+        center=(
+            center_lat,
+            center_lon
+        ),
         zoom=min_zoom,
         scroll_wheel_zoom=True,
+        layout={
+            "width": "100%",
+            "height": "600px",
+        },
     )
 
-    # --------------------------------------------------------
-    # 7. Marcador TX
-    # --------------------------------------------------------
+    # ========================================================
+    # MARCADOR TX
+    # ========================================================
 
     marker_tx = Marker(
-        location=(tx_lat, tx_lon),
-        title="TX",
+        location=(
+            tx_lat,
+            tx_lon
+        ),
+        draggable=False,
+        title=tx.get(
+            "name",
+            "TX"
+        ),
     )
 
-    # --------------------------------------------------------
-    # 8. Marcador RX
-    # --------------------------------------------------------
+    # ========================================================
+    # MARCADOR RX
+    # ========================================================
 
     marker_rx = Marker(
-        location=(rx_lat, rx_lon),
-        title="RX",
+        location=(
+            rx_lat,
+            rx_lon
+        ),
+        draggable=False,
+        title=rx.get(
+            "name",
+            "RX"
+        ),
     )
 
-    # --------------------------------------------------------
-    # 9. Linha do enlace
-    # --------------------------------------------------------
+    # ========================================================
+    # LINHA
+    # ========================================================
 
-    linha = Polyline(
+    line = Polyline(
         locations=[
-            (tx_lat, tx_lon),
-            (rx_lat, rx_lon),
+            (
+                tx_lat,
+                tx_lon
+            ),
+            (
+                rx_lat,
+                rx_lon
+            ),
         ],
         weight=4,
     )
 
-    # --------------------------------------------------------
-    # 10. Adiciona elementos ao mapa
-    # --------------------------------------------------------
+    # ========================================================
+    # CAMADAS
+    # ========================================================
 
-    m.add_layer(linha)
-    m.add_layer(marker_tx)
-    m.add_layer(marker_rx)
+    m.add_layer(
+        marker_tx
+    )
 
-    # --------------------------------------------------------
-    # 11. Enquadra automaticamente TX e RX
-    # --------------------------------------------------------
+    m.add_layer(
+        marker_rx
+    )
 
-    m.fit_bounds(bounds)
+    m.add_layer(
+        line
+    )
 
-    # --------------------------------------------------------
-    # 12. Guarda informações no objeto mapa
-    # --------------------------------------------------------
+    # ========================================================
+    # BOUNDS
+    # ========================================================
 
-    m.tx = tx
-    m.rx = rx
+    m.fit_bounds(
+        bounds
+    )
+
+    # ========================================================
+    # METADADOS
+    # ========================================================
+
+    m.tx = marker_tx
+
+    m.rx = marker_rx
+
+    m.link = line
+
     m.link_bounds = bounds
 
-    # --------------------------------------------------------
-    # 13. Mostra o mapa
-    # --------------------------------------------------------
-
-    display(m)
+    # ========================================================
+    # RETORNO
+    # ========================================================
 
     return m

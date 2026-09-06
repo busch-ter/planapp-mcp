@@ -1,18 +1,11 @@
 # ============================================================
+# PLANAPP AI — JUPYTER
 # agent_jupyter.py
-# PlanApp Agent
-#
-# Jupyter
-#   ↓
-# Ollama / Qwen
-#   ↓
-# MCP
-#   ↓
-# PlanApp
 # ============================================================
 
 import asyncio
 import json
+
 from contextlib import AsyncExitStack
 
 import httpx
@@ -20,12 +13,15 @@ import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from map_utils import mostrar_mapa_enlace
+
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 
 OLLAMA_URL = "http://172.17.0.1:11434"
+
 OLLAMA_MODEL = "qwen3:8b"
 
 MCP_URL = "http://172.17.0.1:8010/mcp"
@@ -34,8 +30,6 @@ USER_ID = "jupyter-user"
 
 OLLAMA_TIMEOUT = 300.0
 
-# True somente para depuração técnica no terminal/kernel.
-# A interface do Jupyter continua mostrando apenas o log amigável.
 DEBUG = False
 
 
@@ -53,463 +47,255 @@ class PlanAppAgent:
 
         self.mcp_session = None
 
-        self.tools = []
-
-        self.ollama_tools = []
+        self.mcp_tools = []
 
         self.messages = []
 
-        self.connected = False
+        self.user_id = USER_ID
 
-        self.evaluate_link_executed = False
+        self.registered = False
+
+        self.evaluate_executed = False
 
         self.geocoded_points = []
 
+        # ----------------------------------------------------
+        # Objeto ipyleaflet.Map
+        # ----------------------------------------------------
+
+        self.map = None
+
         self.current_stage = None
 
-        self.tool_execution_count = 0
+        self.tool_count = 0
+
+        self.last_evaluate_result = None
 
     # ========================================================
     # LOG
     # ========================================================
 
-    def log(self, message):
+    def log(
+        self,
+        texto,
+        tipo="processing"
+    ):
+
+        if DEBUG:
+            print(texto)
 
         if self.progress_callback:
 
-            self.progress_callback(message)
+            try:
 
-        if DEBUG:
+                self.progress_callback(
+                    texto,
+                    tipo
+                )
 
-            print(message)
+            except TypeError:
+
+                try:
+
+                    self.progress_callback(
+                        texto
+                    )
+
+                except Exception:
+                    pass
+
+            except Exception:
+
+                pass
 
     # ========================================================
-    # CONEXÃO MCP
+    # CONNECT
     # ========================================================
 
     async def connect(self):
-
-        if self.connected:
-            return
-
-        try:
-
-            # ------------------------------------------------
-            # Conecta ao MCP via Streamable HTTP
-            # ------------------------------------------------
-
-            read_stream, write_stream = (
-                await self.exit_stack.enter_async_context(
-                    streamable_http_client(MCP_URL)
+    
+        transport = (
+            await self.exit_stack.enter_async_context(
+                streamable_http_client(
+                    MCP_URL
                 )
             )
-
-            self.mcp_session = (
-                await self.exit_stack.enter_async_context(
-                    ClientSession(
-                        read_stream,
-                        write_stream
-                    )
+        )
+    
+        read_stream, write_stream = transport
+    
+        self.mcp_session = (
+            await self.exit_stack.enter_async_context(
+                ClientSession(
+                    read_stream,
+                    write_stream
                 )
             )
-
-            # ------------------------------------------------
-            # Inicializa sessão MCP
-            # ------------------------------------------------
-
-            await self.mcp_session.initialize()
-
-            # ------------------------------------------------
-            # Descobre ferramentas
-            # ------------------------------------------------
-
-            tools_result = await self.mcp_session.list_tools()
-
-            self.tools = tools_result.tools
-
-            # ------------------------------------------------
-            # Converte ferramentas MCP para formato Ollama
-            # ------------------------------------------------
-
-            self.ollama_tools = (
-                self.build_ollama_tools()
-            )
-
-            self.connected = True
-
-            self.log(
-                f"🟢 MCP conectado — "
-                f"{len(self.tools)} ferramentas disponíveis."
-            )
-
-            if DEBUG:
-
-                print()
-                print("========== MCP TOOLS ==========")
-
-                for tool in self.tools:
-
-                    print(
-                        f"- {tool.name}"
-                    )
-
-                print()
-                print("========== OLLAMA TOOLS ==========")
-
-                print(
-                    json.dumps(
-                        self.ollama_tools,
-                        indent=2,
-                        ensure_ascii=False
-                    )
-                )
-
-        except Exception as e:
-
-            self.log(
-                f"🔴 Erro ao conectar ao MCP: {e}"
-            )
-
-            raise
+        )
+    
+        await self.mcp_session.initialize()
+    
+        tools_result = (
+            await self.mcp_session.list_tools()
+        )
+    
+        self.mcp_tools = tools_result.tools
+    
+        self.log(
+            f"🟢 MCP conectado — "
+            f"{len(self.mcp_tools)} ferramentas disponíveis."
+        )
 
     # ========================================================
-    # CONVERTE MCP → OLLAMA
+    # BUILD OLLAMA TOOLS
     # ========================================================
-
     def build_ollama_tools(self):
-
+    
         tools = []
-
-        for tool in self.tools:
-
-            # ------------------------------------------------
-            # Schema de entrada MCP
-            # ------------------------------------------------
-
-            input_schema = getattr(
-                tool,
-                "inputSchema",
-                None
-            )
-
-            # Algumas versões/clientes podem usar
-            # input_schema.
-            if input_schema is None:
-
-                input_schema = getattr(
-                    tool,
-                    "input_schema",
-                    None
-                )
-
-            if input_schema is None:
-
-                input_schema = {
-                    "type": "object",
-                    "properties": {}
-                }
-
-            # ------------------------------------------------
-            # Formato esperado pelo Ollama
-            # ------------------------------------------------
-
-            ollama_tool = {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": (
-                        tool.description or ""
-                    ),
-                    "parameters": input_schema,
-                },
-            }
-
+    
+        for tool in self.mcp_tools:
+    
+            # ----------------------------------------------------
+            # register:
+            # executado diretamente pelo agente.
+            # ----------------------------------------------------
+    
+            if tool.name == "register":
+                continue
+    
+            # ----------------------------------------------------
+            # evaluate_link:
+            # executado automaticamente pelo agente quando os
+            # dois pontos forem geocodificados.
+            #
+            # Não deve ser exposto ao Qwen, para evitar chamada
+            # duplicada.
+            # ----------------------------------------------------
+    
+            if tool.name == "evaluate_link":
+                continue
+    
             tools.append(
-                ollama_tool
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": (
+                            tool.description
+                            or ""
+                        ),
+                        "parameters": (
+                            tool.input_schema
+                        ),
+                    },
+                }
             )
-
+    
         return tools
 
     # ========================================================
-    # FECHAR MCP
-    # ========================================================
-
-    async def close(self):
-
-        try:
-
-            await self.exit_stack.aclose()
-
-        except Exception:
-
-            pass
-
-        self.connected = False
-
-        self.mcp_session = None
-
-        self.tools = []
-
-        self.ollama_tools = []
-
-    # ========================================================
-    # RESET DA ANÁLISE
+    # RESET
     # ========================================================
 
     def reset_state(self):
 
         self.messages = []
 
-        self.evaluate_link_executed = False
+        self.registered = False
+
+        self.evaluate_executed = False
 
         self.geocoded_points = []
 
+        self.map = None
+
         self.current_stage = None
 
-        self.tool_execution_count = 0
+        self.tool_count = 0
+
+        self.last_evaluate_result = None
 
     # ========================================================
-    # TENTA INTERPRETAR JSON
+    # REGISTER
     # ========================================================
 
-    def try_json(self, value):
+    async def register_session(self):
 
-        if isinstance(
-            value,
-            (dict, list)
-        ):
+        self.log(
+            "🔵 Registrando sessão no PlanApp"
+        )
 
-            return value
+        self.log(
+            "🔧 MCP: register"
+        )
 
-        if not isinstance(
-            value,
-            str
-        ):
+        await self.mcp_session.call_tool(
+            "register",
+            {
+                "user_id": self.user_id
+            }
+        )
 
-            return None
+        self.registered = True
 
-        text = value.strip()
-
-        if not text:
-
-            return None
-
-        # ----------------------------------------------------
-        # JSON direto
-        # ----------------------------------------------------
-
-        try:
-
-            return json.loads(text)
-
-        except Exception:
-
-            pass
-
-        # ----------------------------------------------------
-        # JSON dentro de texto
-        # ----------------------------------------------------
-
-        start = text.find("{")
-
-        end = text.rfind("}")
-
-        if start >= 0 and end > start:
-
-            candidate = text[
-                start:end + 1
-            ]
-
-            try:
-
-                return json.loads(
-                    candidate
-                )
-
-            except Exception:
-
-                pass
-
-        # ----------------------------------------------------
-        # Lista JSON
-        # ----------------------------------------------------
-
-        start = text.find("[")
-
-        end = text.rfind("]")
-
-        if start >= 0 and end > start:
-
-            candidate = text[
-                start:end + 1
-            ]
-
-            try:
-
-                return json.loads(
-                    candidate
-                )
-
-            except Exception:
-
-                pass
-
-        return None
+        self.log(
+            "🟢 Sessão PlanApp registrada."
+        )
 
     # ========================================================
-    # EXTRAI RESULTADO DO MCP
+    # PARSE MCP RESULT
     # ========================================================
 
-    def extract_mcp_result(self, result):
+    def parse_mcp_result(
+        self,
+        result
+    ):
 
         if result is None:
-
             return None
 
-        # ----------------------------------------------------
-        # Dict/list direto
-        # ----------------------------------------------------
-
-        if isinstance(
+        if hasattr(
             result,
-            (dict, list)
+            "content"
         ):
 
-            return result
+            content = result.content
 
-        # ----------------------------------------------------
-        # structuredContent
-        # ----------------------------------------------------
-
-        structured = getattr(
-            result,
-            "structuredContent",
-            None
-        )
-
-        if structured:
-
-            return structured
-
-        # ----------------------------------------------------
-        # structured_content
-        # ----------------------------------------------------
-
-        structured = getattr(
-            result,
-            "structured_content",
-            None
-        )
-
-        if structured:
-
-            return structured
-
-        # ----------------------------------------------------
-        # Conteúdo MCP
-        # ----------------------------------------------------
-
-        content = getattr(
-            result,
-            "content",
-            None
-        )
-
-        if content is not None:
-
-            if isinstance(
-                content,
-                list
-            ):
+            if content:
 
                 for item in content:
 
-                    # TextContent
-                    text = getattr(
+                    if hasattr(
                         item,
-                        "text",
-                        None
-                    )
-
-                    if text is not None:
-
-                        parsed = self.try_json(
-                            text
-                        )
-
-                        if parsed is not None:
-
-                            return parsed
-
-                        return text
-
-                    # Dict
-                    if isinstance(
-                        item,
-                        dict
+                        "text"
                     ):
 
-                        if "text" in item:
+                        text = item.text
 
-                            parsed = self.try_json(
-                                item["text"]
+                        try:
+
+                            return json.loads(
+                                text
                             )
 
-                            if parsed is not None:
+                        except Exception:
 
-                                return parsed
+                            return text
 
-                            return item["text"]
-
-                        if "json" in item:
-
-                            return item["json"]
-
-            # Content como string
-            if isinstance(
-                content,
-                str
-            ):
-
-                parsed = self.try_json(
-                    content
-                )
-
-                if parsed is not None:
-
-                    return parsed
-
-                return content
-
-        # ----------------------------------------------------
-        # Fallback text
-        # ----------------------------------------------------
-
-        text = getattr(
+        if hasattr(
             result,
-            "text",
-            None
-        )
+            "structuredContent"
+        ):
 
-        if text is not None:
-
-            parsed = self.try_json(
-                text
-            )
-
-            if parsed is not None:
-
-                return parsed
-
-            return text
+            return result.structuredContent
 
         return result
 
     # ========================================================
-    # BUSCA VALOR RECURSIVAMENTE
+    # RECURSIVE FIND
     # ========================================================
 
-    def find_value(
+    def recursive_find(
         self,
         obj,
         keys
@@ -528,14 +314,14 @@ class PlanAppAgent:
 
             for value in obj.values():
 
-                found = self.find_value(
+                result = self.recursive_find(
                     value,
                     keys
                 )
 
-                if found is not None:
+                if result is not None:
 
-                    return found
+                    return result
 
         elif isinstance(
             obj,
@@ -544,19 +330,19 @@ class PlanAppAgent:
 
             for item in obj:
 
-                found = self.find_value(
+                result = self.recursive_find(
                     item,
                     keys
                 )
 
-                if found is not None:
+                if result is not None:
 
-                    return found
+                    return result
 
         return None
 
     # ========================================================
-    # EXTRAI COORDENADAS
+    # EXTRACT COORDINATES
     # ========================================================
 
     def extract_coordinates(
@@ -564,85 +350,82 @@ class PlanAppAgent:
         result
     ):
 
-        data = self.extract_mcp_result(
-            result
+        latitude = self.recursive_find(
+            result,
+            [
+                "lat",
+                "latitude",
+                "y",
+            ]
         )
 
-        if not isinstance(
-            data,
-            dict
+        longitude = self.recursive_find(
+            result,
+            [
+                "lon",
+                "lng",
+                "longitude",
+                "x",
+            ]
+        )
+
+        if (
+            latitude is None
+            or longitude is None
         ):
-
-            return None
-
-        # ----------------------------------------------------
-        # Formato real do seu geocode.py:
-        #
-        # {
-        #     "status": "OK",
-        #     "query": "...",
-        #     "results": [...]
-        # }
-        # ----------------------------------------------------
-
-        results = data.get(
-            "results"
-        )
-
-        if not isinstance(
-            results,
-            list
-        ):
-
-            return None
-
-        if not results:
-
-            return None
-
-        candidate = results[0]
-
-        if not isinstance(
-            candidate,
-            dict
-        ):
-
-            return None
-
-        lat = candidate.get(
-            "lat"
-        )
-
-        lon = candidate.get(
-            "lon"
-        )
-
-        if lat is None or lon is None:
 
             return None
 
         try:
 
-            return {
-                "lat": float(lat),
-                "lon": float(lon),
-                "name": candidate.get(
-                    "name"
-                ),
-                "display_name": candidate.get(
-                    "display_name"
-                ),
-            }
+            return (
+                float(latitude),
+                float(longitude)
+            )
 
-        except (
-            TypeError,
-            ValueError
-        ):
+        except Exception:
 
             return None
 
     # ========================================================
-    # RESUMO GEOCODE
+    # REGISTER GEOCODED POINT
+    # ========================================================
+
+    def register_geocoded_point(
+        self,
+        result,
+        arguments
+    ):
+
+        coords = self.extract_coordinates(
+            result
+        )
+
+        if coords is None:
+            return
+
+        lat, lon = coords
+
+        name = (
+            arguments.get("query")
+            or arguments.get("place")
+            or arguments.get("name")
+            or (
+                f"Ponto "
+                f"{len(self.geocoded_points) + 1}"
+            )
+        )
+
+        self.geocoded_points.append(
+            {
+                "name": str(name),
+                "lat": lat,
+                "lon": lon,
+            }
+        )
+
+    # ========================================================
+    # GEOCODE SUMMARY
     # ========================================================
 
     def summarize_geocode(
@@ -650,499 +433,51 @@ class PlanAppAgent:
         result
     ):
 
-        data = self.extract_mcp_result(
+        coords = self.extract_coordinates(
             result
         )
 
-        if not isinstance(
-            data,
-            dict
-        ):
+        if coords is None:
+            return ""
 
-            return (
-                "Resultado de geocodificação "
-                "não reconhecido."
-            )
+        lat, lon = coords
 
-        status = data.get(
-            "status"
+        return (
+            f"{lat:.7f}, "
+            f"{lon:.7f}"
         )
-
-        if status == "NOT_FOUND":
-
-            query = data.get(
-                "query",
-                ""
-            )
-
-            return (
-                f"{query} → não encontrado"
-            )
-
-        results = data.get(
-            "results"
-        )
-
-        if not isinstance(
-            results,
-            list
-        ):
-
-            query = data.get(
-                "query",
-                ""
-            )
-
-            return (
-                f"{query} → nenhum resultado"
-            )
-
-        if not results:
-
-            query = data.get(
-                "query",
-                ""
-            )
-
-            return (
-                f"{query} → nenhum resultado"
-            )
-
-        candidate = results[0]
-
-        if not isinstance(
-            candidate,
-            dict
-        ):
-
-            return (
-                "Resultado de geocodificação inválido."
-            )
-
-        name = (
-            candidate.get("name")
-            or data.get("query")
-            or "Ponto"
-        )
-
-        lat = candidate.get(
-            "lat"
-        )
-
-        lon = candidate.get(
-            "lon"
-        )
-
-        if lat is None or lon is None:
-
-            return (
-                f"{name} → "
-                "coordenadas não encontradas"
-            )
-
-        try:
-
-            lat = float(lat)
-
-            lon = float(lon)
-
-            return (
-                f"{name} → "
-                f"{lat:.7f}, {lon:.7f}"
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-
-            return (
-                f"{name} → "
-                "coordenadas inválidas"
-            )
 
     # ========================================================
-    # REGISTRA PONTO GEOCODIFICADO
+    # EVALUATE SUMMARY
     # ========================================================
 
-    def register_geocoded_point(
+    def summarize_evaluate(
         self,
         result
     ):
 
-        point = self.extract_coordinates(
-            result
+        fspl = self.recursive_find(
+            result,
+            [
+                "fspl_db",
+                "fspl",
+                "FSPL",
+            ]
         )
 
-        if point is None:
-
+        if fspl is None:
             return None
-
-        self.geocoded_points.append(
-            point
-        )
-
-        return point
-
-    # ========================================================
-    # FORMATA NÚMERO BRASILEIRO
-    # ========================================================
-
-    def format_number(
-        self,
-        value,
-        decimals=2
-    ):
 
         try:
 
-            text = (
-                f"{float(value):,.{decimals}f}"
-            )
-
-            return (
-                text
-                .replace(",", "X")
-                .replace(".", ",")
-                .replace("X", ".")
-            )
+            return float(fspl)
 
         except Exception:
 
-            return str(value)
+            return fspl
 
     # ========================================================
-    # RESUMO DO EVALUATE_LINK
-    # ========================================================
-
-    def summarize_evaluate_link(
-        self,
-        result
-    ):
-
-        data = self.extract_mcp_result(
-            result
-        )
-
-        if data is None:
-
-            return (
-                "📥 Resultado do enlace recebido."
-            )
-
-        # ----------------------------------------------------
-        # Distância
-        # ----------------------------------------------------
-
-        dist = self.find_value(
-            data,
-            [
-                "dist_m",
-                "distance_m",
-                "distance",
-            ]
-        )
-
-        # ----------------------------------------------------
-        # FSPL
-        # ----------------------------------------------------
-
-        fspl = self.find_value(
-            data,
-            [
-                "fspl",
-                "fspl_db",
-            ]
-        )
-
-        # ----------------------------------------------------
-        # Difração
-        # ----------------------------------------------------
-
-        diffraction = self.find_value(
-            data,
-            [
-                "delta_diffra",
-                "diffraction",
-                "diffraction_db",
-                "diffra",
-            ]
-        )
-
-        # ----------------------------------------------------
-        # Edificações
-        # ----------------------------------------------------
-
-        buildings = self.find_value(
-            data,
-            [
-                "buildings",
-                "building",
-                "building_obstruction",
-            ]
-        )
-
-        # ----------------------------------------------------
-        # Terreno
-        # ----------------------------------------------------
-
-        terrain = self.find_value(
-            data,
-            [
-                "terrain",
-                "terrain_obstruction",
-            ]
-        )
-
-        lines = []
-
-        # ----------------------------------------------------
-        # Distância
-        # ----------------------------------------------------
-
-        if isinstance(
-            dist,
-            (int, float)
-        ):
-
-            lines.append(
-                "📥 Distância: "
-                + self.format_number(
-                    dist
-                )
-                + " m"
-            )
-
-        # ----------------------------------------------------
-        # FSPL
-        # ----------------------------------------------------
-
-        if isinstance(
-            fspl,
-            (int, float)
-        ):
-
-            lines.append(
-                "📥 FSPL: "
-                + self.format_number(
-                    fspl
-                )
-                + " dB"
-            )
-
-        # ----------------------------------------------------
-        # Difração
-        # ----------------------------------------------------
-
-        if isinstance(
-            diffraction,
-            (int, float)
-        ):
-
-            if diffraction > 0:
-
-                lines.append(
-                    "📥 Difração: "
-                    + self.format_number(
-                        diffraction
-                    )
-                    + " dB"
-                )
-
-        # ----------------------------------------------------
-        # Edificações
-        # ----------------------------------------------------
-
-        if self.has_obstruction(
-            buildings
-        ):
-
-            lines.append(
-                "📥 Obstrução por edifícios detectada"
-            )
-
-        # ----------------------------------------------------
-        # Terreno
-        # ----------------------------------------------------
-
-        if self.has_obstruction(
-            terrain
-        ):
-
-            lines.append(
-                "📥 Obstrução por terreno detectada"
-            )
-
-        # ----------------------------------------------------
-        # Fallback
-        # ----------------------------------------------------
-
-        if not lines:
-
-            lines.append(
-                "📥 Resultado do enlace recebido."
-            )
-
-        return "\n".join(lines)
-
-    # ========================================================
-    # DETECTA OBSTRUÇÃO
-    # ========================================================
-
-    def has_obstruction(
-        self,
-        value
-    ):
-
-        if value is None:
-
-            return False
-
-        # ----------------------------------------------------
-        # Número
-        # ----------------------------------------------------
-
-        if isinstance(
-            value,
-            (int, float)
-        ):
-
-            return value > 0
-
-        # ----------------------------------------------------
-        # String
-        # ----------------------------------------------------
-
-        if isinstance(
-            value,
-            str
-        ):
-
-            text = value.lower()
-
-            negative = [
-                "false",
-                "none",
-                "no",
-                "não",
-                "nao",
-                "clear",
-                "livre",
-            ]
-
-            for item in negative:
-
-                if item in text:
-
-                    return False
-
-            positive = [
-                "true",
-                "obstruction",
-                "obstru",
-                "blocked",
-                "bloque",
-            ]
-
-            for item in positive:
-
-                if item in text:
-
-                    return True
-
-            try:
-
-                return (
-                    float(value) > 0
-                )
-
-            except Exception:
-
-                return False
-
-        # ----------------------------------------------------
-        # Dict
-        # ----------------------------------------------------
-
-        if isinstance(
-            value,
-            dict
-        ):
-
-            for key in [
-                "core",
-                "fresnel",
-                "boundary",
-                "value",
-            ]:
-
-                v = value.get(
-                    key
-                )
-
-                if isinstance(
-                    v,
-                    (int, float)
-                ):
-
-                    if v > 0:
-
-                        return True
-
-            for v in value.values():
-
-                if self.has_obstruction(
-                    v
-                ):
-
-                    return True
-
-            return False
-
-        # ----------------------------------------------------
-        # Lista
-        # ----------------------------------------------------
-
-        if isinstance(
-            value,
-            list
-        ):
-
-            for item in value:
-
-                if self.has_obstruction(
-                    item
-                ):
-
-                    return True
-
-        return False
-
-    # ========================================================
-    # DETERMINA ETAPA
-    # ========================================================
-
-    def stage_for_tool(
-        self,
-        tool_name
-    ):
-
-        if tool_name == "geocode_place":
-
-            return (
-                "🔵 Etapa 1 — Localizando os pontos"
-            )
-
-        if tool_name == "evaluate_link":
-
-            return (
-                "🔵 Etapa 2 — Avaliando o enlace"
-            )
-
-        return None
-
-    # ========================================================
-    # EXECUTA FERRAMENTA MCP
+    # EXECUTE MCP TOOL
     # ========================================================
 
     async def execute_mcp_tool(
@@ -1151,725 +486,608 @@ class PlanAppAgent:
         arguments
     ):
 
-        if self.mcp_session is None:
-
-            raise RuntimeError(
-                "Sessão MCP não inicializada."
-            )
-
         # ----------------------------------------------------
-        # Etapa visual
+        # Evita evaluate_link duplicado
         # ----------------------------------------------------
-
-        stage = self.stage_for_tool(
-            tool_name
-        )
 
         if (
-            stage
-            and stage != self.current_stage
+            tool_name == "evaluate_link"
+            and self.evaluate_executed
         ):
 
-            self.current_stage = stage
+            self.log(
+                "⚠️ evaluate_link já foi executado. "
+                "Ignorando chamada duplicada."
+            )
 
-            self.log(stage)
+            return self.last_evaluate_result
 
-        # ----------------------------------------------------
-        # Log ferramenta
-        # ----------------------------------------------------
+        self.tool_count += 1
 
         self.log(
             f"🔧 MCP: {tool_name}"
         )
 
-        self.tool_execution_count += 1
-
-        # ----------------------------------------------------
-        # Executa MCP
-        # ----------------------------------------------------
-
-        result = await self.mcp_session.call_tool(
-            tool_name,
-            arguments=arguments
+        result = (
+            await self.mcp_session.call_tool(
+                tool_name,
+                arguments or {}
+            )
         )
 
-        # ----------------------------------------------------
+        parsed = self.parse_mcp_result(
+            result
+        )
+
+        # ====================================================
         # GEOCODE
-        # ----------------------------------------------------
+        # ====================================================
 
         if tool_name == "geocode_place":
 
-            summary = (
-                self.summarize_geocode(
-                    result
-                )
+            summary = self.summarize_geocode(
+                parsed
             )
+
+            if summary:
+
+                self.log(
+                    summary
+                )
 
             self.register_geocoded_point(
-                result
+                parsed,
+                arguments or {}
             )
 
-            self.log(
-                f"📥 {summary}"
-            )
+            # ------------------------------------------------
+            # Quando os dois pontos existem,
+            # cria o mapa.
+            # ------------------------------------------------
 
-        # ----------------------------------------------------
-        # EVALUATE LINK
-        # ----------------------------------------------------
+            if len(
+                self.geocoded_points
+            ) >= 2:
+
+                await self.mostrar_mapa_apos_geocodificacao()
+
+        # ====================================================
+        # EVALUATE
+        # ====================================================
 
         elif tool_name == "evaluate_link":
 
-            self.evaluate_link_executed = True
+            self.evaluate_executed = True
 
-            summary = (
-                self.summarize_evaluate_link(
-                    result
-                )
+            self.last_evaluate_result = parsed
+
+            fspl = self.summarize_evaluate(
+                parsed
             )
 
-            self.log(summary)
+            if fspl is not None:
 
-        return result
+                try:
+
+                    self.log(
+                        f"📥 FSPL: "
+                        f"{float(fspl):.2f} dB"
+                    )
+
+                except Exception:
+
+                    self.log(
+                        f"📥 FSPL: {fspl}"
+                    )
+
+        return parsed
 
     # ========================================================
-    # CHAMADA OLLAMA
-    #
-    # AQUI ESTÁ A CORREÇÃO PRINCIPAL:
-    #
-    # "tools": self.ollama_tools
-    #
-    # Assim o Qwen recebe os schemas das ferramentas MCP.
+    # PREPARA MAPA
     # ========================================================
 
-    async def call_ollama(
-        self,
-        messages
+    async def mostrar_mapa_apos_geocodificacao(
+        self
     ):
 
-        url = (
-            f"{OLLAMA_URL}/api/chat"
-        )
+        if len(
+            self.geocoded_points
+        ) < 2:
 
-        payload = {
-            "model": OLLAMA_MODEL,
-            "messages": messages,
+            return
 
-            # =================================================
-            # CORREÇÃO FUNDAMENTAL
-            # =================================================
-            "tools": self.ollama_tools,
+        try:
 
-            "stream": False,
+            self.log(
+                "🗺️ Preparando enlace no mapa..."
+            )
 
-            "options": {
-                "temperature": 0.1,
-            },
+            self.map = (
+                mostrar_mapa_enlace(
+                    self
+                )
+            )
+
+            # ------------------------------------------------
+            # Diagnóstico interno
+            # ------------------------------------------------
+
+            self.log(
+                "🟢 Mapa preparado."
+            )
+
+        except Exception as e:
+
+            self.map = None
+
+            self.log(
+                f"⚠️ Não foi possível preparar "
+                f"o mapa: {e}"
+            )
+
+    # ========================================================
+    # ENSURE EVALUATE
+    # ========================================================
+
+    async def ensure_evaluate_link(
+        self
+    ):
+
+        if self.evaluate_executed:
+            return
+
+        if len(
+            self.geocoded_points
+        ) < 2:
+
+            return
+
+        tx = self.geocoded_points[0]
+
+        rx = self.geocoded_points[1]
+
+        arguments = {
+            "tx_lat": tx["lat"],
+            "tx_lon": tx["lon"],
+            "rx_lat": rx["lat"],
+            "rx_lon": rx["lon"],
+            "tx_ha": 7,
+            "rx_ha": 7,
+            "freq_mhz": 900,
+            "on_rooftop": False,
         }
 
-        if DEBUG:
+        self.current_stage = 2
 
-            print()
-            print(
-                "========== OLLAMA REQUEST =========="
-            )
+        self.log(
+            "🔵 Etapa 2 — Avaliando o enlace"
+        )
 
-            print(
-                json.dumps(
-                    payload,
-                    indent=2,
-                    ensure_ascii=False
-                )
-            )
-
-        async with httpx.AsyncClient(
-            timeout=OLLAMA_TIMEOUT
-        ) as client:
-
-            response = await client.post(
-                url,
-                json=payload
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-        if DEBUG:
-
-            print()
-            print(
-                "========== OLLAMA RESPONSE =========="
-            )
-
-            print(
-                json.dumps(
-                    data,
-                    indent=2,
-                    ensure_ascii=False
-                )
-            )
-
-        return data.get(
-            "message",
-            {}
+        await self.execute_mcp_tool(
+            "evaluate_link",
+            arguments
         )
 
     # ========================================================
     # SYSTEM PROMPT
     # ========================================================
 
-    def system_prompt(self):
+    def system_prompt(
+        self
+    ):
 
         return """
-Você é o agente de planejamento de enlaces de rádio do PlanApp.
+Você é o agente de IA do PlanApp.
 
-Você deve utilizar obrigatoriamente as ferramentas MCP disponíveis
-para realizar a análise técnica.
+Sua função é interpretar solicitações de planejamento
+e utilizar as ferramentas MCP do PlanApp para obter
+informações geoespaciais e de enlaces de rádio.
 
-FERRAMENTAS:
+REGRAS IMPORTANTES:
 
-- geocode_place:
-  Localiza endereços, cidades e pontos de interesse e retorna
-  coordenadas geográficas.
+1. O PlanApp é a fonte de verdade para os cálculos.
 
-- evaluate_link:
-  Executa a análise real do enlace através do PlanApp.
+2. Nunca invente valores técnicos.
 
-- register:
-  Ferramenta auxiliar de sessão. Não é necessário chamá-la
-  para uma análise normal se a sessão já estiver funcionando.
+3. Nunca recalcule valores fornecidos pelo PlanApp
+   usando fórmulas próprias.
 
-============================================================
-FLUXO OBRIGATÓRIO
-============================================================
+4. Não altere ou substitua valores retornados pelas
+   ferramentas.
 
-Quando o usuário pedir uma análise entre dois locais:
+5. Utilize geocode_place para localizar os pontos
+   solicitados pelo usuário.
 
-1. Identifique o TX.
-2. Identifique o RX.
-3. Execute geocode_place para o TX.
-4. Execute geocode_place para o RX.
-5. Aguarde os resultados reais das duas geocodificações.
-6. Execute obrigatoriamente evaluate_link.
-7. Aguarde o resultado real do PlanApp.
-8. Somente então produza a análise técnica.
+6. Depois que os dois pontos forem localizados,
+   utilize evaluate_link para obter os resultados
+   técnicos do enlace.
 
-NÃO produza uma análise técnica antes de executar evaluate_link.
+7. Distância, FSPL, difração, obstruções, clearance,
+   terreno, edifícios e demais parâmetros devem ser
+   apresentados exatamente de acordo com os dados
+   retornados pelo PlanApp.
 
-============================================================
-PARÂMETROS PADRÃO
-============================================================
+8. Não interprete clearance como altura de antena.
 
-Se o usuário não informar parâmetros de rádio, utilize:
+9. Não invente potência, ganho de antena, sensibilidade,
+   margem de enlace ou qualquer outro parâmetro que
+   não tenha sido fornecido.
 
-frequência:
-900 MHz
+10. Não declare que um enlace é viável ou inviável
+    apenas com base em distância, FSPL, difração ou
+    obstruções.
 
-altura TX:
-7 metros
+11. Se os dados disponíveis não forem suficientes para
+    determinar a viabilidade completa do enlace, diga
+    explicitamente que são necessários outros parâmetros.
 
-altura RX:
-7 metros
+12. Faça uma interpretação técnica objetiva dos dados
+    efetivamente fornecidos pelo PlanApp.
 
-on_rooftop:
-false
+13. Não mencione detalhes internos de MCP, chamadas HTTP,
+    sessões ou implementação, a menos que o usuário
+    pergunte especificamente.
 
-Não pergunte esses parâmetros ao usuário quando eles não forem
-informados.
+14. Responda em português.
 
-============================================================
-REGRA ABSOLUTA SOBRE RESULTADOS
-============================================================
-
-Nunca invente resultados do PlanApp.
-
-Nunca estime ou simule:
-
-- distância;
-- FSPL;
-- difração;
-- obstrução;
-- Fresnel;
-- folga;
-- ganho de antena;
-- potência;
-- margem;
-- alturas;
-- qualquer outro indicador técnico.
-
-Use somente valores efetivamente retornados pelo evaluate_link.
-
-Se um valor não estiver no resultado do PlanApp, diga que ele
-não foi fornecido.
-
-============================================================
-INTERPRETAÇÃO
-============================================================
-
-Analise tecnicamente os resultados reais retornados pelo PlanApp.
-
-Considere, quando disponíveis:
-
-- distância;
-- FSPL;
-- difração;
-- terreno;
-- edificações;
-- zona de Fresnel;
-- folga;
-- obstáculos;
-- demais indicadores retornados.
-
-Se houver obstrução por edifícios, mencione explicitamente.
-
-Se houver obstrução por terreno, mencione explicitamente.
-
-Não declare que um enlace é viável simplesmente porque a distância
-é pequena.
-
-Não declare que um enlace é inviável sem base nos resultados.
-
-============================================================
-FREQUÊNCIA E FSPL
-============================================================
-
-Para a mesma distância, frequências maiores produzem maior perda
-de espaço livre.
-
-Portanto, nunca diga que aumentar a frequência reduz a FSPL.
-
-============================================================
-RESPOSTA FINAL
-============================================================
-
-Depois que evaluate_link for executado, apresente uma conclusão
-técnica objetiva.
-
-Não invente dados ausentes.
-
-Não chame ferramentas desnecessariamente.
-
-Não peça parâmetros que possuem valores padrão.
+A análise deve ser baseada nos dados reais retornados
+pelas ferramentas.
 """
 
     # ========================================================
-    # GARANTE EVALUATE_LINK
-    #
-    # Segurança adicional:
-    # se o Qwen geocodificar os dois pontos mas não chamar
-    # evaluate_link, executamos automaticamente.
+    # OLLAMA CHAT
     # ========================================================
 
-    async def ensure_evaluate_link(self):
+    async def ollama_chat(
+        self
+    ):
 
-        if self.evaluate_link_executed:
-
-            return None
-
-        # ----------------------------------------------------
-        # Necessários dois pontos
-        # ----------------------------------------------------
-
-        if len(
-            self.geocoded_points
-        ) < 2:
-
-            return None
-
-        tx = self.geocoded_points[0]
-
-        rx = self.geocoded_points[1]
-
-        # ----------------------------------------------------
-        # Mensagem de etapa
-        # ----------------------------------------------------
-
-        if self.current_stage != (
-            "🔵 Etapa 2 — Avaliando o enlace"
-        ):
-
-            self.current_stage = (
-                "🔵 Etapa 2 — Avaliando o enlace"
-            )
-
-            self.log(
-                "🔵 Etapa 2 — Avaliando o enlace"
-            )
-
-        # ----------------------------------------------------
-        # Parâmetros padrão
-        # ----------------------------------------------------
-
-        arguments = {
-
-            "tx_lat": tx["lat"],
-            "tx_lon": tx["lon"],
-
-            "rx_lat": rx["lat"],
-            "rx_lon": rx["lon"],
-
-            "tx_ha": 7,
-            "rx_ha": 7,
-
-            "freq_mhz": 900,
-
-            "on_rooftop": False,
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": self.messages,
+            "tools": self.build_ollama_tools(),
+            "stream": False,
         }
 
-        # ----------------------------------------------------
-        # Executa
-        # ----------------------------------------------------
+        async with httpx.AsyncClient(
+            timeout=OLLAMA_TIMEOUT
+        ) as client:
 
-        result = await self.execute_mcp_tool(
-            "evaluate_link",
-            arguments
-        )
-
-        # ----------------------------------------------------
-        # Resultado real para o Qwen
-        # ----------------------------------------------------
-
-        extracted = (
-            self.extract_mcp_result(
-                result
+            response = await client.post(
+                f"{OLLAMA_URL}/api/chat",
+                json=payload
             )
-        )
 
-        # ----------------------------------------------------
-        # Adiciona chamada de ferramenta ao histórico
-        # ----------------------------------------------------
+            response.raise_for_status()
 
-        self.messages.append(
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "function": {
-                            "name": "evaluate_link",
-                            "arguments": arguments,
-                        }
-                    }
-                ],
-            }
-        )
-
-        self.messages.append(
-            {
-                "role": "tool",
-                "content": json.dumps(
-                    extracted,
-                    ensure_ascii=False
-                ),
-            }
-        )
-
-        return result
+            return response.json()
 
     # ========================================================
-    # PROCESSA UMA RODADA DO AGENTE
+    # AGENT TURN
     # ========================================================
-
-    async def agent_turn(self):
-
-        max_iterations = 12
-
-        for iteration in range(
-            max_iterations
+    async def agent_turn(
+            self
         ):
-
-            if DEBUG:
-
-                print(
-                    f"\n========== "
-                    f"AGENT ITERATION "
-                    f"{iteration + 1}"
-                    f" =========="
+    
+            for _ in range(12):
+    
+                response = (
+                    await self.ollama_chat()
                 )
-
-            # ------------------------------------------------
-            # Qwen
-            # ------------------------------------------------
-
-            assistant_message = (
-                await self.call_ollama(
-                    self.messages
+    
+                message = response.get(
+                    "message",
+                    {}
                 )
-            )
-
-            if not isinstance(
-                assistant_message,
-                dict
-            ):
-
-                assistant_message = {}
-
-            # ------------------------------------------------
-            # Guarda mensagem
-            # ------------------------------------------------
-
-            self.messages.append(
-                assistant_message
-            )
-
-            # ------------------------------------------------
-            # Tool calls
-            # ------------------------------------------------
-
-            tool_calls = (
-                assistant_message.get(
-                    "tool_calls"
+    
+                tool_calls = message.get(
+                    "tool_calls",
+                    []
                 )
-            )
-
-            if tool_calls:
-
+    
+                content = message.get(
+                    "content",
+                    ""
+                )
+    
+                assistant_message = {
+                    "role": "assistant",
+                    "content": content,
+                }
+    
+                if tool_calls:
+    
+                    assistant_message[
+                        "tool_calls"
+                    ] = tool_calls
+    
+                self.messages.append(
+                    assistant_message
+                )
+    
+                # ------------------------------------------------
+                # SEM FERRAMENTAS
+                # ------------------------------------------------
+    
+                if not tool_calls:
+    
+                    # ------------------------------------------------
+                    # Se os dois pontos já foram encontrados e o
+                    # enlace ainda não foi avaliado, executa agora.
+                    # ------------------------------------------------
+    
+                    if (
+                        len(
+                            self.geocoded_points
+                        ) >= 2
+                        and not self.evaluate_executed
+                    ):
+    
+                        await self.ensure_evaluate_link()
+    
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "O PlanApp já executou a "
+                                    "avaliação do enlace. "
+                                    "Agora interprete exclusivamente "
+                                    "os resultados retornados pelo "
+                                    "PlanApp, sem recalcular os "
+                                    "valores."
+                                ),
+                            }
+                        )
+    
+                        continue
+    
+                    # ------------------------------------------------
+                    # Avaliação já realizada.
+                    # Agora estamos na interpretação.
+                    # ------------------------------------------------
+    
+                    self.current_stage = 3
+    
+                    self.log(
+                        "🔵 Etapa 3 — "
+                        "Interpretando resultados"
+                    )
+    
+                    return content
+    
+                # ------------------------------------------------
+                # FERRAMENTAS
+                # ------------------------------------------------
+    
                 for tool_call in tool_calls:
-
-                    function = (
-                        tool_call.get(
-                            "function",
-                            {}
-                        )
+    
+                    function = tool_call.get(
+                        "function",
+                        {}
                     )
-
-                    tool_name = (
-                        function.get(
-                            "name"
-                        )
+    
+                    tool_name = function.get(
+                        "name"
                     )
-
-                    arguments = (
-                        function.get(
-                            "arguments",
-                            {}
-                        )
+    
+                    arguments = function.get(
+                        "arguments",
+                        {}
                     )
-
-                    # ----------------------------------------
-                    # Argumentos podem vir como string JSON
-                    # ----------------------------------------
-
+    
                     if isinstance(
                         arguments,
                         str
                     ):
-
+    
                         try:
-
+    
                             arguments = json.loads(
                                 arguments
                             )
-
+    
                         except Exception:
-
+    
                             arguments = {}
-
-                    if not isinstance(
-                        arguments,
-                        dict
-                    ):
-
-                        arguments = {}
-
-                    if not tool_name:
-
-                        continue
-
-                    # ----------------------------------------
-                    # Segurança:
-                    # só executa ferramentas realmente
-                    # descobertas no MCP.
-                    # ----------------------------------------
-
-                    available_names = {
-                        tool.name
-                        for tool in self.tools
-                    }
-
-                    if (
-                        tool_name
-                        not in available_names
-                    ):
-
-                        if DEBUG:
-
-                            print(
-                                "Ferramenta solicitada "
-                                "pelo Qwen não encontrada "
-                                f"no MCP: {tool_name}"
-                            )
-
-                        continue
-
-                    # ----------------------------------------
-                    # Executa MCP
-                    # ----------------------------------------
-
+    
                     result = (
                         await self.execute_mcp_tool(
                             tool_name,
                             arguments
                         )
                     )
-
-                    # ----------------------------------------
-                    # Resultado para Qwen
-                    # ----------------------------------------
-
-                    extracted = (
-                        self.extract_mcp_result(
-                            result
-                        )
-                    )
-
+    
                     self.messages.append(
                         {
                             "role": "tool",
                             "content": json.dumps(
-                                extracted,
-                                ensure_ascii=False
+                                result,
+                                ensure_ascii=False,
+                                default=str,
                             ),
                         }
                     )
-
+    
                 # ------------------------------------------------
-                # Depois de qualquer rodada de ferramentas,
-                # verificar se temos os dois pontos.
+                # GARANTIA DE EVALUATE
+                #
+                # Depois que todas as ferramentas solicitadas
+                # pelo Qwen foram executadas, verificamos se já
+                # existem dois pontos.
                 # ------------------------------------------------
-
+    
                 if (
                     len(
                         self.geocoded_points
                     ) >= 2
-                    and not self.evaluate_link_executed
+                    and not self.evaluate_executed
                 ):
-
+    
                     await self.ensure_evaluate_link()
-
-                continue
-
-            # ------------------------------------------------
-            # Qwen não chamou ferramenta.
-            #
-            # Se já temos os dois pontos, não permitimos
-            # que ele finalize sem evaluate_link.
-            # ------------------------------------------------
-
-            if (
-                len(
-                    self.geocoded_points
-                ) >= 2
-                and not self.evaluate_link_executed
-            ):
-
-                await self.ensure_evaluate_link()
-
-                continue
-
-            # ------------------------------------------------
-            # Se evaluate_link foi executado, pode finalizar.
-            # ------------------------------------------------
-
-            if self.evaluate_link_executed:
-
-                return assistant_message.get(
-                    "content",
-                    ""
-                )
-
-            # ------------------------------------------------
-            # Caso não tenha conseguido geocodificar os dois
-            # pontos, retorna a resposta do Qwen.
-            # ------------------------------------------------
-
-            return assistant_message.get(
-                "content",
-                ""
+    
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Os dois pontos foram "
+                                "localizados e o PlanApp "
+                                "já executou a avaliação "
+                                "do enlace. Utilize agora "
+                                "os dados retornados pelo "
+                                "PlanApp para interpretar "
+                                "os resultados. Não execute "
+                                "novamente nenhuma avaliação."
+                            ),
+                        }
+                    )
+    
+            return (
+                "O agente atingiu o limite de iterações "
+                "sem concluir a análise."
             )
-
-        return (
-            "Não foi possível concluir a análise "
-            "dentro do número máximo de etapas."
-        )
-
+    
     # ========================================================
     # ASK
     # ========================================================
 
     async def ask(
         self,
-        user_text
+        user_message
     ):
 
-        # ----------------------------------------------------
-        # Conecta MCP
-        # ----------------------------------------------------
+        try:
 
-        await self.connect()
+            self.reset_state()
 
-        # ----------------------------------------------------
-        # Limpa estado da análise
-        # ----------------------------------------------------
+            await self.connect()
 
-        self.reset_state()
+            await self.register_session()
 
-        # ----------------------------------------------------
-        # Mensagens
-        # ----------------------------------------------------
-
-        self.messages = [
-
-            {
-                "role": "system",
-                "content": self.system_prompt(),
-            },
-
-            {
-                "role": "user",
-                "content": user_text,
-            },
-
-        ]
-
-        # ----------------------------------------------------
-        # Executa
-        # ----------------------------------------------------
-
-        answer = await self.agent_turn()
-
-        # ----------------------------------------------------
-        # Etapa 3
-        # ----------------------------------------------------
-
-        if self.evaluate_link_executed:
-
-            self.current_stage = (
-                "🔵 Etapa 3 — Interpretando resultados"
-            )
+            self.current_stage = 1
 
             self.log(
-                "🔵 Etapa 3 — Interpretando resultados"
+                "🔵 Etapa 1 — "
+                "Localizando os pontos"
             )
+
+            self.messages = [
+                {
+                    "role": "system",
+                    "content": self.system_prompt(),
+                },
+                {
+                    "role": "user",
+                    "content": user_message,
+                },
+            ]
+
+            try:
+
+                answer = (
+                    await self.agent_turn()
+                )
+
+            except Exception as e:
+
+                import traceback
+
+                self.log(
+                    f"❌ Erro durante execução "
+                    f"do agente: "
+                    f"{type(e).__name__}: {e}",
+                    "error"
+                )
+
+                traceback.print_exc()
+
+                return (
+                    f"Erro durante a execução: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+            # =================================================
+            # DIAGNÓSTICO FINAL DO MAPA
+            # =================================================
+
+            if self.map is not None:
+
+                self.log(
+                    "🗺️ Objeto do mapa disponível."
+                )
+
+            else:
+
+                self.log(
+                    "⚠️ Nenhum objeto de mapa disponível."
+                )
+
+            # =================================================
+            # CONCLUSÃO
+            # =================================================
+
+            if self.evaluate_executed:
+
+                self.log(
+                    "🟢 Análise concluída",
+                    "success"
+                )
+
+            return answer
+
+        except Exception as e:
+
+            import traceback
 
             self.log(
-                "🟢 Análise concluída"
+                f"❌ Erro durante execução "
+                f"do agente: "
+                f"{type(e).__name__}: {e}",
+                "error"
             )
 
-        return answer
+            traceback.print_exc()
+
+            return (
+                f"Erro durante a execução: "
+                f"{type(e).__name__}: {e}"
+            )
 
     # ========================================================
-    # TESTE
+    # CLOSE
     # ========================================================
 
-    async def test_agent(self):
+    async def close(
+        self
+    ):
 
-        return await self.ask(
-            "Analise um enlace entre "
-            "a Praça da Sé e o Largo do Paissandu "
-            "em São Paulo."
+        try:
+
+            await self.exit_stack.aclose()
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# RUN AGENT
+# ============================================================
+
+async def run_agent(
+    user_message,
+    progress_callback=None
+):
+
+    agent = PlanAppAgent(
+        progress_callback=progress_callback
+    )
+
+    try:
+
+        return await agent.ask(
+            user_message
         )
 
+    finally:
 
-# ============================================================
-# FIM
-# ============================================================
+        await agent.close()
