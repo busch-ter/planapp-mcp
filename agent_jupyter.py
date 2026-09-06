@@ -805,15 +805,15 @@ pelas ferramentas.
                     assistant_message
                 )
     
-                # ------------------------------------------------
+                # ====================================================
                 # SEM FERRAMENTAS
-                # ------------------------------------------------
+                # ====================================================
     
                 if not tool_calls:
     
                     # ------------------------------------------------
-                    # Se os dois pontos já foram encontrados e o
-                    # enlace ainda não foi avaliado, executa agora.
+                    # Dois pontos encontrados e enlace ainda não
+                    # avaliado.
                     # ------------------------------------------------
     
                     if (
@@ -823,18 +823,36 @@ pelas ferramentas.
                         and not self.evaluate_executed
                     ):
     
-                        await self.ensure_evaluate_link()
+                        evaluate_result = (
+                            await self.ensure_evaluate_link()
+                        )
+    
+                        # ------------------------------------------------
+                        # Entrega explicitamente ao Qwen o resultado
+                        # técnico produzido pelo PlanApp.
+                        # ------------------------------------------------
+    
+                        resultado_json = json.dumps(
+                            self.last_evaluate_result,
+                            ensure_ascii=False,
+                            default=str,
+                        )
     
                         self.messages.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    "O PlanApp já executou a "
-                                    "avaliação do enlace. "
-                                    "Agora interprete exclusivamente "
-                                    "os resultados retornados pelo "
-                                    "PlanApp, sem recalcular os "
-                                    "valores."
+                                    "O PlanApp executou a avaliação "
+                                    "técnica do enlace.\n\n"
+                                    "RESULTADO TÉCNICO DO PLANAPP:\n"
+                                    f"{resultado_json}\n\n"
+                                    "Utilize exclusivamente esses "
+                                    "dados retornados pelo PlanApp "
+                                    "para interpretar o enlace. "
+                                    "Não invente valores, não "
+                                    "recalcule os parâmetros e não "
+                                    "solicite novamente "
+                                    "evaluate_link."
                                 ),
                             }
                         )
@@ -843,7 +861,6 @@ pelas ferramentas.
     
                     # ------------------------------------------------
                     # Avaliação já realizada.
-                    # Agora estamos na interpretação.
                     # ------------------------------------------------
     
                     self.current_stage = 3
@@ -855,9 +872,9 @@ pelas ferramentas.
     
                     return content
     
-                # ------------------------------------------------
-                # FERRAMENTAS
-                # ------------------------------------------------
+                # ====================================================
+                # FERRAMENTAS SOLICITADAS PELO QWEN
+                # ====================================================
     
                 for tool_call in tool_calls:
     
@@ -908,13 +925,9 @@ pelas ferramentas.
                         }
                     )
     
-                # ------------------------------------------------
+                # ====================================================
                 # GARANTIA DE EVALUATE
-                #
-                # Depois que todas as ferramentas solicitadas
-                # pelo Qwen foram executadas, verificamos se já
-                # existem dois pontos.
-                # ------------------------------------------------
+                # ====================================================
     
                 if (
                     len(
@@ -923,20 +936,44 @@ pelas ferramentas.
                     and not self.evaluate_executed
                 ):
     
-                    await self.ensure_evaluate_link()
+                    evaluate_result = (
+                        await self.ensure_evaluate_link()
+                    )
+    
+                    # ------------------------------------------------
+                    # IMPORTANTE:
+                    # evaluate_link foi executado pelo nosso código,
+                    # e não por uma tool_call do Qwen.
+                    #
+                    # Portanto o resultado é enviado como contexto
+                    # explícito ao modelo.
+                    # ------------------------------------------------
+    
+                    resultado_json = json.dumps(
+                        self.last_evaluate_result,
+                        ensure_ascii=False,
+                        default=str,
+                    )
     
                     self.messages.append(
                         {
                             "role": "user",
                             "content": (
-                                "Os dois pontos foram "
-                                "localizados e o PlanApp "
-                                "já executou a avaliação "
-                                "do enlace. Utilize agora "
-                                "os dados retornados pelo "
-                                "PlanApp para interpretar "
-                                "os resultados. Não execute "
-                                "novamente nenhuma avaliação."
+                                "Os dois pontos foram localizados "
+                                "e o PlanApp já executou a avaliação "
+                                "técnica do enlace.\n\n"
+                                "RESULTADO TÉCNICO DO PLANAPP:\n"
+                                f"{resultado_json}\n\n"
+                                "Agora interprete os resultados "
+                                "retornados pelo PlanApp. "
+                                "O PlanApp é a fonte de verdade "
+                                "para distância, FSPL, difração, "
+                                "obstruções, clearance, terreno "
+                                "e edifícios. "
+                                "Não recalcule os valores, "
+                                "não invente parâmetros e não "
+                                "solicite novamente "
+                                "evaluate_link."
                             ),
                         }
                     )
@@ -945,7 +982,6 @@ pelas ferramentas.
                 "O agente atingiu o limite de iterações "
                 "sem concluir a análise."
             )
-    
     # ========================================================
     # ASK
     # ========================================================
