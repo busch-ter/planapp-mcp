@@ -13,30 +13,26 @@ from map_utils import mostrar_mapa_enlace
 
 
 # ============================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÕES
 # ============================================================
 
 MCP_URL = os.getenv(
     "PLANAPP_MCP_URL",
-    "http://172.17.0.1:8010/mcp"
+    "http://172.17.0.1:8010/mcp",
 )
 
 OLLAMA_URL = os.getenv(
     "OLLAMA_URL",
-    "http://172.17.0.1:11434"
+    "http://172.17.0.1:11434",
 )
 
 OLLAMA_MODEL = os.getenv(
     "OLLAMA_MODEL",
-    "qwen3:8b"
+    "qwen3:8b",
 )
 
 USER_ID = "jupyter-user"
 
-
-# ============================================================
-# PARÂMETROS PADRÃO DO ENLACE
-# ============================================================
 
 DEFAULT_FREQ_MHZ = 900
 DEFAULT_TX_HA = 7
@@ -53,20 +49,14 @@ class PlanAppAgent:
     def __init__(
         self,
         progress_callback=None,
-        map_callback=None
+        map_callback=None,
+        log_callback=None,
     ):
+        self.progress_callback = progress_callback
+        self.map_callback = map_callback
+        self.log_callback = log_callback
 
-        self.progress_callback = (
-            progress_callback
-        )
-
-        self.map_callback = (
-            map_callback
-        )
-
-        self.exit_stack = (
-            AsyncExitStack()
-        )
+        self.exit_stack = AsyncExitStack()
 
         self.mcp_session = None
         self.mcp_tools = []
@@ -76,18 +66,15 @@ class PlanAppAgent:
         self.geocoded_points = []
 
         self.evaluate_executed = False
-
         self.last_evaluate_result = None
 
         self.tool_count = 0
-
         self.current_stage = 0
 
         self.map = None
 
         self.connected = False
 
-        # Parâmetros técnicos da solicitação atual
         self.link_parameters = {
             "freq_mhz": DEFAULT_FREQ_MHZ,
             "tx_ha": DEFAULT_TX_HA,
@@ -95,255 +82,305 @@ class PlanAppAgent:
             "on_rooftop": DEFAULT_ON_ROOFTOP,
         }
 
+        # ----------------------------------------------------
+        # Parâmetros exatamente como solicitados pelo usuário
+        # ----------------------------------------------------
+
+        self.requested_frequency = None
+        self.requested_frequency_unit = None
+        self.requested_frequency_text = None
+
+        self.requested_tx_ha = None
+        self.requested_rx_ha = None
 
     # ========================================================
-    # LOG
+    # LOGS
     # ========================================================
 
     def log(self, message):
-
+        """
+        Mensagens de andamento/status.
+        """
         if self.progress_callback:
-
             try:
-
-                self.progress_callback(
-                    message
-                )
-
+                self.progress_callback(message)
             except Exception:
                 pass
 
+    def log_detail(self, message):
+        """
+        Logs detalhados, principalmente resultados brutos
+        das ferramentas MCP.
+        """
+        if self.log_callback:
+            try:
+                self.log_callback(message)
+            except Exception:
+                pass
 
     # ========================================================
     # SYSTEM PROMPT
     # ========================================================
 
     def system_prompt(self):
-    
+
         return """
-Você é o assistente de planejamento de enlaces de rádio do PlanApp.
+Você é o PlanApp AI, um assistente especializado em planejamento
+e avaliação técnica de enlaces de rádio.
 
-Sua função é interpretar solicitações de planejamento de enlaces,
-utilizando as ferramentas disponibilizadas pelo PlanApp.
+REGRAS FUNDAMENTAIS:
 
-REGRAS IMPORTANTES:
-
-1. PlanApp é a fonte de verdade dos dados técnicos.
+1. O PlanApp é a fonte de verdade para resultados técnicos.
 
 2. Nunca invente valores técnicos.
 
-3. Nunca altere valores retornados pelo PlanApp.
+3. Nunca recalcule valores fornecidos pelo PlanApp usando fórmulas
+   próprias, salvo quando explicitamente solicitado e quando isso
+   não substituir o resultado do PlanApp.
 
-4. Nunca recalcule parâmetros técnicos que já tenham sido calculados
-   pelo PlanApp.
+4. Quando o usuário informar dois locais, geocodifique ambos usando
+   a ferramenta geocode_place.
 
-5. Quando o usuário fornecer dois locais, utilize geocode_place para
-   localizar os pontos.
+5. Depois que os dois pontos forem geocodificados, a avaliação técnica
+   do enlace deve ser executada automaticamente pelo sistema.
 
-6. Depois que os dois pontos forem geocodificados, a avaliação técnica
-   será executada automaticamente pelo sistema.
+6. Nunca peça ao usuário para executar manualmente a avaliação.
 
-7. NÃO diga que a avaliação está sendo executada se você ainda não
-   recebeu os resultados técnicos do PlanApp.
+7. Nunca diga que precisa esperar uma próxima etapa para executar
+   a avaliação.
 
-8. NÃO produza uma resposta intermediária pedindo para o usuário
-   aguardar a avaliação.
+8. Não solicite ao usuário uma chamada direta de evaluate_link.
 
-9. NÃO invente resultados de uma avaliação que ainda não foi fornecida.
+9. Não faça chamadas diretas de evaluate_link através do modelo.
+   A aplicação executará evaluate_link automaticamente.
 
-10. Não solicite novamente evaluate_link.
+10. Preserve exatamente os valores fornecidos pelo PlanApp.
 
-11. Não tente executar evaluate_link diretamente.
+11. Preserve as unidades fornecidas pelo PlanApp.
 
-12. Quando o resultado técnico do PlanApp estiver disponível, utilize
-    exclusivamente esse resultado para interpretar o enlace.
+12. FSPL significa Free-Space Path Loss.
 
-13. Preserve exatamente os valores e as unidades retornados pelo
-    PlanApp.
+13. Não faça julgamentos sobre qualidade de clearance sem que exista
+    um critério explícito fornecido pelo PlanApp ou pelo usuário.
 
-14. FSPL significa:
-    Free-Space Path Loss
-    (Perda de Propagação no Espaço Livre).
+14. Não conclua que um enlace é viável ou inviável apenas com base
+    em distância, FSPL, difração ou clearance.
 
-15. Não trate clearance como altura de antena.
+15. Uma conclusão de viabilidade exige os parâmetros e critérios
+    técnicos necessários.
 
-16. Não diga que um clearance é "adequado", "insuficiente",
-    "seguro", "bom", "ruim" ou equivalente sem que exista um
-    critério técnico explícito fornecido pelo PlanApp.
+16. Não atribua significado físico a campos que não estejam definidos
+    explicitamente pelo PlanApp.
 
-17. Não conclua que um enlace é viável ou inviável apenas a partir
-    de distância, FSPL, difração ou clearance.
+17. Os campos:
+    core
+    fresnel
+    boundary
+    delta_diffra
+    VV
+    d_norm
 
-18. Para afirmar viabilidade de um enlace de rádio, são necessários,
-    conforme o caso, parâmetros como potência de transmissão,
-    ganhos das antenas, frequência, perdas adicionais, sensibilidade
-    do receptor e margem de enlace.
+    devem permanecer com seus nomes originais.
 
-19. NÃO atribua significado físico a um campo cujo significado não
-    esteja explicitamente informado pelo PlanApp.
+18. Não interprete esses campos usando conhecimento genérico de
+    engenharia quando o significado não tiver sido explicitamente
+    definido pelo PlanApp.
 
-20. Quando houver dúvida sobre o significado de um campo, mantenha
-    exatamente o nome original do campo e apresente seu valor sem
-    criar uma interpretação.
+19. Não compare distância com core, fresnel ou boundary.
 
-21. Os campos "core", "fresnel" e "boundary", quando presentes nos
-    resultados do PlanApp, devem ser tratados como valores retornados
-    pelo PlanApp. NÃO os interprete como "área central", "zona de
-    Fresnel", "limite da zona de Fresnel", "limite de obstáculos",
-    "trecho bloqueado", "extensão de obstáculos" ou qualquer outro
-    significado físico que não esteja explicitamente definido pelo
-    PlanApp.
+20. Não interprete d_norm como posição normalizada, percentual ou
+    qualquer outro significado sem definição explícita.
 
-22. Um clearance negativo não significa automaticamente que uma
-    antena esteja abaixo do solo ou que o enlace seja inviável.
+21. Não interprete VV como altura de obstáculo, pico de terreno ou
+    qualquer outra grandeza física sem definição explícita.
 
-23. O valor de max_obstruction_angle, isoladamente, não comprova que
-    exista bloqueio, interferência ou obstáculo crítico no enlace.
+22. Não interprete delta_diffra como zona de difração ou perda de
+    difração sem definição explícita.
 
-24. elevation_angle igual a zero não significa automaticamente que
-    TX e RX estejam na mesma altitude, que estejam no mesmo nível ou
-    que o enlace seja horizontal.
+23. Não conclua que um ponto está dentro ou fora da zona de Fresnel
+    apenas com base em campos não definidos.
 
-25. FSPL, isoladamente, não implica que seja necessário aumentar a
-    potência de transmissão.
+24. Não afirme que terreno, vegetação ou edificações afetam o sinal
+    apenas porque existem valores numéricos nesses campos.
 
-26. Não invente potência, ganho de antena, sensibilidade, perdas ou
-    margem de enlace quando esses dados não forem fornecidos.
+25. Diferencie claramente:
+    - valores fornecidos pelo usuário;
+    - valores usados pelo PlanApp;
+    - resultados fornecidos pelo PlanApp;
+    - conclusões tecnicamente suportadas;
+    - conclusões que não podem ser obtidas com os dados disponíveis.
 
-27. Não transforme valores numéricos retornados pelo PlanApp em
-    conclusões qualitativas sem um critério explícito.
+REGRAS DE PARÂMETROS:
 
-28. Diferencie claramente:
-    a) parâmetros fornecidos pelo usuário;
-    b) resultados calculados e retornados pelo PlanApp;
-    c) interpretação técnica desses resultados.
+26. Parâmetros explicitamente fornecidos pelo usuário têm prioridade
+    absoluta sobre os valores padrão.
 
-29. Quando a interpretação física de um campo não estiver definida,
-    prefira dizer:
-    "O PlanApp retornou o campo <nome> com valor <valor>, porém o
-    significado físico específico desse campo não está definido nos
-    dados disponibilizados."
-    Não tente preencher essa lacuna por inferência.
+27. Valores padrão só podem ser usados quando o usuário não informar
+    aquele parâmetro.
 
-30. Não use conhecimento genérico de engenharia de rádio para atribuir
-    automaticamente significado a campos internos ou específicos do
-    PlanApp.
+28. Frequência padrão:
+    900 MHz.
 
-31. Não apresente uma hipótese como se fosse um fato.
+29. Altura padrão da antena TX:
+    7 m.
 
-32. Não use expressões como "isso significa que" quando a relação
-    entre o campo e a conclusão não estiver explicitamente estabelecida
-    pelos dados do PlanApp.
+30. Altura padrão da antena RX:
+    7 m.
 
-33. Quando houver dados suficientes para uma interpretação técnica,
-    explique-os de forma objetiva e deixe claro quais conclusões são
-    efetivamente suportadas pelos resultados.
+31. on_rooftop padrão:
+    false.
 
-34. Quando os dados forem insuficientes para uma conclusão, diga
-    explicitamente que os dados disponíveis não permitem essa conclusão.
+32. Preserve a unidade original informada pelo usuário.
 
-35. Não omita resultados relevantes do PlanApp apenas porque seu
-    significado físico não está claro. Nesse caso, apresente o campo
-    e seu valor, mas não invente sua interpretação.
+33. A conversão interna da frequência para MHz deve ser feita somente
+    para o parâmetro freq_mhz enviado ao PlanApp.
 
-36. Responda em português.
+34. Exemplo:
+    "450 MHz" significa 450 MHz.
 
-37. Seja técnico, objetivo e claro.
+35. Exemplo:
+    "450 Hz" pode ser convertido internamente para
+    0.00045 MHz.
 
-38. Não mencione detalhes internos da implementação do agente, MCP ou
-    Ollama ao usuário, a menos que ele pergunte explicitamente.
+36. Exemplo:
+    "450 kHz" pode ser convertido internamente para
+    0.45 MHz.
 
-39. PRESERVE O NOME ORIGINAL DOS CAMPOS RETORNADOS PELO PLANAPP.
+37. Exemplo:
+    "450 GHz" pode ser convertido internamente para
+    450000 MHz.
 
-40. NÃO renomeie um campo técnico para uma descrição física.
-    Por exemplo:
-    - "core" deve permanecer "core";
-    - "fresnel" deve permanecer "fresnel";
-    - "boundary" deve permanecer "boundary";
-    - "delta_diffra" deve permanecer "delta_diffra";
-    - "VV" deve permanecer "VV";
-    - "d_norm" deve permanecer "d_norm".
+38. Entretanto, a solicitação original deve continuar sendo apresentada
+    como foi informada pelo usuário.
 
-41. NÃO transforme "core", "fresnel" ou "boundary" em "raio da zona
-    de Fresnel", "limite da zona de Fresnel", "zona de Fresnel",
-    "área central", "trecho de obstrução" ou qualquer outra
-    descrição física.
+39. Nunca escreva uma unidade que não foi informada pelo usuário.
 
-42. NÃO faça cálculos ou comparações entre campos do PlanApp para
-    inferir significado físico, a menos que a relação matemática
-    esteja explicitamente definida pelo próprio PlanApp.
+40. Não escreva:
+    "450 MHz (Hz)"
+    se o usuário informou apenas "450 Hz".
 
-43. NÃO compare a distância total do enlace com os valores
-    "core", "fresnel" ou "boundary" para tirar conclusões sobre
-    propagação, obstrução ou zona de Fresnel.
+41. Quando o usuário disser algo como:
+    "duas antenas de 10 metros"
+    interprete como:
+    TX = 10 m
+    RX = 10 m.
 
-44. NÃO interprete "d_norm" apenas pelo nome. O campo deve ser
-    apresentado exatamente como retornado pelo PlanApp, sem afirmar
-    que representa posição normalizada, percentual, distância ou
-    localização dentro de uma zona, salvo se isso estiver
-    explicitamente definido.
+42. Quando o usuário informar alturas diferentes, preserve
+    individualmente TX e RX.
 
-45. NÃO interprete "VV" apenas pelo nome. Apresente o valor de VV
-    exatamente como retornado pelo PlanApp e não atribua a ele
-    automaticamente o significado de "altura do obstáculo",
-    "pico de terreno" ou equivalente, salvo se o PlanApp definir
-    explicitamente esse significado.
+43. Se houver divergência entre o parâmetro solicitado pelo usuário
+    e o parâmetro efetivamente utilizado pelo PlanApp, informe
+    explicitamente a divergência.
 
-46. NÃO transforme "delta_diffra" em "zona de difração", "raio de
-    difração", "perda de difração" ou qualquer outra grandeza física.
-    Preserve o nome original e o valor retornado.
+COMPORTAMENTO DA RESPOSTA:
 
-47. NÃO conclua que um determinado ponto, pico ou obstáculo está
-    "dentro da zona de Fresnel", "fora da zona de Fresnel",
-    "interferindo na zona de Fresnel" ou equivalente sem que essa
-    relação esteja explicitamente informada pelo PlanApp.
+44. A resposta final deve ser clara e objetiva.
 
-48. NÃO conclua que um terreno, vegetação ou edifício impacta a
-    qualidade do sinal somente pela existência de um valor numérico.
-    Essa conclusão somente pode ser feita se o PlanApp fornecer
-    explicitamente essa interpretação.
+45. Não apresente JSON bruto como resposta final quando houver
+    informação técnica que possa ser apresentada de forma legível.
 
-49. NÃO use conhecimento genérico de engenharia para preencher o
-    significado de campos específicos do PlanApp.
+46. Use os resultados reais fornecidos pelo PlanApp.
 
-50. Quando o significado de um campo não estiver definido, apresente-o
-    desta forma:
-    
-    "O PlanApp retornou <campo> = <valor>. O significado físico
-    específico desse campo não está definido nos dados
-    disponibilizados."
+47. Não invente informações ausentes.
 
-51. É permitido organizar os resultados por categoria, mas não é
-    permitido alterar a semântica dos campos ao criar os títulos
-    ou descrições.
+48. Não transforme campos técnicos desconhecidos em conceitos conhecidos
+    apenas pelo nome.
 
-52. A resposta deve distinguir rigorosamente entre:
-    - o que o usuário informou;
-    - o que o PlanApp retornou;
-    - o que pode ser concluído diretamente dos dados;
-    - o que NÃO pode ser concluído dos dados.
+49. Se um campo não possui definição suficiente, informe que seu
+    significado não foi definido nos dados retornados.
 
-53. Se uma conclusão exigir uma definição que não foi fornecida pelo
-    PlanApp, NÃO faça a conclusão. Informe que a definição é
-    necessária.
+50. Quando apropriado, apresente:
+    - origem/destino;
+    - coordenadas;
+    - distância;
+    - frequência;
+    - alturas das antenas;
+    - FSPL;
+    - demais resultados técnicos relevantes.
 
-54. Uma comparação matemática simples entre dois números NÃO autoriza
-    uma interpretação física. Por exemplo, o fato de A ser maior ou
-    menor que B não significa que exista obstrução, interferência,
-    cobertura ou qualquer outro fenômeno físico relacionado a A e B.
+51. Não esconda divergências entre os parâmetros solicitados e utilizados.
 
-55. Não crie títulos como "Zona de Fresnel", "Terreno", "Obstáculos"
-    ou "Zona de difração" para campos cujo significado específico
-    não esteja definido pelo PlanApp. Quando necessário, use
-    "Resultados retornados pelo PlanApp".
+52. Não apresente conclusões que não possam ser sustentadas pelos
+    resultados retornados pelo PlanApp.
 
-56. Quando os dados não forem suficientes para uma interpretação,
-    é preferível apresentar menos conclusões e preservar os dados
-    originais do que fornecer uma explicação física especulativa.
+53. A análise deve distinguir claramente dados e interpretação.
+
+54. O mapa é preparado automaticamente depois que os dois pontos
+    são geocodificados.
+
+55. A avaliação técnica é executada automaticamente depois da
+    geocodificação.
+
+56. Não diga ao usuário para aguardar uma execução futura.
+
+57. Não interrompa o fluxo depois da geocodificação.
+
+58. Depois da avaliação técnica, interprete os resultados retornados.
+
+59. Quando houver FSPL, apresente-o como:
+    "FSPL (Free-Space Path Loss)".
+
+60. Não invente unidade para campos que não tenham unidade explícita.
+
+61. Não faça comparações de valores técnicos sem contexto.
+
+62. Não faça afirmações sobre desempenho do enlace sem parâmetros
+    suficientes.
+
+63. Não considere apenas FSPL para determinar viabilidade.
+
+64. Não considere apenas distância para determinar viabilidade.
+
+65. Não considere apenas clearance para determinar viabilidade.
+
+66. Não considere apenas difração para determinar viabilidade.
+
+67. Não transforme uma análise parcial em uma conclusão definitiva.
+
+68. Caso o usuário solicite apenas uma informação específica,
+    responda diretamente com aquela informação.
+
+69. Caso o usuário solicite uma análise completa, apresente os
+    principais resultados disponíveis.
+
+70. Sempre utilize os nomes originais dos campos retornados.
+
+71. Não altere valores numéricos.
+
+72. Não arredonde valores internamente.
+
+73. Arredondamentos apresentados ao usuário devem ser apenas
+    formatação visual.
+
+74. Se o PlanApp fornecer valores com casas decimais, preserve a
+    precisão disponível quando relevante.
+
+75. Nunca substitua um resultado do PlanApp por uma estimativa própria.
+
+76. Nunca diga que uma ferramenta foi executada se ela não foi realmente
+    executada.
+
+77. Nunca invente sucesso de uma ferramenta.
+
+78. Nunca invente erro de uma ferramenta.
+
+79. Se uma ferramenta retornar erro, informe o erro real.
+
+80. Se uma ferramenta retornar sucesso, utilize o resultado real.
+
+81. Se houver dados insuficientes para uma conclusão, diga explicitamente
+    que os dados disponíveis não são suficientes.
+
+82. O objetivo é produzir uma análise técnica fiel aos dados do PlanApp.
+
+83. Não extrapole além dos resultados.
+
+84. A resposta final deve priorizar precisão técnica sobre interpretações
+    genéricas.
 """
 
     # ========================================================
-    # EXTRAÇÃO DOS PARÂMETROS DA SOLICITAÇÃO
+    # EXTRAÇÃO DOS PARÂMETROS
     # ========================================================
 
     def extract_link_parameters(self, text):
@@ -355,156 +392,139 @@ REGRAS IMPORTANTES:
             "on_rooftop": DEFAULT_ON_ROOFTOP,
         }
 
-        if not text:
-            return parameters
-
-        text_lower = text.lower()
+        # Reset dos parâmetros solicitados
+        self.requested_frequency = None
+        self.requested_frequency_unit = None
+        self.requested_frequency_text = None
+        self.requested_tx_ha = None
+        self.requested_rx_ha = None
 
         # ----------------------------------------------------
-        # FREQUÊNCIA
-        #
-        # Exemplos:
-        # 450 MHz
-        # 450mhz
-        # frequência de 450 MHz
-        # frequência 450 MHz
+        # Frequência
         # ----------------------------------------------------
 
-        freq_patterns = [
-            r"(?:frequ[eê]ncia|freq(?:u[eê]ncia)?)"
-            r".{0,30}?"
+        freq_pattern = re.compile(
             r"(\d+(?:[.,]\d+)?)\s*"
-            r"(?:mhz|megahertz)",
+            r"(ghz|mhz|khz|hz)\b",
+            re.IGNORECASE,
+        )
 
-            r"(\d+(?:[.,]\d+)?)\s*"
-            r"(?:mhz|megahertz)",
+        freq_match = freq_pattern.search(text)
+
+        if freq_match:
+
+            value_text = freq_match.group(1)
+            unit = freq_match.group(2).lower()
+
+            value = float(value_text.replace(",", "."))
+
+            self.requested_frequency = value
+            self.requested_frequency_unit = unit
+            self.requested_frequency_text = freq_match.group(0)
+
+            if unit == "ghz":
+                parameters["freq_mhz"] = value * 1000.0
+
+            elif unit == "mhz":
+                parameters["freq_mhz"] = value
+
+            elif unit == "khz":
+                parameters["freq_mhz"] = value / 1000.0
+
+            elif unit == "hz":
+                parameters["freq_mhz"] = value / 1_000_000.0
+
+        # ----------------------------------------------------
+        # Duas antenas com mesma altura
+        # ----------------------------------------------------
+
+        same_height_patterns = [
+            r"duas\s+antenas?\s+de\s+(\d+(?:[.,]\d+)?)\s*(?:m|metros?)",
+            r"antenas?\s+de\s+(\d+(?:[.,]\d+)?)\s*(?:m|metros?)",
         ]
 
-        for pattern in freq_patterns:
+        same_height_match = None
 
-            match = re.search(
+        for pattern in same_height_patterns:
+            same_height_match = re.search(
                 pattern,
-                text_lower,
-                re.IGNORECASE
+                text,
+                re.IGNORECASE,
             )
 
-            if match:
+            if same_height_match:
+                break
 
-                value = match.group(1).replace(
-                    ",",
-                    "."
-                )
+        if same_height_match:
 
-                try:
-
-                    parameters["freq_mhz"] = float(
-                        value
-                    )
-
-                    break
-
-                except ValueError:
-                    pass
-
-        # ----------------------------------------------------
-        # ANTENAS
-        #
-        # Exemplos:
-        # antenas de 40 metros em tx e rx
-        # antenas 40 m em TX e RX
-        # TX 40 m e RX 40 m
-        # ----------------------------------------------------
-
-        antenna_pattern = (
-            r"antenas?\s+"
-            r"(?:de\s+)?"
-            r"(\d+(?:[.,]\d+)?)\s*"
-            r"(?:m|metros?)"
-            r".{0,60}?"
-            r"(?:em|no|nas)?\s*"
-            r"tx\s+e\s+rx"
-        )
-
-        match = re.search(
-            antenna_pattern,
-            text_lower,
-            re.IGNORECASE
-        )
-
-        if match:
-
-            value = match.group(1).replace(
-                ",",
-                "."
+            height = float(
+                same_height_match.group(1).replace(",", ".")
             )
 
-            try:
+            parameters["tx_ha"] = height
+            parameters["rx_ha"] = height
 
-                height = float(value)
-
-                parameters["tx_ha"] = height
-                parameters["rx_ha"] = height
-
-            except ValueError:
-                pass
+            self.requested_tx_ha = height
+            self.requested_rx_ha = height
 
         else:
 
             # ------------------------------------------------
             # TX / RX separados
-            #
-            # Exemplo:
-            # TX 40 metros e RX 30 metros
             # ------------------------------------------------
 
             tx_match = re.search(
-                r"\btx\b"
-                r".{0,20}?"
-                r"(\d+(?:[.,]\d+)?)\s*"
-                r"(?:m|metros?)",
-                text_lower,
-                re.IGNORECASE
+                r"(?:tx|transmissora?|transmissor)"
+                r".{0,30}?"
+                r"(\d+(?:[.,]\d+)?)\s*(?:m|metros?)",
+                text,
+                re.IGNORECASE,
             )
 
             rx_match = re.search(
-                r"\brx\b"
-                r".{0,20}?"
-                r"(\d+(?:[.,]\d+)?)\s*"
-                r"(?:m|metros?)",
-                text_lower,
-                re.IGNORECASE
+                r"(?:rx|receptora?|receptor)"
+                r".{0,30}?"
+                r"(\d+(?:[.,]\d+)?)\s*(?:m|metros?)",
+                text,
+                re.IGNORECASE,
             )
 
             if tx_match:
+                height = float(
+                    tx_match.group(1).replace(",", ".")
+                )
 
-                try:
-
-                    parameters["tx_ha"] = float(
-                        tx_match.group(1).replace(
-                            ",",
-                            "."
-                        )
-                    )
-
-                except ValueError:
-                    pass
+                parameters["tx_ha"] = height
+                self.requested_tx_ha = height
 
             if rx_match:
+                height = float(
+                    rx_match.group(1).replace(",", ".")
+                )
 
-                try:
+                parameters["rx_ha"] = height
+                self.requested_rx_ha = height
 
-                    parameters["rx_ha"] = float(
-                        rx_match.group(1).replace(
-                            ",",
-                            "."
-                        )
-                    )
+        # ----------------------------------------------------
+        # Rooftop
+        # ----------------------------------------------------
 
-                except ValueError:
-                    pass
+        rooftop_patterns = [
+            r"\bno\s+telhado\b",
+            r"\bem\s+cima\s+do\s+telhado\b",
+            r"\bsobre\s+o\s+telhado\b",
+            r"\brooftop\b",
+        ]
+
+        for pattern in rooftop_patterns:
+
+            if re.search(pattern, text, re.IGNORECASE):
+                parameters["on_rooftop"] = True
+                break
+
+        self.link_parameters = parameters
 
         return parameters
-
 
     # ========================================================
     # CONEXÃO MCP
@@ -512,41 +532,26 @@ REGRAS IMPORTANTES:
 
     async def connect(self):
 
-        if self.connected:
-            return
+        self.log("🔌 Conectando ao PlanApp MCP...")
 
-        self.log(
-            "🔌 Conectando ao PlanApp MCP..."
-        )
-
-        transport = (
-            await self.exit_stack.enter_async_context(
-                streamable_http_client(
-                    MCP_URL
-                )
-            )
+        transport = await self.exit_stack.enter_async_context(
+            streamable_http_client(MCP_URL)
         )
 
         read_stream, write_stream = transport
 
-        self.mcp_session = (
-            await self.exit_stack.enter_async_context(
-                ClientSession(
-                    read_stream,
-                    write_stream
-                )
+        self.mcp_session = await self.exit_stack.enter_async_context(
+            ClientSession(
+                read_stream,
+                write_stream,
             )
         )
 
         await self.mcp_session.initialize()
 
-        tools_result = (
-            await self.mcp_session.list_tools()
-        )
+        tools_result = await self.mcp_session.list_tools()
 
-        self.mcp_tools = (
-            tools_result.tools
-        )
+        self.mcp_tools = tools_result.tools
 
         self.connected = True
 
@@ -554,7 +559,6 @@ REGRAS IMPORTANTES:
             f"🟢 MCP conectado — "
             f"{len(self.mcp_tools)} ferramentas disponíveis."
         )
-
 
     # ========================================================
     # FERRAMENTAS PARA O OLLAMA
@@ -566,34 +570,24 @@ REGRAS IMPORTANTES:
 
         for tool in self.mcp_tools:
 
-            # register é executado diretamente pelo agente
-            if tool.name == "register":
+            if tool.name in {
+                "register",
+                "evaluate_link",
+            }:
                 continue
 
-            # evaluate_link é executado automaticamente pelo agente
-            if tool.name == "evaluate_link":
-                continue
-
-            input_schema = getattr(
+            schema = getattr(
                 tool,
                 "input_schema",
-                None
+                None,
             )
 
-            if input_schema is None:
-
-                input_schema = getattr(
+            if schema is None:
+                schema = getattr(
                     tool,
                     "inputSchema",
-                    None
+                    None,
                 )
-
-            if input_schema is None:
-
-                input_schema = {
-                    "type": "object",
-                    "properties": {},
-                }
 
             tools.append(
                 {
@@ -601,19 +595,25 @@ REGRAS IMPORTANTES:
                     "function": {
                         "name": tool.name,
                         "description": (
-                            tool.description
+                            getattr(
+                                tool,
+                                "description",
+                                None,
+                            )
                             or ""
                         ),
-                        "parameters": input_schema,
+                        "parameters": schema or {
+                            "type": "object",
+                            "properties": {},
+                        },
                     },
                 }
             )
 
         return tools
 
-
     # ========================================================
-    # CHAMADA AO OLLAMA
+    # OLLAMA
     # ========================================================
 
     async def ollama_chat(self):
@@ -625,17 +625,19 @@ REGRAS IMPORTANTES:
             "stream": False,
         }
 
-        response = await asyncio.to_thread(
-            requests.post,
-            f"{OLLAMA_URL}/api/chat",
-            json=payload,
-            timeout=300,
-        )
+        def do_request():
 
-        response.raise_for_status()
+            response = requests.post(
+                f"{OLLAMA_URL}/api/chat",
+                json=payload,
+                timeout=300,
+            )
 
-        return response.json()
+            response.raise_for_status()
 
+            return response.json()
+
+        return await asyncio.to_thread(do_request)
 
     # ========================================================
     # PARSE RESULTADO MCP
@@ -643,365 +645,172 @@ REGRAS IMPORTANTES:
 
     def parse_mcp_result(self, result):
 
-        # ----------------------------------------------------
-        # MCP moderno
-        # ----------------------------------------------------
-
-        if hasattr(
+        structured = getattr(
             result,
-            "structuredContent"
-        ):
+            "structuredContent",
+            None,
+        )
 
-            structured = (
-                result.structuredContent
+        if structured is None:
+            structured = getattr(
+                result,
+                "structured_content",
+                None,
             )
 
-            if structured:
-                return structured
-
-        # Alguns clientes utilizam structured_content
-
-        if hasattr(
-            result,
-            "structured_content"
-        ):
-
-            structured = (
-                result.structured_content
-            )
-
-            if structured:
-                return structured
-
-        # ----------------------------------------------------
-        # Conteúdo textual
-        # ----------------------------------------------------
+        if structured is not None:
+            return structured
 
         content = getattr(
             result,
             "content",
-            None
+            None,
         )
 
         if content:
-
-            texts = []
 
             for item in content:
 
                 text = getattr(
                     item,
                     "text",
-                    None
+                    None,
                 )
 
-                if text is not None:
+                if text:
 
-                    texts.append(
-                        text
-                    )
+                    try:
+                        return json.loads(text)
 
-            if texts:
-
-                text = "\n".join(
-                    texts
-                )
-
-                try:
-
-                    return json.loads(
-                        text
-                    )
-
-                except Exception:
-
-                    return {
-                        "text": text
-                    }
-
-        # ----------------------------------------------------
-        # Fallback
-        # ----------------------------------------------------
+                    except Exception:
+                        return text
 
         return result
 
-
     # ========================================================
-    # RESUMO GEOCODIFICAÇÃO
+    # RESUMO GEOCODE
     # ========================================================
 
-    def summarize_geocode(self, result):
+    def summarize_geocode(self, parsed):
 
-        if not isinstance(
-            result,
-            dict
-        ):
+        if not isinstance(parsed, dict):
             return None
 
-        # ----------------------------------------------------
-        # O geocode_place retorna:
-        #
-        # {
-        #   "status": "OK",
-        #   "query": "...",
-        #   "results": [
-        #       {
-        #           "name": "...",
-        #           "lat": ...,
-        #           "lon": ...
-        #       }
-        #   ]
-        # }
-        # ----------------------------------------------------
+        results = parsed.get("results")
 
-        point = result
-
-        results = result.get(
-            "results"
-        )
-
-        if (
-            isinstance(results, list)
-            and results
-            and isinstance(results[0], dict)
-        ):
-
-            point = results[0]
-
-        name = (
-            point.get("name")
-            or point.get("place")
-            or result.get("query")
-        )
-
-        lat = (
-            point.get("lat")
-            if point.get("lat") is not None
-            else point.get("latitude")
-        )
-
-        lon = (
-            point.get("lon")
-            if point.get("lon") is not None
-            else point.get("longitude")
-        )
-
-        if lat is not None and lon is not None:
-
-            if name:
-
-                return (
-                    f"📍 {name}: "
-                    f"{float(lat):.6f}, "
-                    f"{float(lon):.6f}"
-                )
-
-            return (
-                f"📍 Ponto localizado: "
-                f"{float(lat):.6f}, "
-                f"{float(lon):.6f}"
-            )
-
-        return None
-
-
-    # ========================================================
-    # RESUMO EVALUATE
-    # ========================================================
-
-    def summarize_evaluate(self, result):
-
-        if not isinstance(
-            result,
-            dict
-        ):
+        if not results:
             return None
 
-        fspl = result.get(
-            "fspl"
-        )
+        first = results[0]
 
-        if fspl is None:
+        if not isinstance(first, dict):
+            return None
 
-            fspl = result.get(
-                "FSPL"
-            )
+        name = first.get("name")
 
-        if fspl is None:
-
-            technical = result.get(
-                "technical"
-            )
-
-            if isinstance(
-                technical,
-                dict
-            ):
-
-                fspl = technical.get(
-                    "fspl"
-                )
-
-        return fspl
-
-
-    # ========================================================
-    # REGISTRA PONTO GEOCODIFICADO
-    # ========================================================
-
-    def register_geocoded_point(
-        self,
-        result,
-        arguments
-    ):
-
-        if not isinstance(
-            result,
-            dict
-        ):
-            return
-
-        # ----------------------------------------------------
-        # Extrai o primeiro resultado do geocode
-        # ----------------------------------------------------
-
-        point_data = result
-
-        results = result.get(
-            "results"
-        )
-
-        if (
-            isinstance(results, list)
-            and results
-            and isinstance(results[0], dict)
-        ):
-
-            point_data = results[0]
-
-        # ----------------------------------------------------
-        # Coordenadas
-        # ----------------------------------------------------
-
-        lat = (
-            point_data.get("lat")
-            if point_data.get("lat") is not None
-            else point_data.get("latitude")
-        )
-
-        lon = (
-            point_data.get("lon")
-            if point_data.get("lon") is not None
-            else point_data.get("longitude")
-        )
+        lat = first.get("lat")
+        lon = first.get("lon")
 
         if lat is None or lon is None:
-            return
+            return None
 
-        # ----------------------------------------------------
-        # Nome
-        # ----------------------------------------------------
-
-        name = (
-            point_data.get("name")
-            or point_data.get("place")
-            or result.get("query")
-            or arguments.get("query")
-            or f"Ponto {len(self.geocoded_points) + 1}"
-        )
-
-        point = {
+        return {
             "name": name,
             "lat": float(lat),
             "lon": float(lon),
         }
 
-        self.geocoded_points.append(
-            point
-        )
-
-        self.log(
-            f"📍 Ponto registrado: "
-            f"{name} "
-            f"({point['lat']:.6f}, "
-            f"{point['lon']:.6f})"
-        )
-
-
     # ========================================================
-    # MAPA
+    # RESUMO EVALUATE
     # ========================================================
 
-    async def mostrar_mapa_apos_geocodificacao(
-        self
-    ):
+    def summarize_evaluate(self, parsed):
 
-        if len(
-            self.geocoded_points
-        ) < 2:
+        if not isinstance(parsed, dict):
+            return None
 
+        if "fspl" in parsed:
+            return parsed["fspl"]
+
+        technical = parsed.get("technical")
+
+        if isinstance(technical, dict):
+
+            if "fspl" in technical:
+                return technical["fspl"]
+
+        data = parsed.get("data")
+
+        if isinstance(data, dict):
+
+            if "fspl" in data:
+                return data["fspl"]
+
+        return None
+
+    # ========================================================
+    # REGISTRA PONTO GEOCODIFICADO
+    # ========================================================
+
+    def register_geocoded_point(self, parsed):
+
+        point = self.summarize_geocode(parsed)
+
+        if point is None:
             return
 
+        self.geocoded_points.append(point)
+
         self.log(
-            "🗺️ Preparando enlace no mapa..."
+            "📍 "
+            f"{point['name']} — "
+            f"{point['lat']:.6f}, "
+            f"{point['lon']:.6f}"
         )
+
+    # ========================================================
+    # PREPARAÇÃO DO MAPA
+    # ========================================================
+
+    async def mostrar_mapa_apos_geocodificacao(self):
+
+        if len(self.geocoded_points) < 2:
+            return
+
+        self.log("🗺️ Preparando enlace no mapa...")
 
         try:
 
-            # IMPORTANTE:
-            # map_utils.mostrar_mapa_enlace()
-            # recebe o agente inteiro.
-
-            self.map = (
-                mostrar_mapa_enlace(
-                    self
-                )
-            )
-
-            # ------------------------------------------------
-            # ATUALIZA A INTERFACE
-            # ------------------------------------------------
+            self.map = mostrar_mapa_enlace(self)
 
             if self.map_callback:
 
                 try:
-
-                    self.map_callback(
-                        self.map
-                    )
+                    self.map_callback(self.map)
 
                 except Exception as exc:
 
                     self.log(
-                        f"⚠️ Erro ao atualizar mapa: "
-                        f"{exc}"
+                        f"⚠️ Erro ao atualizar mapa: {exc}"
                     )
 
-            self.log(
-                "🟢 Mapa preparado."
-            )
+            self.log("🟢 Mapa preparado.")
 
         except Exception as exc:
 
             self.log(
-                f"❌ Erro ao preparar mapa: "
-                f"{exc}"
+                f"❌ Erro ao preparar mapa: {exc}"
             )
 
-
     # ========================================================
-    # EXECUTA FERRAMENTA MCP
+    # EXECUÇÃO DE FERRAMENTA MCP
     # ========================================================
 
     async def execute_mcp_tool(
         self,
         tool_name,
-        arguments
+        arguments,
     ):
-
-        # ----------------------------------------------------
-        # Evita evaluate_link duplicado
-        # ----------------------------------------------------
 
         if (
             tool_name == "evaluate_link"
@@ -1013,23 +822,17 @@ REGRAS IMPORTANTES:
                 "Ignorando chamada duplicada."
             )
 
-            return (
-                self.last_evaluate_result
-            )
+            return self.last_evaluate_result
 
         self.tool_count += 1
 
         # ----------------------------------------------------
-        # STATUS DA TOOL
+        # STATUS
         # ----------------------------------------------------
 
         self.log(
             f"🔧 MCP: {tool_name}"
         )
-
-        # ----------------------------------------------------
-        # ARGUMENTOS
-        # ----------------------------------------------------
 
         self.log(
             "   Argumentos: "
@@ -1042,40 +845,29 @@ REGRAS IMPORTANTES:
         )
 
         # ----------------------------------------------------
-        # CHAMADA MCP
+        # EXECUTA MCP
         # ----------------------------------------------------
 
-        result = (
-            await self.mcp_session.call_tool(
-                tool_name,
-                arguments or {}
-            )
+        result = await self.mcp_session.call_tool(
+            tool_name,
+            arguments or {},
         )
 
-        parsed = (
-            self.parse_mcp_result(
-                result
+        parsed = self.parse_mcp_result(result)
+
+        # ----------------------------------------------------
+        # RESULTADO BRUTO VAI PARA LOG DETALHADO
+        # ----------------------------------------------------
+
+        self.log_detail(
+            "   Resultado: "
+            + json.dumps(
+                parsed,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
             )
         )
-
-        # ----------------------------------------------------
-        # RESULTADO
-        # ----------------------------------------------------
-
-        try:
-
-            self.log(
-                "   Resultado: "
-                + json.dumps(
-                    parsed,
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
-                )
-            )
-
-        except Exception:
-            pass
 
         # ----------------------------------------------------
         # GEOCODE
@@ -1083,37 +875,11 @@ REGRAS IMPORTANTES:
 
         if tool_name == "geocode_place":
 
-            summary = (
-                self.summarize_geocode(
-                    parsed
-                )
-            )
+            self.register_geocoded_point(parsed)
 
-            if summary:
+            if len(self.geocoded_points) == 2:
 
-                self.log(
-                    summary
-                )
-
-            self.register_geocoded_point(
-                parsed,
-                arguments or {}
-            )
-
-            # ------------------------------------------------
-            # SEGUNDO PONTO
-            #
-            # O mapa é preparado assim que os dois pontos
-            # existem.
-            # ------------------------------------------------
-
-            if len(
-                self.geocoded_points
-            ) >= 2:
-
-                await (
-                    self.mostrar_mapa_apos_geocodificacao()
-                )
+                await self.mostrar_mapa_apos_geocodificacao()
 
         # ----------------------------------------------------
         # EVALUATE
@@ -1123,33 +889,17 @@ REGRAS IMPORTANTES:
 
             self.evaluate_executed = True
 
-            self.last_evaluate_result = (
-                parsed
-            )
+            self.last_evaluate_result = parsed
 
-            fspl = (
-                self.summarize_evaluate(
-                    parsed
-                )
-            )
+            fspl = self.summarize_evaluate(parsed)
 
             if fspl is not None:
 
-                try:
-
-                    self.log(
-                        f"📥 FSPL: "
-                        f"{float(fspl):.2f} dB"
-                    )
-
-                except Exception:
-
-                    self.log(
-                        f"📥 FSPL: {fspl}"
-                    )
+                self.log(
+                    f"📥 FSPL: {float(fspl):.2f} dB"
+                )
 
         return parsed
-
 
     # ========================================================
     # REGISTER
@@ -1161,58 +911,37 @@ REGRAS IMPORTANTES:
             "👤 Registrando usuário no PlanApp..."
         )
 
-        result = (
-            await self.execute_mcp_tool(
-                "register",
-                {
-                    "user_id": USER_ID
-                }
-            )
+        await self.execute_mcp_tool(
+            "register",
+            {
+                "user_id": USER_ID,
+            },
         )
 
         self.log(
             "🟢 Usuário registrado."
         )
 
-        return result
-
-
     # ========================================================
     # EVALUATE AUTOMÁTICO
     # ========================================================
 
     async def ensure_evaluate_link(
-        self
+        self,
+        parameters=None,
     ):
 
         if self.evaluate_executed:
+            return self.last_evaluate_result
 
-            return (
-                self.last_evaluate_result
-            )
-
-        if len(
-            self.geocoded_points
-        ) < 2:
-
+        if len(self.geocoded_points) < 2:
             return None
 
-        self.log(
-            "📡 Executando avaliação técnica do enlace..."
-        )
+        if parameters is None:
+            parameters = self.link_parameters
 
-        tx = (
-            self.geocoded_points[0]
-        )
-
-        rx = (
-            self.geocoded_points[1]
-        )
-
-        parameters = (
-            self.link_parameters
-            or {}
-        )
+        tx = self.geocoded_points[0]
+        rx = self.geocoded_points[1]
 
         arguments = {
             "tx_lat": tx["lat"],
@@ -1221,21 +950,25 @@ REGRAS IMPORTANTES:
             "rx_lon": rx["lon"],
             "tx_ha": parameters.get(
                 "tx_ha",
-                DEFAULT_TX_HA
+                DEFAULT_TX_HA,
             ),
             "rx_ha": parameters.get(
                 "rx_ha",
-                DEFAULT_RX_HA
+                DEFAULT_RX_HA,
             ),
             "freq_mhz": parameters.get(
                 "freq_mhz",
-                DEFAULT_FREQ_MHZ
+                DEFAULT_FREQ_MHZ,
             ),
             "on_rooftop": parameters.get(
                 "on_rooftop",
-                DEFAULT_ON_ROOFTOP
+                DEFAULT_ON_ROOFTOP,
             ),
         }
+
+        self.log(
+            "📡 Executando avaliação técnica do enlace..."
+        )
 
         self.log(
             "📤 Parâmetros enviados ao PlanApp: "
@@ -1246,74 +979,92 @@ REGRAS IMPORTANTES:
             )
         )
 
-        result = (
-            await self.execute_mcp_tool(
-                "evaluate_link",
-                arguments
-            )
+        return await self.execute_mcp_tool(
+            "evaluate_link",
+            arguments,
         )
-
-        return result
-
 
     # ========================================================
     # CONTEXTO TÉCNICO PARA O QWEN
     # ========================================================
 
-    def append_technical_context(self):
+    def append_technical_context(
+        self,
+        technical_result,
+    ):
 
-        if self.last_evaluate_result is None:
-            return
+        effective = {
+            "freq_mhz": self.link_parameters.get(
+                "freq_mhz"
+            ),
+            "tx_ha": self.link_parameters.get(
+                "tx_ha"
+            ),
+            "rx_ha": self.link_parameters.get(
+                "rx_ha"
+            ),
+            "on_rooftop": self.link_parameters.get(
+                "on_rooftop"
+            ),
+        }
 
-        resultado_json = json.dumps(
-            self.last_evaluate_result,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        )
+        requested = {
+            "frequency": self.requested_frequency,
+            "frequency_unit": self.requested_frequency_unit,
+            "frequency_text": self.requested_frequency_text,
+            "tx_ha": self.requested_tx_ha,
+            "rx_ha": self.requested_rx_ha,
+        }
 
-        parameters_json = json.dumps(
-            self.link_parameters,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        )
+        conversion_text = ""
+
+        if (
+            self.requested_frequency is not None
+            and self.requested_frequency_unit is not None
+        ):
+
+            conversion_text = (
+                f"A frequência foi solicitada pelo usuário como "
+                f"{self.requested_frequency_text}. "
+                f"Apenas internamente ela foi convertida para "
+                f"{effective['freq_mhz']} MHz para o parâmetro "
+                f"freq_mhz do PlanApp. "
+                f"Na resposta ao usuário, preserve a unidade original "
+                f"{self.requested_frequency_unit}."
+            )
+
+        context = {
+            "parametros_solicitados_pelo_usuario": requested,
+            "parametros_efetivos_enviados_ao_planapp": effective,
+            "conversao_de_frequencia": conversion_text,
+            "resultado_tecnico_real_do_planapp": technical_result,
+            "regras_de_interpretacao": [
+                "Use o resultado real do PlanApp.",
+                "Não invente valores.",
+                "Não recalcule FSPL.",
+                "Não altere unidades.",
+                "Não interprete core, fresnel, boundary, "
+                "delta_diffra, VV ou d_norm sem definição explícita.",
+                "Não conclua viabilidade sem critérios suficientes.",
+                "Diferencie parâmetros solicitados dos parâmetros efetivos.",
+            ],
+        }
 
         self.messages.append(
             {
                 "role": "user",
                 "content": (
-                    "A avaliação técnica do enlace já foi "
-                    "executada pelo PlanApp.\n\n"
-
-                    "PARÂMETROS DA SOLICITAÇÃO ENVIADOS "
-                    "AO PLANAPP:\n"
-                    f"{parameters_json}\n\n"
-
-                    "RESULTADO TÉCNICO REAL DO PLANAPP:\n"
-                    f"{resultado_json}\n\n"
-
-                    "Agora produza a análise técnica final "
-                    "para o usuário.\n\n"
-
-                    "IMPORTANTE:\n"
-                    "- Utilize exclusivamente os dados "
-                    "retornados pelo PlanApp.\n"
-                    "- Não invente valores.\n"
-                    "- Não recalcule valores já fornecidos.\n"
-                    "- Não solicite novamente evaluate_link.\n"
-                    "- Não diga que a avaliação ainda está "
-                    "sendo executada.\n"
-                    "- Não produza uma resposta de espera.\n"
-                    "- Explique claramente os resultados "
-                    "disponíveis e suas limitações.\n"
-                    "- Se os dados disponíveis não forem "
-                    "suficientes para concluir a viabilidade "
-                    "do enlace, diga isso explicitamente."
+                    "CONTEXTO TÉCNICO OBTIDO AUTOMATICAMENTE "
+                    "PELO PLANAPP.\n\n"
+                    + json.dumps(
+                        context,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
                 ),
             }
         )
-
 
     # ========================================================
     # TURNO DO AGENTE
@@ -1323,23 +1074,21 @@ REGRAS IMPORTANTES:
 
         for _ in range(12):
 
-            response = (
-                await self.ollama_chat()
-            )
+            response = await self.ollama_chat()
 
             message = response.get(
                 "message",
-                {}
-            )
-
-            tool_calls = message.get(
-                "tool_calls",
-                []
+                {},
             )
 
             content = message.get(
                 "content",
-                ""
+                "",
+            )
+
+            tool_calls = message.get(
+                "tool_calls",
+                [],
             )
 
             assistant_message = {
@@ -1348,68 +1097,44 @@ REGRAS IMPORTANTES:
             }
 
             if tool_calls:
-
-                assistant_message[
-                    "tool_calls"
-                ] = tool_calls
+                assistant_message["tool_calls"] = tool_calls
 
             self.messages.append(
                 assistant_message
             )
 
-            # =================================================
-            # QWEN NÃO PEDIU TOOL
-            # =================================================
+            # ------------------------------------------------
+            # Sem chamada de ferramenta
+            # ------------------------------------------------
 
             if not tool_calls:
 
-                # -------------------------------------------------
-                # Se temos dois pontos, a avaliação TEM que acontecer
-                # antes de aceitar qualquer resposta final do Qwen.
-                # -------------------------------------------------
-
                 if (
-                    len(
-                        self.geocoded_points
-                    ) >= 2
+                    len(self.geocoded_points) >= 2
                     and not self.evaluate_executed
                 ):
 
-                    await (
-                        self.ensure_evaluate_link()
+                    technical_result = (
+                        await self.ensure_evaluate_link(
+                            self.link_parameters
+                        )
                     )
 
-                    self.append_technical_context()
+                    self.append_technical_context(
+                        technical_result
+                    )
 
-                    # O Qwen recebe agora o resultado real e produz
-                    # a análise final.
                     continue
-
-                # -------------------------------------------------
-                # Se a avaliação já aconteceu, agora sim podemos
-                # aceitar a resposta final.
-                # -------------------------------------------------
 
                 if self.evaluate_executed:
 
-                    self.current_stage = 3
-
-                    self.log(
-                        "🔵 Etapa 3 — "
-                        "Interpretando resultados"
-                    )
-
                     return content
-
-                # -------------------------------------------------
-                # Ainda não temos dois pontos.
-                # -------------------------------------------------
 
                 return content
 
-            # =================================================
-            # EXECUTA TOOL CALLS
-            # =================================================
+            # ------------------------------------------------
+            # Executa chamadas de ferramentas
+            # ------------------------------------------------
 
             for tool_call in tool_calls:
 
@@ -1427,31 +1152,18 @@ REGRAS IMPORTANTES:
                     {}
                 )
 
-                if isinstance(
-                    arguments,
-                    str
-                ):
+                if isinstance(arguments, str):
 
                     try:
-
-                        arguments = json.loads(
-                            arguments
-                        )
+                        arguments = json.loads(arguments)
 
                     except Exception:
-
                         arguments = {}
 
-                result = (
-                    await self.execute_mcp_tool(
-                        tool_name,
-                        arguments
-                    )
+                result = await self.execute_mcp_tool(
+                    tool_name,
+                    arguments,
                 )
-
-                # ------------------------------------------------
-                # Retorna o resultado da ferramenta ao Qwen.
-                # ------------------------------------------------
 
                 self.messages.append(
                     {
@@ -1464,101 +1176,92 @@ REGRAS IMPORTANTES:
                     }
                 )
 
-            # =================================================
-            # APÓS AS TOOLS
-            # =================================================
+            # ------------------------------------------------
+            # Após as ferramentas
+            # ------------------------------------------------
 
             if (
-                len(
-                    self.geocoded_points
-                ) >= 2
+                len(self.geocoded_points) >= 2
                 and not self.evaluate_executed
             ):
 
-                # ------------------------------------------------
-                # O Python executa obrigatoriamente o evaluate.
-                # ------------------------------------------------
-
-                await (
-                    self.ensure_evaluate_link()
+                technical_result = (
+                    await self.ensure_evaluate_link(
+                        self.link_parameters
+                    )
                 )
 
-                # ------------------------------------------------
-                # Só depois entregamos o resultado real ao Qwen.
-                # ------------------------------------------------
-
-                self.append_technical_context()
-
-                # ------------------------------------------------
-                # Volta ao Ollama para produzir a análise final.
-                # ------------------------------------------------
+                self.append_technical_context(
+                    technical_result
+                )
 
                 continue
 
-        return (
-            "O agente atingiu o limite de iterações "
-            "sem concluir a análise."
-        )
+            if self.evaluate_executed:
 
+                # Faz uma nova chamada ao Qwen para produzir
+                # a resposta final usando o resultado técnico.
+                continue
+
+        return (
+            "A análise foi executada, mas o modelo atingiu "
+            "o limite de processamento da resposta."
+        )
 
     # ========================================================
     # ASK
     # ========================================================
 
-    async def ask(
-        self,
-        text
-    ):
+    async def ask(self, text):
 
-        # ====================================================
-        # RESET DO ESTADO DA ANÁLISE
-        # ====================================================
+        # ----------------------------------------------------
+        # Reset da execução
+        # ----------------------------------------------------
+
+        self.messages = []
 
         self.geocoded_points = []
 
         self.evaluate_executed = False
-
         self.last_evaluate_result = None
 
         self.tool_count = 0
-
         self.current_stage = 0
 
         self.map = None
 
         # ----------------------------------------------------
-        # Extrai parâmetros técnicos da solicitação
+        # Parâmetros
         # ----------------------------------------------------
 
-        self.link_parameters = (
-            self.extract_link_parameters(
-                text
-            )
+        parameters = self.extract_link_parameters(
+            text
+        )
+
+        self.log(
+            "🟡 Etapa 1 — Processando solicitação"
         )
 
         self.log(
             "⚙️ Parâmetros detectados: "
             + json.dumps(
-                self.link_parameters,
+                parameters,
                 ensure_ascii=False,
+                indent=2,
             )
         )
 
-        # ====================================================
-        # CONEXÃO
-        # ====================================================
+        # ----------------------------------------------------
+        # MCP
+        # ----------------------------------------------------
 
         await self.connect()
 
-        # ====================================================
-        # REGISTER
-        # ====================================================
-
         await self.register()
 
-        # ====================================================
-        # MENSAGENS
-        # ====================================================
+        # ----------------------------------------------------
+        # Mensagens iniciais
+        # ----------------------------------------------------
 
         self.messages = [
             {
@@ -1571,71 +1274,58 @@ REGRAS IMPORTANTES:
             },
         ]
 
-        # ====================================================
-        # ETAPA 1
-        # ====================================================
+        # ----------------------------------------------------
+        # Agente
+        # ----------------------------------------------------
 
-        self.current_stage = 1
+        resultado = await self.agent_turn()
 
-        self.log(
-            "🟡 Etapa 1 — "
-            "Processando solicitação"
-        )
-
-        # ====================================================
-        # AGENTE
-        # ====================================================
-
-        result = (
-            await self.agent_turn()
-        )
-
-        # ====================================================
-        # GARANTIA FINAL DA AVALIAÇÃO
-        # ====================================================
+        # ----------------------------------------------------
+        # Garantias finais
+        # ----------------------------------------------------
 
         if (
-            len(
-                self.geocoded_points
-            ) >= 2
+            len(self.geocoded_points) >= 2
             and not self.evaluate_executed
         ):
 
-            await (
-                self.ensure_evaluate_link()
+            technical_result = (
+                await self.ensure_evaluate_link(
+                    parameters
+                )
             )
 
-        # ====================================================
-        # GARANTIA FINAL DO MAPA
-        # ====================================================
+            self.append_technical_context(
+                technical_result
+            )
+
+            # Última resposta do modelo
+            resultado = await self.agent_turn()
 
         if (
-            self.map is None
-            and len(
-                self.geocoded_points
-            ) >= 2
+            len(self.geocoded_points) >= 2
+            and self.map is None
         ):
 
-            await (
-                self.mostrar_mapa_apos_geocodificacao()
+            await self.mostrar_mapa_apos_geocodificacao()
+
+        if self.map is not None:
+
+            self.log(
+                "🗺️ Mapa disponível."
             )
 
-        # ====================================================
-        # STATUS FINAL
-        # ====================================================
+        self.current_stage = 3
 
         self.log(
-            "🗺️ Objeto do mapa disponível."
-            if self.map is not None
-            else "⚠️ Mapa não disponível."
+            "🔵 Etapa 3 — Interpretando resultados"
         )
 
         self.log(
             "🟢 Análise concluída."
         )
 
-        return result
-
+        return resultado
 
     # ========================================================
     # CLOSE
@@ -1647,11 +1337,8 @@ REGRAS IMPORTANTES:
 
             await self.exit_stack.aclose()
 
-        except Exception:
-            pass
+        finally:
 
-        self.connected = False
-
-        self.mcp_session = None
-
-        self.mcp_tools = []
+            self.mcp_session = None
+            self.mcp_tools = []
+            self.connected = False
