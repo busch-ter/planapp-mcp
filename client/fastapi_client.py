@@ -1,4 +1,33 @@
+import base64
+from dataclasses import dataclass
+
 import requests
+
+
+@dataclass
+class APIResult:
+    """
+    Resultado de uma chamada à API do PlanApp.
+
+    kind:
+        "json"
+        "image"
+        "text"
+        "bytes"
+        "http_error"
+        "request_error"
+        "error"
+
+    data:
+        Conteúdo retornado pelo backend.
+    """
+
+    kind: str
+    data: object
+    response: requests.Response | None = None
+
+    def __repr__(self):
+        return f"APIResult(kind={self.kind!r})"
 
 
 class FastAPIClient:
@@ -31,12 +60,6 @@ class FastAPIClient:
 
         Endpoint:
             POST /register?user_id=<user_id>
-
-        O backend retorna:
-            user_id
-            token
-
-        Esses valores ficam armazenados na instância.
         """
 
         response = requests.post(
@@ -76,17 +99,12 @@ class FastAPIClient:
         method="get",
         params=None,
         body=None,
+        timeout=None,
     ):
         """
         Executa uma chamada autenticada ao backend.
 
-        Depois do register(), a URL segue o padrão:
-
-            /{user_id}/{route}
-
-        e o token é enviado através de:
-
-            X-Token: <token>
+        O retorno pode ser JSON, imagem, texto ou bytes.
         """
 
         if not self.user_id or not self.token:
@@ -106,34 +124,226 @@ class FastAPIClient:
         }
 
         method = method.lower()
+        timeout = timeout or self.timeout
 
-        if method == "post":
+        try:
 
-            response = requests.post(
-                url,
-                params=params,
-                headers=headers,
-                json=body,
-                timeout=self.timeout,
+            if method == "post":
+
+                response = requests.post(
+                    url,
+                    params=params,
+                    headers=headers,
+                    json=body,
+                    timeout=timeout,
+                )
+
+            elif method == "get":
+
+                response = requests.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=timeout,
+                )
+
+            else:
+                raise ValueError(
+                    f"Método HTTP não suportado: {method}"
+                )
+
+            response.raise_for_status()
+
+            return self._parse_response(response)
+
+        except requests.HTTPError as e:
+
+            response = getattr(e, "response", None)
+
+            return APIResult(
+                kind="http_error",
+                data=str(e),
+                response=response,
             )
 
-        elif method == "get":
+        except requests.RequestException as e:
 
-            response = requests.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=self.timeout,
+            return APIResult(
+                kind="request_error",
+                data=str(e),
+                response=None,
             )
 
-        else:
-            raise ValueError(
-                f"Método HTTP não suportado: {method}"
+        except Exception as e:
+
+            return APIResult(
+                kind="error",
+                data=str(e),
+                response=None,
             )
 
-        response.raise_for_status()
+    # ========================================================
+    # Parsing da resposta
+    # ========================================================
 
-        return response.json()
+    def _parse_response(self, response):
+        """
+        Interpreta a resposta HTTP do backend.
+
+        Suporta:
+
+        - application/json
+        - image/*
+        - text/*
+        - bytes
+        """
+
+        content_type = (
+            response.headers.get("content-type") or ""
+        ).lower()
+
+        # ----------------------------------------------------
+        # JSON
+        # ----------------------------------------------------
+
+        if "application/json" in content_type:
+
+            try:
+                data = response.json()
+            except ValueError:
+                return APIResult(
+                    kind="bytes",
+                    data=response.content,
+                    response=response,
+                )
+
+            return self._parse_json_payload(
+                data,
+                response,
+            )
+
+        # ----------------------------------------------------
+        # Imagem HTTP direta
+        # ----------------------------------------------------
+
+        if content_type.startswith("image/"):
+
+            return APIResult(
+                kind="image",
+                data=response.content,
+                response=response,
+            )
+
+        # ----------------------------------------------------
+        # Texto
+        # ----------------------------------------------------
+
+        if "text/" in content_type:
+
+            return APIResult(
+                kind="text",
+                data=response.text,
+                response=response,
+            )
+
+        # ----------------------------------------------------
+        # Qualquer outro conteúdo
+        # ----------------------------------------------------
+
+        return APIResult(
+            kind="bytes",
+            data=response.content,
+            response=response,
+        )
+
+    # ========================================================
+    # Parsing de payload JSON
+    # ========================================================
+
+    def _parse_json_payload(
+        self,
+        data,
+        response,
+    ):
+        """
+        Interpreta respostas JSON no formato utilizado pelo
+        backend do PlanApp.
+
+        Exemplo:
+
+            {
+                "status": "ok",
+                "kind": "image",
+                "data": "<base64>"
+            }
+        """
+
+        # JSON simples que não seja dict
+        if not isinstance(data, dict):
+
+            return APIResult(
+                kind="json",
+                data=data,
+                response=response,
+            )
+
+        status = str(
+            data.get("status", "")
+        ).lower()
+
+        kind = data.get("kind")
+        payload = data.get("data")
+
+        # ----------------------------------------------------
+        # Imagem codificada em Base64
+        # ----------------------------------------------------
+
+        if kind == "image" and status == "ok":
+
+            try:
+
+                image_bytes = base64.b64decode(
+                    payload
+                )
+
+                return APIResult(
+                    kind="image",
+                    data=image_bytes,
+                    response=response,
+                )
+
+            except Exception as e:
+
+                return APIResult(
+                    kind="error",
+                    data=f"Erro ao decodificar imagem Base64: {e}",
+                    response=response,
+                )
+
+        # ----------------------------------------------------
+        # Texto
+        # ----------------------------------------------------
+
+        if kind == "text":
+
+            return APIResult(
+                kind="text",
+                data={
+                    "status": status,
+                    "data": payload,
+                },
+                response=response,
+            )
+
+        # ----------------------------------------------------
+        # JSON normal
+        # ----------------------------------------------------
+
+        return APIResult(
+            kind="json",
+            data=data,
+            response=response,
+        )
 
     # ========================================================
     # PlanApp - set_link
@@ -207,3 +417,188 @@ class FastAPIClient:
             "link_features",
             method="get",
         )
+
+    # ========================================================
+    # PlanApp - link_area
+    # ========================================================
+
+    def link_area(self, ds_string):
+        """
+        Retorna a representação visual da área do enlace.
+
+        ds_string:
+            COVER
+            DTM
+            DSM
+        """
+
+        return self._request(
+            "link_area",
+            params={
+                "ds_string": ds_string,
+            },
+            method="get",
+        )
+
+    # ========================================================
+    # PlanApp - link_profile
+    # ========================================================
+
+    def link_profile(
+        self,
+        v_h=0,
+        **kwargs,
+    ):
+        """
+        Retorna a representação visual do perfil do enlace.
+
+        v_h:
+            Offset horizontal do plano Fresnel.
+
+        kwargs:
+            Opções adicionais, como figsize e dpi.
+        """
+
+        return self._request(
+            "link_profile",
+            params={
+                "v_h": v_h,
+            },
+            body={
+                "options": kwargs,
+            },
+            method="post",
+        )
+
+    # ========================================================
+    # PlanApp - lulc_fresnel
+    # ========================================================
+
+    def lulc_fresnel(
+        self,
+        **kwargs,
+    ):
+        """
+        Retorna a visualização LULC/Fresnel do enlace.
+        """
+
+        return self._request(
+            "lulc_fresnel",
+            body={
+                "options": kwargs,
+            },
+            method="post",
+        )
+
+    # ========================================================
+    # PlanApp - bldg_prepare
+    # ========================================================
+
+    def bldg_prepare(self):
+        """
+        Prepara as informações de edificações para a análise
+        do enlace.
+        """
+
+        return self._request(
+            "prepare_bldg",
+            method="get",
+            timeout=120,
+        )
+
+    # ========================================================
+    # PlanApp - bldg_fresnel
+    # ========================================================
+
+    def bldg_fresnel(
+        self,
+        **kwargs,
+    ):
+        """
+        Retorna a visualização de edificações no plano Fresnel.
+        """
+
+        options = dict(kwargs)
+        options["base64"] = True
+
+        return self._request(
+            "bldg_fresnel",
+            body={
+                "options": options,
+            },
+            method="post",
+        )
+
+    # ========================================================
+    # PlanApp - bldg_profile
+    # ========================================================
+
+    def bldg_profile(
+        self,
+        filtered=False,
+        **kwargs,
+    ):
+        """
+        Retorna o perfil do enlace com informações de
+        edificações.
+        """
+
+        options = dict(kwargs)
+        options["base64"] = True
+
+        return self._request(
+            "bldg_profile",
+            params={
+                "filtered": filtered,
+            },
+            body={
+                "options": options,
+            },
+            method="post",
+        )
+
+    # ========================================================
+    # Visualizações completas do enlace
+    # ========================================================
+
+    def generate_link_visualizations(self):
+        """
+        Executa as visualizações padrão de um enlace.
+
+        A sequência é determinística e não depende do LLM.
+
+        Retorna um dicionário contendo os resultados visuais
+        de cada etapa.
+        """
+
+        results = {}
+
+        # ----------------------------------------------------
+        # Área do enlace
+        # ----------------------------------------------------
+
+        results["dtm"] = self.link_area("DTM")
+        results["dsm"] = self.link_area("DSM")
+        results["cover"] = self.link_area("COVER")
+
+        # ----------------------------------------------------
+        # Perfil do enlace
+        # ----------------------------------------------------
+
+        results["link_profile"] = self.link_profile()
+
+        # ----------------------------------------------------
+        # LULC / Fresnel
+        # ----------------------------------------------------
+
+        results["lulc_fresnel"] = self.lulc_fresnel()
+
+        # ----------------------------------------------------
+        # Edificações
+        # ----------------------------------------------------
+
+        results["bldg_prepare"] = self.bldg_prepare()
+        results["bldg_fresnel"] = self.bldg_fresnel()
+        results["bldg_profile"] = self.bldg_profile()
+
+        return results
