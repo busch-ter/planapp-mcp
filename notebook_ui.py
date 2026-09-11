@@ -2,6 +2,7 @@ import asyncio
 import html
 import importlib
 import json
+import traceback
 
 import ipywidgets as widgets
 from IPython.display import display
@@ -92,6 +93,7 @@ def iniciar_planapp():
             padding="8px",
             max_height="180px",
             overflow="auto",
+            width="100%",
         )
     )
 
@@ -103,8 +105,9 @@ def iniciar_planapp():
         layout=widgets.Layout(
             border="1px solid #ddd",
             padding="8px",
-            max_height="350px",
+            height="350px",
             overflow="auto",
+            width="100%",
         )
     )
 
@@ -118,6 +121,7 @@ def iniciar_planapp():
             padding="10px",
             max_height="500px",
             overflow="auto",
+            width="100%",
         )
     )
 
@@ -152,19 +156,46 @@ def iniciar_planapp():
     )
 
     # ========================================================
+    # CONTADORES
+    # ========================================================
+
+    estado = {
+        "status_count": 0,
+        "log_count": 0,
+        "visualizacao_count": 0,
+        "mapa_count": 0,
+        "resultado_count": 0,
+    }
+
+    # ========================================================
     # CALLBACK — STATUS
     # ========================================================
 
     def atualizar_status(mensagem):
 
+        estado["status_count"] += 1
+
+        texto = str(mensagem)
+
         status.value = (
             "<b>Status:</b> "
-            + html.escape(str(mensagem))
+            + html.escape(texto)
         )
 
-        with historico_status:
+        try:
 
-            print(str(mensagem))
+            with historico_status:
+
+                print(
+                    f"[STATUS #{estado['status_count']}] "
+                    f"{texto}"
+                )
+
+        except Exception as exc:
+
+            print(
+                f"[ERRO CALLBACK STATUS] {repr(exc)}"
+            )
 
     # ========================================================
     # CALLBACK — LOG MCP
@@ -172,9 +203,25 @@ def iniciar_planapp():
 
     def atualizar_log(mensagem):
 
-        with log_execucao:
+        estado["log_count"] += 1
 
-            print(str(mensagem))
+        texto = str(mensagem)
+
+        try:
+
+            with log_execucao:
+
+                print(
+                    f"[LOG #{estado['log_count']}] "
+                    f"{texto}"
+                )
+
+        except Exception as exc:
+
+            # Último recurso: não deixar a exceção desaparecer.
+            print(
+                f"[ERRO CALLBACK LOG] {repr(exc)}"
+            )
 
     # ========================================================
     # CALLBACK — RESULTADO TÉCNICO
@@ -182,48 +229,64 @@ def iniciar_planapp():
 
     def atualizar_resultado_tecnico(resultado):
 
-        with resultado_tecnico_output:
+        estado["resultado_count"] += 1
+
+        try:
 
             resultado_tecnico_output.clear_output(
                 wait=True
             )
 
-            print(
-                "=================================================="
-            )
-
-            print(
-                "📊 RESULTADO TÉCNICO REAL DO PLANAPP"
-            )
-
-            print(
-                "=================================================="
-            )
-
-            if resultado is None:
+            with resultado_tecnico_output:
 
                 print(
-                    "Nenhum resultado técnico foi retornado."
+                    "=================================================="
                 )
 
-                return
-
-            try:
+                print(
+                    "📊 RESULTADO TÉCNICO REAL DO PLANAPP"
+                )
 
                 print(
-                    json.dumps(
-                        resultado,
-                        ensure_ascii=False,
-                        indent=2,
-                        default=str,
+                    "=================================================="
+                )
+
+                if resultado is None:
+
+                    print(
+                        "Nenhum resultado técnico foi retornado."
                     )
-                )
 
-            except Exception:
+                    return
 
-                print(
-                    str(resultado)
-                )
+                try:
+
+                    print(
+                        json.dumps(
+                            resultado,
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        )
+                    )
+
+                except Exception:
+
+                    print(
+                        str(resultado)
+                    )
+
+        except Exception as exc:
+
+            print(
+                "[ERRO CALLBACK RESULTADO]"
+            )
+
+            print(
+                repr(exc)
+            )
+
+            traceback.print_exc()
 
     # ========================================================
     # CALLBACK — MAPA
@@ -231,13 +294,164 @@ def iniciar_planapp():
 
     def atualizar_mapa(mapa):
 
-        mapa_output.children = []
+        estado["mapa_count"] += 1
 
-        if mapa is not None:
+        try:
+
+            mapa_output.children = []
+
+            if mapa is None:
+
+                return
+
+            # ------------------------------------------------
+            # O mapa precisa ser um Widget.
+            # ------------------------------------------------
+
+            if isinstance(mapa, widgets.Widget):
+
+                mapa_output.children = [
+                    mapa
+                ]
+
+                return
+
+            # ------------------------------------------------
+            # Caso venha um objeto de display/IPython,
+            # colocamos dentro de Output.
+            # ------------------------------------------------
+
+            output = widgets.Output(
+                layout=widgets.Layout(
+                    width="100%",
+                )
+            )
+
+            with output:
+
+                display(mapa)
 
             mapa_output.children = [
-                mapa
+                output
             ]
+
+        except Exception as exc:
+
+            output = widgets.Output()
+
+            with output:
+
+                print(
+                    "❌ Erro ao exibir mapa:"
+                )
+
+                print(
+                    repr(exc)
+                )
+
+                traceback.print_exc()
+
+            mapa_output.children = [
+                output
+            ]
+
+    # ========================================================
+    # CONVERSÃO DE IMAGEM
+    # ========================================================
+
+    def converter_visualizacao(item):
+
+        # ----------------------------------------------------
+        # Já é um Widget
+        # ----------------------------------------------------
+
+        if isinstance(item, widgets.Widget):
+
+            return item
+
+        # ----------------------------------------------------
+        # Dicionário retornado pelo MCP
+        # ----------------------------------------------------
+
+        if isinstance(item, dict):
+
+            kind = item.get("kind")
+
+            if kind == "image":
+
+                encoding = item.get(
+                    "encoding"
+                )
+
+                data = item.get(
+                    "data"
+                )
+
+                if encoding == "base64" and data:
+
+                    import base64
+
+                    image_bytes = base64.b64decode(
+                        data
+                    )
+
+                    return widgets.Image(
+                        value=image_bytes,
+                        format="png",
+                        layout=widgets.Layout(
+                            width="100%",
+                            height="auto",
+                        ),
+                    )
+
+            # ------------------------------------------------
+            # Qualquer outro resultado textual
+            # ------------------------------------------------
+
+            texto = json.dumps(
+                item,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+
+            return widgets.HTML(
+                value=(
+                    "<pre style='"
+                    "white-space:pre-wrap;"
+                    "margin:10px 0;"
+                    "'>"
+                    + html.escape(texto)
+                    + "</pre>"
+                )
+            )
+
+        # ----------------------------------------------------
+        # Bytes diretamente
+        # ----------------------------------------------------
+
+        if isinstance(item, bytes):
+
+            return widgets.Image(
+                value=item,
+                format="png",
+                layout=widgets.Layout(
+                    width="100%",
+                    height="auto",
+                ),
+            )
+
+        # ----------------------------------------------------
+        # Objeto desconhecido
+        # ----------------------------------------------------
+
+        return widgets.HTML(
+            value=(
+                "<pre>"
+                + html.escape(str(item))
+                + "</pre>"
+            )
+        )
 
     # ========================================================
     # CALLBACK — VISUALIZAÇÕES
@@ -245,21 +459,81 @@ def iniciar_planapp():
 
     def atualizar_visualizacoes(visualizacoes):
 
-        visualizacoes_output.children = []
+        estado["visualizacao_count"] += 1
 
-        if not visualizacoes:
-            return
+        try:
 
-        children = []
+            if not visualizacoes:
 
-        for item in visualizacoes:
+                visualizacoes_output.children = []
 
-            if item is None:
-                continue
+                return
 
-            children.append(item)
+            children = []
 
-        visualizacoes_output.children = children
+            for index, item in enumerate(
+                visualizacoes,
+                start=1,
+            ):
+
+                if item is None:
+                    continue
+
+                try:
+
+                    widget = converter_visualizacao(
+                        item
+                    )
+
+                    if widget is not None:
+
+                        children.append(
+                            widget
+                        )
+
+                except Exception as exc:
+
+                    erro = widgets.Output()
+
+                    with erro:
+
+                        print(
+                            f"❌ Erro na visualização #{index}"
+                        )
+
+                        print(
+                            repr(exc)
+                        )
+
+                        traceback.print_exc()
+
+                    children.append(
+                        erro
+                    )
+
+            visualizacoes_output.children = (
+                tuple(children)
+            )
+
+        except Exception as exc:
+
+            erro = widgets.Output()
+
+            with erro:
+
+                print(
+                    "❌ ERRO NO CALLBACK DE VISUALIZAÇÕES"
+                )
+
+                print(
+                    repr(exc)
+                )
+
+                traceback.print_exc()
+
+            visualizacoes_output.children = [
+                erro
+            ]
 
     # ========================================================
     # CRIA AGENTE
@@ -307,8 +581,36 @@ def iniciar_planapp():
                 "🟡 Iniciando análise..."
             )
 
+            atualizar_log(
+                "=================================================="
+            )
+
+            atualizar_log(
+                "🚀 INÍCIO DA EXECUÇÃO"
+            )
+
+            atualizar_log(
+                "=================================================="
+            )
+
+            atualizar_log(
+                f"Solicitação: {texto}"
+            )
+
             resultado = await agent.ask(
                 texto
+            )
+
+            atualizar_log(
+                "=================================================="
+            )
+
+            atualizar_log(
+                "🏁 EXECUÇÃO FINALIZADA"
+            )
+
+            atualizar_log(
+                "=================================================="
             )
 
             resposta.value = (
@@ -336,21 +638,29 @@ def iniciar_planapp():
                 f"❌ Erro na execução: {exc}"
             )
 
-            with log_execucao:
+            try:
 
-                print("")
-                print(
-                    "=================================================="
-                )
-                print(
-                    "❌ EXCEÇÃO NA INTERFACE"
-                )
-                print(
-                    "=================================================="
-                )
-                print(
-                    repr(exc)
-                )
+                with log_execucao:
+
+                    print("")
+                    print(
+                        "=================================================="
+                    )
+                    print(
+                        "❌ EXCEÇÃO NA INTERFACE"
+                    )
+                    print(
+                        "=================================================="
+                    )
+                    print(
+                        repr(exc)
+                    )
+
+                    traceback.print_exc()
+
+            except Exception:
+
+                pass
 
         finally:
 
@@ -362,9 +672,27 @@ def iniciar_planapp():
 
     def ao_clicar_analisar(_):
 
-        asyncio.ensure_future(
-            executar_analise_async()
-        )
+        try:
+
+            asyncio.ensure_future(
+                executar_analise_async()
+            )
+
+        except Exception as exc:
+
+            atualizar_status(
+                f"❌ Não foi possível iniciar: {exc}"
+            )
+
+            with log_execucao:
+
+                print(
+                    "❌ ERRO AO CRIAR TASK"
+                )
+
+                print(
+                    repr(exc)
+                )
 
     botao_analisar.on_click(
         ao_clicar_analisar
@@ -403,7 +731,7 @@ def iniciar_planapp():
         visualizacoes_output.children = []
 
         # ----------------------------------------------------
-        # Fecha o agente anterior
+        # Fecha agente anterior
         # ----------------------------------------------------
 
         try:
@@ -417,7 +745,7 @@ def iniciar_planapp():
             pass
 
         # ----------------------------------------------------
-        # Cria nova instância
+        # Novo agente
         # ----------------------------------------------------
 
         agent = PlanAppAgent(
@@ -447,7 +775,10 @@ def iniciar_planapp():
             ),
             status,
             historico_status,
-        ]
+        ],
+        layout=widgets.Layout(
+            width="100%",
+        ),
     )
 
     # ========================================================
@@ -460,7 +791,10 @@ def iniciar_planapp():
                 value="<h4>🔧 MCP / Log de execução</h4>"
             ),
             log_execucao,
-        ]
+        ],
+        layout=widgets.Layout(
+            width="100%",
+        ),
     )
 
     # ========================================================
@@ -473,7 +807,10 @@ def iniciar_planapp():
                 value="<h4>📊 Resultado técnico</h4>"
             ),
             resultado_tecnico_output,
-        ]
+        ],
+        layout=widgets.Layout(
+            width="100%",
+        ),
     )
 
     # ========================================================
@@ -486,7 +823,10 @@ def iniciar_planapp():
                 value="<h4>🗺️ Mapa do enlace</h4>"
             ),
             mapa_output,
-        ]
+        ],
+        layout=widgets.Layout(
+            width="100%",
+        ),
     )
 
     # ========================================================
@@ -499,7 +839,10 @@ def iniciar_planapp():
                 value="<h4>📈 Visualizações técnicas</h4>"
             ),
             visualizacoes_output,
-        ]
+        ],
+        layout=widgets.Layout(
+            width="100%",
+        ),
     )
 
     # ========================================================
@@ -509,7 +852,10 @@ def iniciar_planapp():
     painel_resposta = widgets.VBox(
         [
             resposta,
-        ]
+        ],
+        layout=widgets.Layout(
+            width="100%",
+        ),
     )
 
     # ========================================================
@@ -550,26 +896,16 @@ def iniciar_planapp():
     interface = widgets.VBox(
         [
             titulo,
-
             entrada,
-
             botoes,
-
             painel_status,
-
             painel_mcp,
-
             painel_resultado,
-
             painel_mapa,
-
             painel_visualizacoes,
-
             painel_resposta,
-
             exemplos,
         ],
-
         layout=widgets.Layout(
             width="100%",
         ),

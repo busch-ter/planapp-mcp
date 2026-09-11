@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import re
@@ -8,6 +9,8 @@ import requests
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+
+import ipywidgets as widgets
 
 from map_utils import mostrar_mapa_enlace
 
@@ -43,6 +46,22 @@ MAX_AGENT_ITERATIONS = 12
 
 
 # ============================================================
+# FERRAMENTAS CONTROLADAS PELA APLICAÇÃO
+# ============================================================
+
+APPLICATION_CONTROLLED_TOOLS = {
+    "register",
+    "evaluate_link",
+    "link_area",
+    "link_profile",
+    "lulc_fresnel",
+    "bldg_prepare",
+    "bldg_fresnel",
+    "bldg_profile",
+}
+
+
+# ============================================================
 # AGENTE
 # ============================================================
 
@@ -68,16 +87,15 @@ class PlanAppAgent:
             Recebe o mapa gerado após a geocodificação.
 
         log_callback:
-            Logs técnicos do MCP, incluindo argumentos e
-            resultados brutos das ferramentas.
+            Logs técnicos do MCP.
 
         result_callback:
             Recebe o resultado técnico real retornado pelo
             evaluate_link.
 
         visualization_callback:
-            Reservado para as visualizações automáticas do
-            enlace.
+            Recebe a lista de visualizações geradas
+            automaticamente após evaluate_link.
         """
 
         self.progress_callback = progress_callback
@@ -97,7 +115,6 @@ class PlanAppAgent:
 
         self.evaluate_executed = False
         self.last_evaluate_result = None
-
         self.evaluate_error = None
 
         self.tool_count = 0
@@ -125,6 +142,13 @@ class PlanAppAgent:
         self.requested_tx_ha = None
         self.requested_rx_ha = None
 
+        # ----------------------------------------------------
+        # Visualizações
+        # ----------------------------------------------------
+
+        self.visualizations = []
+
+
     # ========================================================
     # STATUS
     # ========================================================
@@ -133,7 +157,6 @@ class PlanAppAgent:
         """
         Envia somente mensagens de andamento/status.
 
-        IMPORTANTE:
         Argumentos e resultados brutos do MCP NÃO devem passar
         por este método.
         """
@@ -143,6 +166,7 @@ class PlanAppAgent:
                 self.progress_callback(message)
             except Exception:
                 pass
+
 
     # ========================================================
     # LOG TÉCNICO
@@ -158,6 +182,7 @@ class PlanAppAgent:
                 self.log_callback(message)
             except Exception:
                 pass
+
 
     # ========================================================
     # RESULTADO TÉCNICO
@@ -176,6 +201,7 @@ class PlanAppAgent:
                 self.result_callback(result)
             except Exception:
                 pass
+
 
     # ========================================================
     # SYSTEM PROMPT
@@ -458,7 +484,11 @@ COMPORTAMENTO DA RESPOSTA:
 
 91. A aplicação pode executar evaluate_link automaticamente mesmo que
     o modelo não faça uma chamada direta dessa ferramenta.
+
+92. As ferramentas de visualização são controladas exclusivamente pela
+    aplicação. O modelo não deve chamá-las diretamente.
 """
+
 
     # ========================================================
     # EXTRAÇÃO DOS PARÂMETROS
@@ -474,6 +504,7 @@ COMPORTAMENTO DA RESPOSTA:
         }
 
         # Reset dos parâmetros solicitados
+
         self.requested_frequency = None
         self.requested_frequency_unit = None
         self.requested_frequency_text = None
@@ -497,7 +528,9 @@ COMPORTAMENTO DA RESPOSTA:
             value_text = freq_match.group(1)
             unit = freq_match.group(2).lower()
 
-            value = float(value_text.replace(",", "."))
+            value = float(
+                value_text.replace(",", ".")
+            )
 
             self.requested_frequency = value
             self.requested_frequency_unit = unit
@@ -602,7 +635,11 @@ COMPORTAMENTO DA RESPOSTA:
 
         for pattern in rooftop_patterns:
 
-            if re.search(pattern, text, re.IGNORECASE):
+            if re.search(
+                pattern,
+                text,
+                re.IGNORECASE,
+            ):
                 parameters["on_rooftop"] = True
                 break
 
@@ -610,13 +647,16 @@ COMPORTAMENTO DA RESPOSTA:
 
         return parameters
 
+
     # ========================================================
     # CONEXÃO MCP
     # ========================================================
 
     async def connect(self):
 
-        self.log("🔌 Conectando ao PlanApp MCP...")
+        self.log(
+            "🔌 Conectando ao PlanApp MCP..."
+        )
 
         transport = await self.exit_stack.enter_async_context(
             streamable_http_client(MCP_URL)
@@ -654,6 +694,7 @@ COMPORTAMENTO DA RESPOSTA:
                 f"  - {tool.name}"
             )
 
+
     # ========================================================
     # FERRAMENTAS PARA O OLLAMA
     # ========================================================
@@ -664,11 +705,12 @@ COMPORTAMENTO DA RESPOSTA:
 
         for tool in self.mcp_tools:
 
-            # Estas ferramentas são controladas pela aplicação.
-            if tool.name in {
-                "register",
-                "evaluate_link",
-            }:
+            # ------------------------------------------------
+            # Estas ferramentas são controladas exclusivamente
+            # pela aplicação e NÃO pelo modelo.
+            # ------------------------------------------------
+
+            if tool.name in APPLICATION_CONTROLLED_TOOLS:
                 continue
 
             schema = getattr(
@@ -678,6 +720,7 @@ COMPORTAMENTO DA RESPOSTA:
             )
 
             if schema is None:
+
                 schema = getattr(
                     tool,
                     "inputSchema",
@@ -707,6 +750,7 @@ COMPORTAMENTO DA RESPOSTA:
 
         return tools
 
+
     # ========================================================
     # OLLAMA
     # ========================================================
@@ -718,6 +762,7 @@ COMPORTAMENTO DA RESPOSTA:
             "messages": self.messages,
             "tools": self.build_ollama_tools(),
             "stream": False,
+            "think": False,
         }
 
         def do_request():
@@ -732,7 +777,10 @@ COMPORTAMENTO DA RESPOSTA:
 
             return response.json()
 
-        return await asyncio.to_thread(do_request)
+        return await asyncio.to_thread(
+            do_request
+        )
+
 
     # ========================================================
     # PARSE RESULTADO MCP
@@ -810,6 +858,55 @@ COMPORTAMENTO DA RESPOSTA:
 
         return result
 
+
+    # ========================================================
+    # DETECÇÃO RECURSIVA DE ERRO
+    # ========================================================
+
+    def contains_nested_error(self, value):
+        """
+        Procura erros em qualquer nível de uma estrutura
+        retornada pelo MCP.
+        """
+
+        if isinstance(value, dict):
+
+            status = str(
+                value.get(
+                    "status",
+                    "",
+                )
+            ).lower()
+
+            if status in {
+                "error",
+                "failed",
+                "failure",
+            }:
+                return True
+
+            if value.get("error"):
+                return True
+
+            for child in value.values():
+
+                if self.contains_nested_error(
+                    child
+                ):
+                    return True
+
+        elif isinstance(value, list):
+
+            for child in value:
+
+                if self.contains_nested_error(
+                    child
+                ):
+                    return True
+
+        return False
+
+
     # ========================================================
     # DETECÇÃO DE ERRO MCP
     # ========================================================
@@ -838,26 +935,58 @@ COMPORTAMENTO DA RESPOSTA:
             return True
 
         # ----------------------------------------------------
-        # Erro dentro do payload
+        # Erro no payload, inclusive aninhado
         # ----------------------------------------------------
 
-        if isinstance(parsed, dict):
+        return self.contains_nested_error(
+            parsed
+        )
 
-            status = str(
-                parsed.get("status", "")
-            ).lower()
 
-            if status in {
-                "error",
-                "failed",
-                "failure",
-            }:
-                return True
+    # ========================================================
+    # RESULTADO SEGURO PARA LOG
+    # ========================================================
 
-            if parsed.get("error"):
-                return True
+    def make_log_safe(self, value):
+        """
+        Evita colocar grandes payloads Base64 de imagens no
+        painel de log.
+        """
 
-        return False
+        if isinstance(value, dict):
+
+            safe = {}
+
+            for key, child in value.items():
+
+                if (
+                    key == "data"
+                    and isinstance(child, str)
+                    and value.get("kind") == "image"
+                ):
+
+                    safe[key] = (
+                        f"<base64 image: "
+                        f"{len(child)} chars>"
+                    )
+
+                else:
+
+                    safe[key] = self.make_log_safe(
+                        child
+                    )
+
+            return safe
+
+        if isinstance(value, list):
+
+            return [
+                self.make_log_safe(child)
+                for child in value
+            ]
+
+        return value
+
 
     # ========================================================
     # RESUMO GEOCODE
@@ -892,6 +1021,7 @@ COMPORTAMENTO DA RESPOSTA:
             "lon": float(lon),
         }
 
+
     # ========================================================
     # RESUMO EVALUATE
     # ========================================================
@@ -904,14 +1034,18 @@ COMPORTAMENTO DA RESPOSTA:
         if "fspl" in parsed:
             return parsed["fspl"]
 
-        technical = parsed.get("technical")
+        technical = parsed.get(
+            "technical"
+        )
 
         if isinstance(technical, dict):
 
             if "fspl" in technical:
                 return technical["fspl"]
 
-        data = parsed.get("data")
+        data = parsed.get(
+            "data"
+        )
 
         if isinstance(data, dict):
 
@@ -920,22 +1054,29 @@ COMPORTAMENTO DA RESPOSTA:
 
         return None
 
+
     # ========================================================
     # REGISTRA PONTO GEOCODIFICADO
     # ========================================================
 
     def register_geocoded_point(self, parsed):
 
-        point = self.summarize_geocode(parsed)
+        point = self.summarize_geocode(
+            parsed
+        )
 
         if point is None:
+
             self.log(
                 "⚠️ Não foi possível extrair coordenadas "
                 "do resultado da geocodificação."
             )
+
             return
 
-        self.geocoded_points.append(point)
+        self.geocoded_points.append(
+            point
+        )
 
         self.log(
             "📍 "
@@ -944,20 +1085,27 @@ COMPORTAMENTO DA RESPOSTA:
             f"{point['lon']:.6f}"
         )
 
+
     # ========================================================
     # PREPARAÇÃO DO MAPA
     # ========================================================
 
-    async def mostrar_mapa_apos_geocodificacao(self):
+    async def mostrar_mapa_apos_geocodificacao(
+        self
+    ):
 
         if len(self.geocoded_points) < 2:
             return
 
-        self.log("🗺️ Preparando enlace no mapa...")
+        self.log(
+            "🗺️ Preparando enlace no mapa..."
+        )
 
         try:
 
-            self.map = mostrar_mapa_enlace(self)
+            self.map = mostrar_mapa_enlace(
+                self
+            )
 
             if self.map_callback:
 
@@ -970,20 +1118,281 @@ COMPORTAMENTO DA RESPOSTA:
                 except Exception as exc:
 
                     self.log(
-                        f"⚠️ Erro ao atualizar mapa: {exc}"
+                        f"⚠️ Erro ao atualizar mapa: "
+                        f"{exc}"
                     )
 
-            self.log("🟢 Mapa preparado.")
+            self.log(
+                "🟢 Mapa preparado."
+            )
 
         except Exception as exc:
 
             self.log(
-                f"❌ Erro ao preparar mapa: {exc}"
+                f"❌ Erro ao preparar mapa: "
+                f"{exc}"
             )
 
             self.log_detail(
-                f"Erro detalhado ao preparar mapa: {exc}"
+                f"Erro detalhado ao preparar mapa: "
+                f"{exc}"
             )
+
+
+    # ========================================================
+    # VISUALIZAÇÕES AUTOMÁTICAS
+    # ========================================================
+
+    async def gerar_visualizacoes(
+        self
+    ):
+
+        # ----------------------------------------------------
+        # Segurança
+        # ----------------------------------------------------
+
+        if not self.evaluate_executed:
+            return
+
+        if self.evaluate_error is not None:
+            return
+
+        if self.mcp_session is None:
+
+            self.log_detail(
+                "⚠️ Não é possível gerar visualizações: "
+                "sessão MCP inexistente."
+            )
+
+            return
+
+        self.log(
+            "📊 Gerando visualizações do enlace..."
+        )
+
+        self.visualizations = []
+
+        # ----------------------------------------------------
+        # Lista determinística.
+        #
+        # O modelo NÃO escolhe essas visualizações.
+        # ----------------------------------------------------
+
+        etapas = [
+            (
+                "DTM",
+                "link_area",
+                {
+                    "ds_string": "DTM",
+                },
+            ),
+            (
+                "DSM",
+                "link_area",
+                {
+                    "ds_string": "DSM",
+                },
+            ),
+            (
+                "COVER",
+                "link_area",
+                {
+                    "ds_string": "COVER",
+                },
+            ),
+            (
+                "Perfil do enlace",
+                "link_profile",
+                {},
+            ),
+            (
+                "LULC / Fresnel",
+                "lulc_fresnel",
+                {},
+            ),
+            (
+                "Preparação das edificações",
+                "bldg_prepare",
+                {},
+            ),
+            (
+                "Edificações / Fresnel",
+                "bldg_fresnel",
+                {},
+            ),
+            (
+                "Edificações / Perfil",
+                "bldg_profile",
+                {},
+            ),
+        ]
+
+        for titulo, tool_name, arguments in etapas:
+
+            self.log_detail("")
+            self.log_detail(
+                f"📊 Visualização: {titulo}"
+            )
+
+            try:
+
+                result = await self.execute_mcp_tool(
+                    tool_name,
+                    arguments,
+                )
+
+            except Exception as exc:
+
+                self.log_detail(
+                    f"❌ Exceção em {titulo}: "
+                    f"{exc}"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Resultado inválido
+            # ------------------------------------------------
+
+            if not isinstance(result, dict):
+
+                self.log_detail(
+                    f"⚠️ Resultado inválido para "
+                    f"{titulo}."
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Erro
+            # ------------------------------------------------
+
+            status = str(
+                result.get(
+                    "status",
+                    "",
+                )
+            ).lower()
+
+            if status in {
+                "error",
+                "failed",
+                "failure",
+            }:
+
+                self.log_detail(
+                    f"⚠️ Falha na visualização: "
+                    f"{titulo}"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Tipo do resultado
+            # ------------------------------------------------
+
+            kind = result.get(
+                "kind"
+            )
+
+            # ------------------------------------------------
+            # Etapas não visuais
+            # ------------------------------------------------
+
+            if kind != "image":
+
+                self.log_detail(
+                    f"ℹ️ {titulo}: "
+                    f"resultado não visualizável."
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Base64
+            # ------------------------------------------------
+
+            data = result.get(
+                "data"
+            )
+
+            if not data:
+
+                self.log_detail(
+                    f"⚠️ {titulo}: imagem vazia."
+                )
+
+                continue
+
+            try:
+
+                image_bytes = base64.b64decode(
+                    data,
+                    validate=True,
+                )
+
+                if not image_bytes:
+
+                    self.log_detail(
+                        f"⚠️ {titulo}: "
+                        f"imagem decodificada vazia."
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # Cria widget IPython
+                # ------------------------------------------------
+
+                widget = widgets.Image(
+                    value=image_bytes,
+                    format="png",
+                    layout=widgets.Layout(
+                        width="100%",
+                        max_width="1200px",
+                        height="auto",
+                    ),
+                )
+
+                self.visualizations.append(
+                    widget
+                )
+
+                self.log_detail(
+                    f"✅ {titulo}: imagem recebida."
+                )
+
+            except Exception as exc:
+
+                self.log_detail(
+                    f"❌ Erro ao decodificar "
+                    f"{titulo}: {exc}"
+                )
+
+        # ----------------------------------------------------
+        # Publica as visualizações para a UI
+        # ----------------------------------------------------
+
+        if self.visualization_callback:
+
+            try:
+
+                self.visualization_callback(
+                    self.visualizations
+                )
+
+            except Exception as exc:
+
+                self.log_detail(
+                    "❌ Erro ao atualizar "
+                    f"visualizações: {exc}"
+                )
+
+        self.log(
+            f"📊 {len(self.visualizations)} "
+            f"visualizações geradas."
+        )
+
 
     # ========================================================
     # EXECUÇÃO DE FERRAMENTA MCP
@@ -1011,11 +1420,9 @@ COMPORTAMENTO DA RESPOSTA:
         # ----------------------------------------------------
         # LOG TÉCNICO
         # ----------------------------------------------------
-        # IMPORTANTE:
-        # Argumentos NÃO vão para progress_callback/status.
-        # ----------------------------------------------------
 
         self.log_detail("")
+
         self.log_detail(
             f"🔧 MCP TOOL: {tool_name}"
         )
@@ -1092,16 +1499,23 @@ COMPORTAMENTO DA RESPOSTA:
         )
 
         # ----------------------------------------------------
-        # RESULTADO BRUTO VAI SOMENTE PARA O LOG
+        # RESULTADO VAI SOMENTE PARA O LOG
+        #
+        # Imagens Base64 são resumidas para não poluir
+        # o painel.
         # ----------------------------------------------------
 
         self.log_detail(
             "Resultado:"
         )
 
+        safe_parsed = self.make_log_safe(
+            parsed
+        )
+
         self.log_detail(
             json.dumps(
-                parsed,
+                safe_parsed,
                 ensure_ascii=False,
                 indent=2,
                 default=str,
@@ -1130,7 +1544,9 @@ COMPORTAMENTO DA RESPOSTA:
                     parsed
                 )
 
-                if len(self.geocoded_points) == 2:
+                if len(
+                    self.geocoded_points
+                ) == 2:
 
                     await self.mostrar_mapa_apos_geocodificacao()
 
@@ -1158,8 +1574,6 @@ COMPORTAMENTO DA RESPOSTA:
                     "❌ A avaliação técnica retornou erro."
                 )
 
-                # O resultado real do erro também é publicado
-                # para a interface.
                 self.publish_technical_result(
                     parsed
                 )
@@ -1176,6 +1590,14 @@ COMPORTAMENTO DA RESPOSTA:
                     parsed
                 )
 
+                # ------------------------------------------------
+                # VISUALIZAÇÕES AUTOMÁTICAS
+                #
+                # Somente após evaluate_link OK.
+                # ------------------------------------------------
+
+                await self.gerar_visualizacoes()
+
                 fspl = self.summarize_evaluate(
                     parsed
                 )
@@ -1185,7 +1607,8 @@ COMPORTAMENTO DA RESPOSTA:
                     try:
 
                         self.log(
-                            f"📥 FSPL: {float(fspl):.2f} dB"
+                            f"📥 FSPL: "
+                            f"{float(fspl):.2f} dB"
                         )
 
                     except Exception:
@@ -1201,6 +1624,7 @@ COMPORTAMENTO DA RESPOSTA:
                     )
 
         return parsed
+
 
     # ========================================================
     # REGISTER
@@ -1219,10 +1643,16 @@ COMPORTAMENTO DA RESPOSTA:
             },
         )
 
-        if isinstance(result, dict):
+        if isinstance(
+            result,
+            dict,
+        ):
 
             status = str(
-                result.get("status", "")
+                result.get(
+                    "status",
+                    "",
+                )
             ).lower()
 
             if status == "error":
@@ -1239,6 +1669,7 @@ COMPORTAMENTO DA RESPOSTA:
 
         return result
 
+
     # ========================================================
     # EVALUATE AUTOMÁTICO
     # ========================================================
@@ -1252,7 +1683,9 @@ COMPORTAMENTO DA RESPOSTA:
 
             return self.last_evaluate_result
 
-        if len(self.geocoded_points) < 2:
+        if len(
+            self.geocoded_points
+        ) < 2:
 
             return None
 
@@ -1291,8 +1724,7 @@ COMPORTAMENTO DA RESPOSTA:
         )
 
         # ----------------------------------------------------
-        # Parâmetros técnicos vão para o LOG MCP,
-        # não para o Status.
+        # Parâmetros técnicos vão para o LOG MCP
         # ----------------------------------------------------
 
         self.log_detail(
@@ -1312,6 +1744,7 @@ COMPORTAMENTO DA RESPOSTA:
             "evaluate_link",
             arguments,
         )
+
 
     # ========================================================
     # CONTEXTO TÉCNICO PARA O QWEN
@@ -1397,6 +1830,7 @@ COMPORTAMENTO DA RESPOSTA:
             }
         )
 
+
     # ========================================================
     # TURNO DO AGENTE
     # ========================================================
@@ -1409,7 +1843,8 @@ COMPORTAMENTO DA RESPOSTA:
 
             self.log_detail(
                 f"🤖 Iteração do agente: "
-                f"{iteration + 1}/{MAX_AGENT_ITERATIONS}"
+                f"{iteration + 1}/"
+                f"{MAX_AGENT_ITERATIONS}"
             )
 
             response = await self.ollama_chat()
@@ -1573,11 +2008,15 @@ COMPORTAMENTO DA RESPOSTA:
             "o limite de processamento da resposta."
         )
 
+
     # ========================================================
     # ASK
     # ========================================================
 
-    async def ask(self, text):
+    async def ask(
+        self,
+        text,
+    ):
 
         # ----------------------------------------------------
         # Reset da execução
@@ -1595,6 +2034,21 @@ COMPORTAMENTO DA RESPOSTA:
         self.current_stage = 0
 
         self.map = None
+
+        self.visualizations = []
+
+        # Limpa visualizações da UI imediatamente.
+
+        if self.visualization_callback:
+
+            try:
+
+                self.visualization_callback(
+                    []
+                )
+
+            except Exception:
+                pass
 
         # ----------------------------------------------------
         # Parâmetros
@@ -1630,8 +2084,12 @@ COMPORTAMENTO DA RESPOSTA:
         register_result = await self.register()
 
         # Se o registro falhar, não continuar.
+
         if (
-            isinstance(register_result, dict)
+            isinstance(
+                register_result,
+                dict,
+            )
             and str(
                 register_result.get(
                     "status",
@@ -1750,6 +2208,7 @@ COMPORTAMENTO DA RESPOSTA:
             )
 
         return resultado
+
 
     # ========================================================
     # CLOSE
