@@ -17,7 +17,6 @@ def register_visualization_tools(mcp, client: FastAPIClient):
             DSM
             COVER
         """
-
         return client.link_area(ds_string)
 
     # ========================================================
@@ -25,13 +24,10 @@ def register_visualization_tools(mcp, client: FastAPIClient):
     # ========================================================
 
     @mcp.tool()
-    def link_profile(
-        v_h: float = 0,
-    ) -> object:
+    def link_profile(v_h: float = 0) -> object:
         """
         Retorna o perfil do enlace.
         """
-
         return client.link_profile(v_h=v_h)
 
     # ========================================================
@@ -43,7 +39,6 @@ def register_visualization_tools(mcp, client: FastAPIClient):
         """
         Retorna a visualização LULC/Fresnel.
         """
-
         return client.lulc_fresnel()
 
     # ========================================================
@@ -55,7 +50,6 @@ def register_visualization_tools(mcp, client: FastAPIClient):
         """
         Prepara os dados de edificações para as visualizações.
         """
-
         return client.bldg_prepare()
 
     # ========================================================
@@ -67,7 +61,6 @@ def register_visualization_tools(mcp, client: FastAPIClient):
         """
         Retorna a visualização de edificações no plano Fresnel.
         """
-
         return client.bldg_fresnel()
 
     # ========================================================
@@ -81,5 +74,4 @@ def register_visualization_tools(mcp, client: FastAPIClient):
         """
         Retorna o perfil do enlace com informações de edificações.
         """
-
         return client.bldg_profile(filtered=filtered)

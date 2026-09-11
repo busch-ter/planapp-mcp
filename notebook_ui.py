@@ -1,6 +1,7 @@
 import asyncio
 import html
 import importlib
+import json
 
 import ipywidgets as widgets
 from IPython.display import display
@@ -13,7 +14,7 @@ PlanAppAgent = agent_jupyter.PlanAppAgent
 
 
 # ============================================================
-# INTERFACE PLANAPP
+# INTERFACE PLANAPP AI
 # ============================================================
 
 def iniciar_planapp():
@@ -35,14 +36,14 @@ def iniciar_planapp():
     # ========================================================
 
     entrada = widgets.Textarea(
+        value="",
         placeholder=(
-            "Exemplo: Analise um enlace entre "
-            "a Praça da República e o Largo do Paissandu "
-            "em São Paulo."
+            "Exemplo: Analise um enlace entre a Praça da República "
+            "e o Largo do Paissandu em São Paulo."
         ),
         layout=widgets.Layout(
             width="100%",
-            height="100px",
+            height="90px",
         ),
     )
 
@@ -51,17 +52,19 @@ def iniciar_planapp():
     # ========================================================
 
     botao_analisar = widgets.Button(
-        description="🚀 Analisar enlace",
+        description="📡 Analisar enlace",
         button_style="primary",
+        icon="search",
         layout=widgets.Layout(
             width="180px",
         ),
     )
 
     botao_nova = widgets.Button(
-        description="🆕 Nova análise",
+        description="🔄 Nova análise",
+        icon="refresh",
         layout=widgets.Layout(
-            width="140px",
+            width="150px",
         ),
     )
 
@@ -71,7 +74,7 @@ def iniciar_planapp():
             botao_nova,
         ],
         layout=widgets.Layout(
-            margin="8px 0 8px 0",
+            margin="8px 0 12px 0",
         ),
     )
 
@@ -85,26 +88,48 @@ def iniciar_planapp():
 
     historico_status = widgets.Output(
         layout=widgets.Layout(
-            width="100%",
-            max_height="260px",
-            overflow="auto",
             border="1px solid #ddd",
-            padding="6px",
+            padding="8px",
+            max_height="180px",
+            overflow="auto",
         )
     )
 
     # ========================================================
-    # LOG DETALHADO MCP
+    # LOG MCP
     # ========================================================
 
     log_execucao = widgets.Output(
         layout=widgets.Layout(
-            width="100%",
-            max_height="400px",
-            overflow="auto",
             border="1px solid #ddd",
-            padding="6px",
+            padding="8px",
+            max_height="350px",
+            overflow="auto",
         )
+    )
+
+    # ========================================================
+    # RESULTADO TÉCNICO
+    # ========================================================
+
+    resultado_tecnico_output = widgets.Output(
+        layout=widgets.Layout(
+            border="1px solid #ddd",
+            padding="10px",
+            max_height="500px",
+            overflow="auto",
+        )
+    )
+
+    # ========================================================
+    # VISUALIZAÇÕES
+    # ========================================================
+
+    visualizacoes_output = widgets.VBox(
+        [],
+        layout=widgets.Layout(
+            width="100%",
+        ),
     )
 
     # ========================================================
@@ -119,18 +144,15 @@ def iniciar_planapp():
     )
 
     # ========================================================
-    # RESPOSTA FINAL
+    # RESPOSTA DO AGENTE
     # ========================================================
 
     resposta = widgets.HTML(
-        value="",
-        layout=widgets.Layout(
-            width="100%",
-        ),
+        value=""
     )
 
     # ========================================================
-    # CALLBACK STATUS
+    # CALLBACK — STATUS
     # ========================================================
 
     def atualizar_status(mensagem):
@@ -145,7 +167,7 @@ def iniciar_planapp():
             print(str(mensagem))
 
     # ========================================================
-    # CALLBACK LOG DETALHADO
+    # CALLBACK — LOG MCP
     # ========================================================
 
     def atualizar_log(mensagem):
@@ -155,27 +177,104 @@ def iniciar_planapp():
             print(str(mensagem))
 
     # ========================================================
-    # CALLBACK MAPA
+    # CALLBACK — RESULTADO TÉCNICO
+    # ========================================================
+
+    def atualizar_resultado_tecnico(resultado):
+
+        with resultado_tecnico_output:
+
+            resultado_tecnico_output.clear_output(
+                wait=True
+            )
+
+            print(
+                "=================================================="
+            )
+
+            print(
+                "📊 RESULTADO TÉCNICO REAL DO PLANAPP"
+            )
+
+            print(
+                "=================================================="
+            )
+
+            if resultado is None:
+
+                print(
+                    "Nenhum resultado técnico foi retornado."
+                )
+
+                return
+
+            try:
+
+                print(
+                    json.dumps(
+                        resultado,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                )
+
+            except Exception:
+
+                print(
+                    str(resultado)
+                )
+
+    # ========================================================
+    # CALLBACK — MAPA
     # ========================================================
 
     def atualizar_mapa(mapa):
 
-        mapa_output.children = [
-            mapa
-        ]
+        mapa_output.children = []
+
+        if mapa is not None:
+
+            mapa_output.children = [
+                mapa
+            ]
 
     # ========================================================
-    # AGENTE
+    # CALLBACK — VISUALIZAÇÕES
+    # ========================================================
+
+    def atualizar_visualizacoes(visualizacoes):
+
+        visualizacoes_output.children = []
+
+        if not visualizacoes:
+            return
+
+        children = []
+
+        for item in visualizacoes:
+
+            if item is None:
+                continue
+
+            children.append(item)
+
+        visualizacoes_output.children = children
+
+    # ========================================================
+    # CRIA AGENTE
     # ========================================================
 
     agent = PlanAppAgent(
         progress_callback=atualizar_status,
         map_callback=atualizar_mapa,
         log_callback=atualizar_log,
+        result_callback=atualizar_resultado_tecnico,
+        visualization_callback=atualizar_visualizacoes,
     )
 
     # ========================================================
-    # EXECUÇÃO ASSÍNCRONA
+    # EXECUÇÃO
     # ========================================================
 
     async def executar_analise_async():
@@ -184,116 +283,91 @@ def iniciar_planapp():
 
         if not texto:
 
-            status.value = (
-                "<b>Status:</b> "
+            atualizar_status(
                 "⚠️ Digite uma solicitação."
             )
 
             return
 
-        # ----------------------------------------------------
-        # Limpa execução anterior
-        # ----------------------------------------------------
+        botao_analisar.disabled = True
 
         resposta.value = ""
 
         mapa_output.children = []
 
-        with historico_status:
+        visualizacoes_output.children = []
 
-            print("")
-            print("=" * 70)
-            print("🆕 NOVA ANÁLISE")
-            print("=" * 70)
-
-        with log_execucao:
-
-            print("")
-            print("=" * 70)
-            print("🔧 LOG MCP")
-            print("=" * 70)
-
-        botao_analisar.disabled = True
-        botao_nova.disabled = True
-
-        status.value = (
-            "<b>Status:</b> ⏳ Processando..."
+        resultado_tecnico_output.clear_output(
+            wait=True
         )
 
         try:
 
+            atualizar_status(
+                "🟡 Iniciando análise..."
+            )
+
             resultado = await agent.ask(
                 texto
             )
-
-            # ------------------------------------------------
-            # Resposta final
-            # ------------------------------------------------
 
             resposta.value = (
                 "<div style='"
                 "border:1px solid #ddd;"
                 "padding:12px;"
                 "margin-top:10px;"
-                "background:#fafafa;"
+                "border-radius:6px;"
                 "'>"
-                "<h3 style='margin-top:0;'>"
-                "💬 Resposta do PlanApp AI"
-                "</h3>"
-                "<div style='white-space:pre-wrap;'>"
+                "<b>💬 Resposta do PlanApp AI</b>"
+                "<div style='margin-top:10px;'>"
                 + html.escape(
                     str(resultado)
+                ).replace(
+                    "\n",
+                    "<br>"
                 )
                 + "</div>"
                 "</div>"
-            )
-
-            status.value = (
-                "<b>Status:</b> "
-                "✅ Análise concluída."
             )
 
         except Exception as exc:
 
-            resposta.value = (
-                "<div style='"
-                "border:1px solid #f00;"
-                "padding:12px;"
-                "margin-top:10px;"
-                "'>"
-                "<h3 style='margin-top:0;'>"
-                "❌ Erro"
-                "</h3>"
-                "<div style='white-space:pre-wrap;'>"
-                + html.escape(
-                    str(exc)
-                )
-                + "</div>"
-                "</div>"
+            atualizar_status(
+                f"❌ Erro na execução: {exc}"
             )
 
-            status.value = (
-                "<b>Status:</b> "
-                "❌ Erro durante a análise."
-            )
+            with log_execucao:
+
+                print("")
+                print(
+                    "=================================================="
+                )
+                print(
+                    "❌ EXCEÇÃO NA INTERFACE"
+                )
+                print(
+                    "=================================================="
+                )
+                print(
+                    repr(exc)
+                )
 
         finally:
 
             botao_analisar.disabled = False
-            botao_nova.disabled = False
 
     # ========================================================
-    # CALLBACK BOTÃO ANALISAR
+    # BOTÃO ANALISAR
     # ========================================================
 
-    def executar_analise(_):
+    def ao_clicar_analisar(_):
 
-        asyncio.create_task(
+        asyncio.ensure_future(
             executar_analise_async()
         )
 
     botao_analisar.on_click(
-        executar_analise
+        ao_clicar_analisar
     )
 
     # ========================================================
@@ -302,42 +376,140 @@ def iniciar_planapp():
 
     def nova_analise(_):
 
+        nonlocal agent
+
         entrada.value = ""
 
         resposta.value = ""
 
         status.value = (
-            "<b>Status:</b> "
-            "Aguardando nova solicitação."
+            "<b>Status:</b> Aguardando solicitação."
+        )
+
+        historico_status.clear_output(
+            wait=True
+        )
+
+        log_execucao.clear_output(
+            wait=True
+        )
+
+        resultado_tecnico_output.clear_output(
+            wait=True
         )
 
         mapa_output.children = []
 
-        historico_status.clear_output()
+        visualizacoes_output.children = []
 
-        log_execucao.clear_output()
-
-        # Novo agente para garantir estado limpo
-        nonlocal agent
+        # ----------------------------------------------------
+        # Fecha o agente anterior
+        # ----------------------------------------------------
 
         try:
 
-            agent = PlanAppAgent(
-                progress_callback=atualizar_status,
-                map_callback=atualizar_mapa,
-                log_callback=atualizar_log,
+            asyncio.ensure_future(
+                agent.close()
             )
 
-        except Exception as exc:
+        except Exception:
 
-            status.value = (
-                "<b>Status:</b> "
-                f"❌ Erro ao criar agente: "
-                f"{html.escape(str(exc))}"
-            )
+            pass
+
+        # ----------------------------------------------------
+        # Cria nova instância
+        # ----------------------------------------------------
+
+        agent = PlanAppAgent(
+            progress_callback=atualizar_status,
+            map_callback=atualizar_mapa,
+            log_callback=atualizar_log,
+            result_callback=atualizar_resultado_tecnico,
+            visualization_callback=atualizar_visualizacoes,
+        )
+
+        atualizar_status(
+            "🔄 Nova análise pronta."
+        )
 
     botao_nova.on_click(
         nova_analise
+    )
+
+    # ========================================================
+    # PAINEL STATUS
+    # ========================================================
+
+    painel_status = widgets.VBox(
+        [
+            widgets.HTML(
+                value="<h4>📋 Status</h4>"
+            ),
+            status,
+            historico_status,
+        ]
+    )
+
+    # ========================================================
+    # PAINEL MCP
+    # ========================================================
+
+    painel_mcp = widgets.VBox(
+        [
+            widgets.HTML(
+                value="<h4>🔧 MCP / Log de execução</h4>"
+            ),
+            log_execucao,
+        ]
+    )
+
+    # ========================================================
+    # PAINEL RESULTADO TÉCNICO
+    # ========================================================
+
+    painel_resultado = widgets.VBox(
+        [
+            widgets.HTML(
+                value="<h4>📊 Resultado técnico</h4>"
+            ),
+            resultado_tecnico_output,
+        ]
+    )
+
+    # ========================================================
+    # PAINEL MAPA
+    # ========================================================
+
+    painel_mapa = widgets.VBox(
+        [
+            widgets.HTML(
+                value="<h4>🗺️ Mapa do enlace</h4>"
+            ),
+            mapa_output,
+        ]
+    )
+
+    # ========================================================
+    # PAINEL VISUALIZAÇÕES
+    # ========================================================
+
+    painel_visualizacoes = widgets.VBox(
+        [
+            widgets.HTML(
+                value="<h4>📈 Visualizações técnicas</h4>"
+            ),
+            visualizacoes_output,
+        ]
+    )
+
+    # ========================================================
+    # PAINEL RESPOSTA
+    # ========================================================
+
+    painel_resposta = widgets.VBox(
+        [
+            resposta,
+        ]
     )
 
     # ========================================================
@@ -350,101 +522,25 @@ def iniciar_planapp():
             margin-top:15px;
             padding:10px;
             border:1px solid #ddd;
-            background:#fafafa;
+            border-radius:6px;
         ">
-            <b>Exemplos:</b>
-
-            <ul>
-                <li>
-                    Analise um enlace entre a Praça da República
-                    e o Largo do Paissandu em São Paulo.
-                </li>
-
-                <li>
-                    Analise um enlace entre Curitiba e São José
-                    dos Pinhais usando 2,4 GHz.
-                </li>
-
-                <li>
-                    Analise o enlace entre dois pontos usando
-                    antenas de 10 metros e frequência de 900 MHz.
-                </li>
-
-                <li>
-                    Analise um enlace com antena TX de 12 metros,
-                    antena RX de 8 metros e frequência de 5 GHz.
-                </li>
-            </ul>
+        <b>Exemplos:</b>
+        <ul>
+            <li>
+                Analise um enlace entre a Praça da República
+                e o Largo do Paissandu em São Paulo.
+            </li>
+            <li>
+                Analise um enlace entre Curitiba e São José dos Pinhais
+                usando 450 MHz.
+            </li>
+            <li>
+                Analise o enlace com duas antenas de 10 metros
+                em 2.4 GHz, sobre o telhado.
+            </li>
+        </ul>
         </div>
         """
-    )
-
-    # ========================================================
-    # PAINEL DE STATUS
-    # ========================================================
-
-    painel_status = widgets.VBox(
-        [
-            widgets.HTML(
-                "<h3 style='margin-bottom:5px;'>"
-                "📋 Andamento"
-                "</h3>"
-            ),
-            status,
-            historico_status,
-        ],
-        layout=widgets.Layout(
-            width="100%",
-        ),
-    )
-
-    # ========================================================
-    # PAINEL MCP
-    # ========================================================
-
-    painel_mcp = widgets.VBox(
-        [
-            widgets.HTML(
-                "<h3 style='margin-bottom:5px;'>"
-                "🔧 Execução MCP"
-                "</h3>"
-            ),
-            log_execucao,
-        ],
-        layout=widgets.Layout(
-            width="100%",
-        ),
-    )
-
-    # ========================================================
-    # PAINEL MAPA
-    # ========================================================
-
-    painel_mapa = widgets.VBox(
-        [
-            widgets.HTML(
-                "<h3 style='margin-bottom:5px;'>"
-                "🗺️ Enlace"
-                "</h3>"
-            ),
-            mapa_output,
-        ],
-        layout=widgets.Layout(
-            width="100%",
-        ),
-    )
-
-    # ========================================================
-    # PAINEL RESPOSTA
-    # ========================================================
-
-    painel_resposta = widgets.VBox(
-        [
-            resposta,
-        ],
-        layout=widgets.Layout(
-            width="100%",
-        ),
     )
 
     # ========================================================
@@ -455,36 +551,25 @@ def iniciar_planapp():
         [
             titulo,
 
-            widgets.HTML(
-                "<b>Solicitação:</b>"
-            ),
-
             entrada,
 
             botoes,
 
             painel_status,
 
-            widgets.HTML(
-                "<hr style='margin:15px 0;'>"
-            ),
-
             painel_mcp,
 
-            widgets.HTML(
-                "<hr style='margin:15px 0;'>"
-            ),
+            painel_resultado,
 
             painel_mapa,
 
-            widgets.HTML(
-                "<hr style='margin:15px 0;'>"
-            ),
+            painel_visualizacoes,
 
             painel_resposta,
 
             exemplos,
         ],
+
         layout=widgets.Layout(
             width="100%",
         ),
@@ -495,9 +580,5 @@ def iniciar_planapp():
     # ========================================================
 
     display(interface)
-
-    # ========================================================
-    # RETORNO
-    # ========================================================
 
     return interface, agent

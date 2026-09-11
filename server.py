@@ -4,18 +4,21 @@ from client.fastapi_client import FastAPIClient
 from tools.session import register_session_tools
 from tools.link import register_link_tools
 from tools.geocode import register_geocode_tools
+from tools.visualization import register_visualization_tools
+
 
 # ============================================================
-# Configuração
+# CONFIGURAÇÃO
 # ============================================================
 
 FASTAPI_URL = "http://features-link-v2:8080"
+
 MCP_HOST = "0.0.0.0"
 MCP_PORT = 8010
 
 
 # ============================================================
-# MCP Server
+# SERVIDOR MCP
 # ============================================================
 
 mcp = MCPServer(
@@ -25,7 +28,7 @@ mcp = MCPServer(
 
 
 # ============================================================
-# Cliente FastAPI
+# CLIENTE FASTAPI
 # ============================================================
 
 client = FastAPIClient(
@@ -35,25 +38,36 @@ client = FastAPIClient(
 
 
 # ============================================================
-# Registro das ferramentas
+# REGISTRO DAS FERRAMENTAS MCP
 # ============================================================
 
+# Sessão / autenticação
 register_session_tools(
     mcp,
     client,
 )
 
+# Avaliação do enlace
 register_link_tools(
     mcp,
     client,
 )
 
+# Geocodificação
 register_geocode_tools(
-    mcp
+    mcp,
+    client,
 )
 
+# Visualizações do enlace
+register_visualization_tools(
+    mcp,
+    client,
+)
+
+
 # ============================================================
-# Entry point
+# INICIALIZAÇÃO
 # ============================================================
 
 if __name__ == "__main__":
@@ -62,4 +76,3 @@ if __name__ == "__main__":
         host=MCP_HOST,
         port=MCP_PORT,
     )
-

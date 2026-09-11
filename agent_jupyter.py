@@ -39,6 +39,8 @@ DEFAULT_TX_HA = 7
 DEFAULT_RX_HA = 7
 DEFAULT_ON_ROOFTOP = False
 
+MAX_AGENT_ITERATIONS = 12
+
 
 # ============================================================
 # AGENTE
@@ -51,10 +53,38 @@ class PlanAppAgent:
         progress_callback=None,
         map_callback=None,
         log_callback=None,
+        result_callback=None,
+        visualization_callback=None,
     ):
+        """
+        Agente do PlanApp.
+
+        Callbacks:
+
+        progress_callback:
+            Mensagens amigáveis de andamento/status.
+
+        map_callback:
+            Recebe o mapa gerado após a geocodificação.
+
+        log_callback:
+            Logs técnicos do MCP, incluindo argumentos e
+            resultados brutos das ferramentas.
+
+        result_callback:
+            Recebe o resultado técnico real retornado pelo
+            evaluate_link.
+
+        visualization_callback:
+            Reservado para as visualizações automáticas do
+            enlace.
+        """
+
         self.progress_callback = progress_callback
         self.map_callback = map_callback
         self.log_callback = log_callback
+        self.result_callback = result_callback
+        self.visualization_callback = visualization_callback
 
         self.exit_stack = AsyncExitStack()
 
@@ -67,6 +97,8 @@ class PlanAppAgent:
 
         self.evaluate_executed = False
         self.last_evaluate_result = None
+
+        self.evaluate_error = None
 
         self.tool_count = 0
         self.current_stage = 0
@@ -94,27 +126,54 @@ class PlanAppAgent:
         self.requested_rx_ha = None
 
     # ========================================================
-    # LOGS
+    # STATUS
     # ========================================================
 
     def log(self, message):
         """
-        Mensagens de andamento/status.
+        Envia somente mensagens de andamento/status.
+
+        IMPORTANTE:
+        Argumentos e resultados brutos do MCP NÃO devem passar
+        por este método.
         """
+
         if self.progress_callback:
             try:
                 self.progress_callback(message)
             except Exception:
                 pass
 
+    # ========================================================
+    # LOG TÉCNICO
+    # ========================================================
+
     def log_detail(self, message):
         """
-        Logs detalhados, principalmente resultados brutos
-        das ferramentas MCP.
+        Envia logs técnicos para o painel de log MCP.
         """
+
         if self.log_callback:
             try:
                 self.log_callback(message)
+            except Exception:
+                pass
+
+    # ========================================================
+    # RESULTADO TÉCNICO
+    # ========================================================
+
+    def publish_technical_result(self, result):
+        """
+        Publica o resultado técnico real do evaluate_link.
+
+        Esse resultado é separado da resposta textual produzida
+        pelo modelo.
+        """
+
+        if self.result_callback:
+            try:
+                self.result_callback(result)
             except Exception:
                 pass
 
@@ -142,7 +201,7 @@ REGRAS FUNDAMENTAIS:
    a ferramenta geocode_place.
 
 5. Depois que os dois pontos forem geocodificados, a avaliação técnica
-   do enlace deve ser executada automaticamente pelo sistema.
+   do enlace deve ser executada automaticamente pela aplicação.
 
 6. Nunca peça ao usuário para executar manualmente a avaliação.
 
@@ -364,7 +423,8 @@ COMPORTAMENTO DA RESPOSTA:
 
 78. Nunca invente erro de uma ferramenta.
 
-79. Se uma ferramenta retornar erro, informe o erro real.
+79. Se uma ferramenta retornar erro, informe o erro real retornado
+    pela ferramenta. Não especule sobre possíveis causas.
 
 80. Se uma ferramenta retornar sucesso, utilize o resultado real.
 
@@ -377,6 +437,27 @@ COMPORTAMENTO DA RESPOSTA:
 
 84. A resposta final deve priorizar precisão técnica sobre interpretações
     genéricas.
+
+85. O resultado técnico retornado pelo PlanApp é diferente da resposta
+    textual do assistente.
+
+86. Nunca substitua o resultado técnico real do PlanApp por uma estimativa
+    feita pelo modelo.
+
+87. Se evaluate_link retornar erro, não invente distância, FSPL ou outros
+    resultados técnicos.
+
+88. Se evaluate_link retornar erro, apresente o erro real e deixe claro
+    que a análise técnica não foi concluída.
+
+89. Não diga que um valor foi calculado pelo PlanApp se ele não estiver
+    presente no resultado real.
+
+90. Não estime a distância entre as coordenadas quando evaluate_link
+    não tiver fornecido uma distância.
+
+91. A aplicação pode executar evaluate_link automaticamente mesmo que
+    o modelo não faça uma chamada direta dessa ferramenta.
 """
 
     # ========================================================
@@ -446,6 +527,7 @@ COMPORTAMENTO DA RESPOSTA:
         same_height_match = None
 
         for pattern in same_height_patterns:
+
             same_height_match = re.search(
                 pattern,
                 text,
@@ -490,6 +572,7 @@ COMPORTAMENTO DA RESPOSTA:
             )
 
             if tx_match:
+
                 height = float(
                     tx_match.group(1).replace(",", ".")
                 )
@@ -498,6 +581,7 @@ COMPORTAMENTO DA RESPOSTA:
                 self.requested_tx_ha = height
 
             if rx_match:
+
                 height = float(
                     rx_match.group(1).replace(",", ".")
                 )
@@ -560,6 +644,16 @@ COMPORTAMENTO DA RESPOSTA:
             f"{len(self.mcp_tools)} ferramentas disponíveis."
         )
 
+        self.log_detail(
+            "Ferramentas MCP disponíveis:"
+        )
+
+        for tool in self.mcp_tools:
+
+            self.log_detail(
+                f"  - {tool.name}"
+            )
+
     # ========================================================
     # FERRAMENTAS PARA O OLLAMA
     # ========================================================
@@ -570,6 +664,7 @@ COMPORTAMENTO DA RESPOSTA:
 
         for tool in self.mcp_tools:
 
+            # Estas ferramentas são controladas pela aplicação.
             if tool.name in {
                 "register",
                 "evaluate_link",
@@ -645,6 +740,10 @@ COMPORTAMENTO DA RESPOSTA:
 
     def parse_mcp_result(self, result):
 
+        # ----------------------------------------------------
+        # Conteúdo estruturado
+        # ----------------------------------------------------
+
         structured = getattr(
             result,
             "structuredContent",
@@ -652,6 +751,7 @@ COMPORTAMENTO DA RESPOSTA:
         )
 
         if structured is None:
+
             structured = getattr(
                 result,
                 "structured_content",
@@ -661,6 +761,10 @@ COMPORTAMENTO DA RESPOSTA:
         if structured is not None:
             return structured
 
+        # ----------------------------------------------------
+        # Conteúdo textual
+        # ----------------------------------------------------
+
         content = getattr(
             result,
             "content",
@@ -668,6 +772,8 @@ COMPORTAMENTO DA RESPOSTA:
         )
 
         if content:
+
+            parsed_items = []
 
             for item in content:
 
@@ -677,15 +783,81 @@ COMPORTAMENTO DA RESPOSTA:
                     None,
                 )
 
-                if text:
+                if text is None:
+                    continue
 
-                    try:
-                        return json.loads(text)
+                try:
 
-                    except Exception:
-                        return text
+                    parsed_items.append(
+                        json.loads(text)
+                    )
+
+                except Exception:
+
+                    parsed_items.append(
+                        text
+                    )
+
+            if len(parsed_items) == 1:
+                return parsed_items[0]
+
+            if parsed_items:
+                return parsed_items
+
+        # ----------------------------------------------------
+        # Fallback
+        # ----------------------------------------------------
 
         return result
+
+    # ========================================================
+    # DETECÇÃO DE ERRO MCP
+    # ========================================================
+
+    def is_mcp_error(self, result, parsed):
+
+        # ----------------------------------------------------
+        # Campo padrão isError do MCP
+        # ----------------------------------------------------
+
+        is_error = getattr(
+            result,
+            "isError",
+            None,
+        )
+
+        if is_error is None:
+
+            is_error = getattr(
+                result,
+                "is_error",
+                False,
+            )
+
+        if is_error:
+            return True
+
+        # ----------------------------------------------------
+        # Erro dentro do payload
+        # ----------------------------------------------------
+
+        if isinstance(parsed, dict):
+
+            status = str(
+                parsed.get("status", "")
+            ).lower()
+
+            if status in {
+                "error",
+                "failed",
+                "failure",
+            }:
+                return True
+
+            if parsed.get("error"):
+                return True
+
+        return False
 
     # ========================================================
     # RESUMO GEOCODE
@@ -757,6 +929,10 @@ COMPORTAMENTO DA RESPOSTA:
         point = self.summarize_geocode(parsed)
 
         if point is None:
+            self.log(
+                "⚠️ Não foi possível extrair coordenadas "
+                "do resultado da geocodificação."
+            )
             return
 
         self.geocoded_points.append(point)
@@ -786,7 +962,10 @@ COMPORTAMENTO DA RESPOSTA:
             if self.map_callback:
 
                 try:
-                    self.map_callback(self.map)
+
+                    self.map_callback(
+                        self.map
+                    )
 
                 except Exception as exc:
 
@@ -800,6 +979,10 @@ COMPORTAMENTO DA RESPOSTA:
 
             self.log(
                 f"❌ Erro ao preparar mapa: {exc}"
+            )
+
+            self.log_detail(
+                f"Erro detalhado ao preparar mapa: {exc}"
             )
 
     # ========================================================
@@ -818,8 +1001,7 @@ COMPORTAMENTO DA RESPOSTA:
         ):
 
             self.log(
-                "⚠️ evaluate_link já foi executado. "
-                "Ignorando chamada duplicada."
+                "⚠️ evaluate_link já foi executado."
             )
 
             return self.last_evaluate_result
@@ -827,16 +1009,23 @@ COMPORTAMENTO DA RESPOSTA:
         self.tool_count += 1
 
         # ----------------------------------------------------
-        # STATUS
+        # LOG TÉCNICO
+        # ----------------------------------------------------
+        # IMPORTANTE:
+        # Argumentos NÃO vão para progress_callback/status.
         # ----------------------------------------------------
 
-        self.log(
-            f"🔧 MCP: {tool_name}"
+        self.log_detail("")
+        self.log_detail(
+            f"🔧 MCP TOOL: {tool_name}"
         )
 
-        self.log(
-            "   Argumentos: "
-            + json.dumps(
+        self.log_detail(
+            "Argumentos:"
+        )
+
+        self.log_detail(
+            json.dumps(
                 arguments or {},
                 ensure_ascii=False,
                 indent=2,
@@ -848,20 +1037,70 @@ COMPORTAMENTO DA RESPOSTA:
         # EXECUTA MCP
         # ----------------------------------------------------
 
-        result = await self.mcp_session.call_tool(
-            tool_name,
-            arguments or {},
-        )
+        try:
 
-        parsed = self.parse_mcp_result(result)
+            result = await self.mcp_session.call_tool(
+                tool_name,
+                arguments or {},
+            )
+
+        except Exception as exc:
+
+            error_result = {
+                "status": "error",
+                "kind": "mcp_exception",
+                "tool": tool_name,
+                "error": str(exc),
+            }
+
+            self.log_detail(
+                "❌ Exceção durante chamada MCP:"
+            )
+
+            self.log_detail(
+                json.dumps(
+                    error_result,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+            )
+
+            if tool_name == "evaluate_link":
+
+                self.evaluate_executed = True
+                self.evaluate_error = error_result
+                self.last_evaluate_result = error_result
+
+                self.publish_technical_result(
+                    error_result
+                )
+
+            return error_result
 
         # ----------------------------------------------------
-        # RESULTADO BRUTO VAI PARA LOG DETALHADO
+        # PARSE
+        # ----------------------------------------------------
+
+        parsed = self.parse_mcp_result(
+            result
+        )
+
+        mcp_error = self.is_mcp_error(
+            result,
+            parsed,
+        )
+
+        # ----------------------------------------------------
+        # RESULTADO BRUTO VAI SOMENTE PARA O LOG
         # ----------------------------------------------------
 
         self.log_detail(
-            "   Resultado: "
-            + json.dumps(
+            "Resultado:"
+        )
+
+        self.log_detail(
+            json.dumps(
                 parsed,
                 ensure_ascii=False,
                 indent=2,
@@ -870,16 +1109,36 @@ COMPORTAMENTO DA RESPOSTA:
         )
 
         # ----------------------------------------------------
+        # ERRO
+        # ----------------------------------------------------
+
+        if mcp_error:
+
+            self.log_detail(
+                "❌ MCP retornou erro."
+            )
+
+        # ----------------------------------------------------
         # GEOCODE
         # ----------------------------------------------------
 
         if tool_name == "geocode_place":
 
-            self.register_geocoded_point(parsed)
+            if not mcp_error:
 
-            if len(self.geocoded_points) == 2:
+                self.register_geocoded_point(
+                    parsed
+                )
 
-                await self.mostrar_mapa_apos_geocodificacao()
+                if len(self.geocoded_points) == 2:
+
+                    await self.mostrar_mapa_apos_geocodificacao()
+
+            else:
+
+                self.log(
+                    "❌ Falha na geocodificação."
+                )
 
         # ----------------------------------------------------
         # EVALUATE
@@ -891,13 +1150,55 @@ COMPORTAMENTO DA RESPOSTA:
 
             self.last_evaluate_result = parsed
 
-            fspl = self.summarize_evaluate(parsed)
+            if mcp_error:
 
-            if fspl is not None:
+                self.evaluate_error = parsed
 
                 self.log(
-                    f"📥 FSPL: {float(fspl):.2f} dB"
+                    "❌ A avaliação técnica retornou erro."
                 )
+
+                # O resultado real do erro também é publicado
+                # para a interface.
+                self.publish_technical_result(
+                    parsed
+                )
+
+            else:
+
+                self.evaluate_error = None
+
+                # ------------------------------------------------
+                # ESTE É O RESULTADO TÉCNICO REAL DO PLANAPP
+                # ------------------------------------------------
+
+                self.publish_technical_result(
+                    parsed
+                )
+
+                fspl = self.summarize_evaluate(
+                    parsed
+                )
+
+                if fspl is not None:
+
+                    try:
+
+                        self.log(
+                            f"📥 FSPL: {float(fspl):.2f} dB"
+                        )
+
+                    except Exception:
+
+                        self.log(
+                            f"📥 FSPL: {fspl}"
+                        )
+
+                else:
+
+                    self.log(
+                        "🟢 Avaliação técnica concluída."
+                    )
 
         return parsed
 
@@ -911,16 +1212,32 @@ COMPORTAMENTO DA RESPOSTA:
             "👤 Registrando usuário no PlanApp..."
         )
 
-        await self.execute_mcp_tool(
+        result = await self.execute_mcp_tool(
             "register",
             {
                 "user_id": USER_ID,
             },
         )
 
+        if isinstance(result, dict):
+
+            status = str(
+                result.get("status", "")
+            ).lower()
+
+            if status == "error":
+
+                self.log(
+                    "❌ Falha no registro do usuário."
+                )
+
+                return result
+
         self.log(
             "🟢 Usuário registrado."
         )
+
+        return result
 
     # ========================================================
     # EVALUATE AUTOMÁTICO
@@ -932,12 +1249,15 @@ COMPORTAMENTO DA RESPOSTA:
     ):
 
         if self.evaluate_executed:
+
             return self.last_evaluate_result
 
         if len(self.geocoded_points) < 2:
+
             return None
 
         if parameters is None:
+
             parameters = self.link_parameters
 
         tx = self.geocoded_points[0]
@@ -970,12 +1290,21 @@ COMPORTAMENTO DA RESPOSTA:
             "📡 Executando avaliação técnica do enlace..."
         )
 
-        self.log(
-            "📤 Parâmetros enviados ao PlanApp: "
-            + json.dumps(
+        # ----------------------------------------------------
+        # Parâmetros técnicos vão para o LOG MCP,
+        # não para o Status.
+        # ----------------------------------------------------
+
+        self.log_detail(
+            "Parâmetros enviados ao PlanApp:"
+        )
+
+        self.log_detail(
+            json.dumps(
                 arguments,
                 ensure_ascii=False,
                 indent=2,
+                default=str,
             )
         )
 
@@ -1047,6 +1376,8 @@ COMPORTAMENTO DA RESPOSTA:
                 "delta_diffra, VV ou d_norm sem definição explícita.",
                 "Não conclua viabilidade sem critérios suficientes.",
                 "Diferencie parâmetros solicitados dos parâmetros efetivos.",
+                "Se o resultado contiver erro, informe o erro real.",
+                "Não estime valores técnicos ausentes.",
             ],
         }
 
@@ -1072,7 +1403,14 @@ COMPORTAMENTO DA RESPOSTA:
 
     async def agent_turn(self):
 
-        for _ in range(12):
+        for iteration in range(
+            MAX_AGENT_ITERATIONS
+        ):
+
+            self.log_detail(
+                f"🤖 Iteração do agente: "
+                f"{iteration + 1}/{MAX_AGENT_ITERATIONS}"
+            )
 
             response = await self.ollama_chat()
 
@@ -1097,7 +1435,10 @@ COMPORTAMENTO DA RESPOSTA:
             }
 
             if tool_calls:
-                assistant_message["tool_calls"] = tool_calls
+
+                assistant_message[
+                    "tool_calls"
+                ] = tool_calls
 
             self.messages.append(
                 assistant_message
@@ -1108,6 +1449,11 @@ COMPORTAMENTO DA RESPOSTA:
             # ------------------------------------------------
 
             if not tool_calls:
+
+                # --------------------------------------------
+                # Se já temos os dois pontos e a avaliação
+                # ainda não ocorreu, a aplicação executa.
+                # --------------------------------------------
 
                 if (
                     len(self.geocoded_points) >= 2
@@ -1126,6 +1472,15 @@ COMPORTAMENTO DA RESPOSTA:
 
                     continue
 
+                # --------------------------------------------
+                # Se evaluate_link terminou com erro,
+                # não tentar "consertar" ou inventar.
+                # --------------------------------------------
+
+                if self.evaluate_error is not None:
+
+                    return content
+
                 if self.evaluate_executed:
 
                     return content
@@ -1140,7 +1495,7 @@ COMPORTAMENTO DA RESPOSTA:
 
                 function = tool_call.get(
                     "function",
-                    {}
+                    {},
                 )
 
                 tool_name = function.get(
@@ -1149,15 +1504,22 @@ COMPORTAMENTO DA RESPOSTA:
 
                 arguments = function.get(
                     "arguments",
-                    {}
+                    {},
                 )
 
-                if isinstance(arguments, str):
+                if isinstance(
+                    arguments,
+                    str,
+                ):
 
                     try:
-                        arguments = json.loads(arguments)
+
+                        arguments = json.loads(
+                            arguments
+                        )
 
                     except Exception:
+
                         arguments = {}
 
                 result = await self.execute_mcp_tool(
@@ -1197,10 +1559,13 @@ COMPORTAMENTO DA RESPOSTA:
 
                 continue
 
+            # ------------------------------------------------
+            # Após evaluate_link, uma nova chamada ao modelo
+            # produz a resposta final baseada no resultado real.
+            # ------------------------------------------------
+
             if self.evaluate_executed:
 
-                # Faz uma nova chamada ao Qwen para produzir
-                # a resposta final usando o resultado técnico.
                 continue
 
         return (
@@ -1224,6 +1589,7 @@ COMPORTAMENTO DA RESPOSTA:
 
         self.evaluate_executed = False
         self.last_evaluate_result = None
+        self.evaluate_error = None
 
         self.tool_count = 0
         self.current_stage = 0
@@ -1242,12 +1608,16 @@ COMPORTAMENTO DA RESPOSTA:
             "🟡 Etapa 1 — Processando solicitação"
         )
 
-        self.log(
-            "⚙️ Parâmetros detectados: "
-            + json.dumps(
+        self.log_detail(
+            "Parâmetros detectados:"
+        )
+
+        self.log_detail(
+            json.dumps(
                 parameters,
                 ensure_ascii=False,
                 indent=2,
+                default=str,
             )
         )
 
@@ -1257,7 +1627,24 @@ COMPORTAMENTO DA RESPOSTA:
 
         await self.connect()
 
-        await self.register()
+        register_result = await self.register()
+
+        # Se o registro falhar, não continuar.
+        if (
+            isinstance(register_result, dict)
+            and str(
+                register_result.get(
+                    "status",
+                    "",
+                )
+            ).lower()
+            == "error"
+        ):
+
+            return (
+                "Não foi possível registrar o usuário "
+                "no PlanApp."
+            )
 
         # ----------------------------------------------------
         # Mensagens iniciais
@@ -1281,7 +1668,7 @@ COMPORTAMENTO DA RESPOSTA:
         resultado = await self.agent_turn()
 
         # ----------------------------------------------------
-        # Garantias finais
+        # Garantia final da avaliação
         # ----------------------------------------------------
 
         if (
@@ -1299,8 +1686,11 @@ COMPORTAMENTO DA RESPOSTA:
                 technical_result
             )
 
-            # Última resposta do modelo
             resultado = await self.agent_turn()
+
+        # ----------------------------------------------------
+        # Garantia final do mapa
+        # ----------------------------------------------------
 
         if (
             len(self.geocoded_points) >= 2
@@ -1315,15 +1705,49 @@ COMPORTAMENTO DA RESPOSTA:
                 "🗺️ Mapa disponível."
             )
 
-        self.current_stage = 3
+        # ----------------------------------------------------
+        # Resultado técnico
+        # ----------------------------------------------------
 
-        self.log(
-            "🔵 Etapa 3 — Interpretando resultados"
-        )
+        if self.evaluate_error is not None:
 
-        self.log(
-            "🟢 Análise concluída."
-        )
+            self.current_stage = 3
+
+            self.log(
+                "🔴 Etapa 3 — Avaliação técnica não concluída"
+            )
+
+            self.log(
+                "❌ A análise técnica retornou erro."
+            )
+
+        elif self.evaluate_executed:
+
+            self.current_stage = 3
+
+            self.log(
+                "🔵 Etapa 3 — Interpretando resultados"
+            )
+
+            self.log(
+                "🟢 Resultado técnico recebido do PlanApp."
+            )
+
+            self.log(
+                "🟢 Análise concluída."
+            )
+
+        else:
+
+            self.current_stage = 3
+
+            self.log(
+                "🔵 Etapa 3 — Interpretando resultados"
+            )
+
+            self.log(
+                "🟡 Análise concluída sem avaliação técnica."
+            )
 
         return resultado
 
