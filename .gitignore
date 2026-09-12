@@ -1,0 +1,31 @@
+# Python virtual environments
+.venv/
+.venvcd/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local virtualenv artifacts
+bin/
+lib/
+lib64/
+include/
+pyvenv.cfg
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+lib64
