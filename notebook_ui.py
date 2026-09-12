@@ -7,11 +7,11 @@ import traceback
 import ipywidgets as widgets
 from IPython.display import display
 
-import agent_ollama
+import agent_openai
 
-agent_ollama = importlib.reload(agent_ollama)
+agent_openai = importlib.reload(agent_openai)
 
-PlanAppAgent = agent_ollama.PlanAppAgent
+PlanAppAgent = agent_openai.PlanAppAgent
 
 
 # ============================================================
