@@ -7,11 +7,11 @@ import traceback
 import ipywidgets as widgets
 from IPython.display import display
 
-import agent_jupyter
+import agent_ollama
 
-agent_jupyter = importlib.reload(agent_jupyter)
+agent_ollama = importlib.reload(agent_ollama)
 
-PlanAppAgent = agent_jupyter.PlanAppAgent
+PlanAppAgent = agent_ollama.PlanAppAgent
 
 
 # ============================================================
