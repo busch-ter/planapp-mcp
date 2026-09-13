@@ -1,3 +1,4 @@
+# ============================================================================
 # PLANAPP AI — JUPYTER / OPENAI
 #
 # Arquitetura:
@@ -8,20 +9,38 @@
 #   OpenAI Responses API / GPT-5.6 Luna
 #      |
 #      v
-#   PlanApp MCP
+#   geocode_place
 #      |
 #      v
-#   PlanApp FastAPI
+#   APLICAÇÃO
+#      |
+#      +--> evaluate_link
+#      |
+#      +--> mapa
+#      |
+#      +--> visualizações
+#      |
+#      v
+#   OpenAI — resposta final
 #
-# Este agente mantém a mesma lógica funcional do agent_ollama.py.
 #
-# IMPORTANTE:
-# - O LLM NÃO executa evaluate_link diretamente.
-# - O LLM NÃO escolhe quais visualizações devem ser geradas.
-# - A aplicação controla evaluate_link.
-# - Depois de um evaluate_link bem-sucedido, a aplicação gera
-#   deterministicamente todas as visualizações disponíveis.
+# REGRAS ARQUITETURAIS
 #
+# O OpenAI é responsável por:
+#   - interpretar a solicitação;
+#   - identificar os locais;
+#   - solicitar geocodificação.
+#
+# A aplicação é responsável por:
+#   - evaluate_link;
+#   - mapa;
+#   - todas as visualizações.
+#
+# O LLM NÃO escolhe visualizações.
+# O LLM NÃO executa evaluate_link.
+#
+# ============================================================================
+
 
 import asyncio
 import base64
@@ -47,26 +66,20 @@ from map_utils import mostrar_mapa_enlace
 
 OPENAI_MODEL = "gpt-5.6-luna"
 
-# Para a POC, medium oferece uma boa relação entre capacidade e custo.
 OPENAI_REASONING_EFFORT = "medium"
 
 MCP_URL = "http://172.17.0.1:8010/mcp"
 
 USER_ID = "jupyter-user"
 
-DEBUG = False
+DEBUG = True
 
-MAX_AGENT_ITERATIONS = 12
+MAX_AGENT_ITERATIONS = 8
 
 
 # ============================================================================
 # TOOLS CONTROLADAS PELA APLICAÇÃO
 # ============================================================================
-#
-# Estas ferramentas NÃO são expostas ao LLM.
-#
-# O agente Python decide quando executá-las.
-#
 
 APPLICATION_CONTROLLED_TOOLS = {
     "register",
@@ -84,7 +97,12 @@ APPLICATION_CONTROLLED_TOOLS = {
 # PLANAPP AGENT
 # ============================================================================
 
+
 class PlanAppAgent:
+
+    # ========================================================================
+    # INIT
+    # ========================================================================
 
     def __init__(
         self,
@@ -94,9 +112,10 @@ class PlanAppAgent:
         result_callback=None,
         visualization_callback=None,
     ):
-        # ------------------------------------------------------------------
+
+        # --------------------------------------------------------------------
         # Callbacks
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         self.progress_callback = progress_callback
         self.map_callback = map_callback
@@ -104,47 +123,57 @@ class PlanAppAgent:
         self.result_callback = result_callback
         self.visualization_callback = visualization_callback
 
-        # ------------------------------------------------------------------
-        # MCP / OpenAI
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # MCP
+        # --------------------------------------------------------------------
 
         self.exit_stack = AsyncExitStack()
 
         self.mcp_session = None
         self.mcp_tools = []
 
+        # --------------------------------------------------------------------
+        # OpenAI
+        # --------------------------------------------------------------------
+
         self.openai_client = None
 
-        # ------------------------------------------------------------------
-        # Conversação
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Histórico
+        # --------------------------------------------------------------------
 
         self.messages = []
+
+        # --------------------------------------------------------------------
+        # Estado
+        # --------------------------------------------------------------------
+
         self.user_id = USER_ID
 
-        # ------------------------------------------------------------------
-        # Estado
-        # ------------------------------------------------------------------
-
         self.registered = False
+
+        self.geocoded_points = []
 
         self.evaluate_executed = False
         self.evaluate_error = None
 
-        self.geocoded_points = []
+        self.last_evaluate_result = None
 
         self.map = None
 
-        self.current_stage = None
-        self.tool_count = 0
-
-        self.last_evaluate_result = None
-
         self.visualizations = []
 
-        # ------------------------------------------------------------------
+        self.technical_context_added = False
+
+        # --------------------------------------------------------------------
+        # Resposta intermediária do agente
+        # --------------------------------------------------------------------
+
+        self.last_agent_text = ""
+
+        # --------------------------------------------------------------------
         # Parâmetros do enlace
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         self.requested_frequency_value = None
         self.requested_frequency_unit = None
@@ -155,9 +184,16 @@ class PlanAppAgent:
 
         self.requested_on_rooftop = False
 
-        # ------------------------------------------------------------------
-        # Estatísticas OpenAI
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Estado de execução
+        # --------------------------------------------------------------------
+
+        self.current_stage = None
+        self.tool_count = 0
+
+        # --------------------------------------------------------------------
+        # OpenAI usage
+        # --------------------------------------------------------------------
 
         self.input_tokens = 0
         self.output_tokens = 0
@@ -168,15 +204,15 @@ class PlanAppAgent:
         self.estimated_output_cost_usd = 0.0
         self.estimated_total_cost_usd = 0.0
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
         # Responses API
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         self.last_response_id = None
 
-        # ------------------------------------------------------------------
-        # Configuração de custo
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Preços GPT-5.6 Luna
+        # --------------------------------------------------------------------
 
         self.INPUT_PRICE_PER_MILLION = 0.20
         self.OUTPUT_PRICE_PER_MILLION = 1.20
@@ -185,46 +221,66 @@ class PlanAppAgent:
     # LOG
     # ========================================================================
 
-    def log(self, texto, tipo="processing"):
-        """
-        Envia mensagem para o callback da interface.
-
-        Compatibilidade:
-        - callback(texto, tipo)
-        - callback(texto)
-        """
+    def log(
+        self,
+        texto,
+        tipo="processing",
+    ):
 
         if DEBUG:
             print(texto)
 
         if self.progress_callback:
+
             try:
                 self.progress_callback(texto)
             except Exception:
                 pass
 
         if self.log_callback:
+
             try:
-                self.log_callback(texto, tipo)
+                self.log_callback(
+                    texto,
+                    tipo,
+                )
+
             except TypeError:
+
                 try:
                     self.log_callback(texto)
                 except Exception:
                     pass
+
             except Exception:
                 pass
 
-    def log_detail(self, texto):
-        self.log(texto, "detail")
+    # ========================================================================
+    # LOG DETAIL
+    # ========================================================================
+
+    def log_detail(
+        self,
+        texto,
+    ):
+
+        self.log(
+            texto,
+            "detail",
+        )
 
     # ========================================================================
-    # OPENAI
+    # CONNECT OPENAI
     # ========================================================================
 
     def connect_openai(self):
-        api_key = os.getenv("OPENAI_API_KEY")
+
+        api_key = os.getenv(
+            "OPENAI_API_KEY"
+        )
 
         if not api_key:
+
             raise RuntimeError(
                 "OPENAI_API_KEY não encontrada no ambiente."
             )
@@ -233,50 +289,123 @@ class PlanAppAgent:
             api_key=api_key
         )
 
-        self.log("✅ Cliente OpenAI inicializado.")
+        self.log(
+            "✅ Cliente OpenAI inicializado."
+        )
+
+        self.log_detail(
+            f"🤖 Modelo: {OPENAI_MODEL}"
+        )
 
     # ========================================================================
-    # CONNECT MCP + OPENAI
+    # CONNECT MCP
     # ========================================================================
 
     async def connect(self):
 
-        self.current_stage = "Conectando ao OpenAI"
+        self.current_stage = (
+            "Conectando ao OpenAI/MCP"
+        )
+
+        self.log(
+            "1️⃣ Inicializando OpenAI..."
+        )
 
         self.connect_openai()
 
-        self.log("🔌 Conectando ao PlanApp MCP...")
-
-        transport = await self.exit_stack.enter_async_context(
-            streamable_http_client(MCP_URL)
+        self.log(
+            "2️⃣ Conectando ao MCP..."
         )
 
-        read_stream, write_stream, _ = transport
-
-        self.mcp_session = await self.exit_stack.enter_async_context(
-            ClientSession(
-                read_stream,
-                write_stream,
+        transport = (
+            await self.exit_stack.enter_async_context(
+                streamable_http_client(
+                    MCP_URL
+                )
             )
         )
 
-        await self.mcp_session.initialize()
+        self.log(
+            "3️⃣ streamable_http_client conectado."
+        )
 
-        tools_result = await self.mcp_session.list_tools()
-
-        self.mcp_tools = tools_result.tools
+        read_stream, write_stream = transport
 
         self.log(
-            f"🔧 MCP conectado: {len(self.mcp_tools)} ferramentas disponíveis."
+            "4️⃣ Transporte MCP separado."
+        )
+
+        self.mcp_session = (
+            await self.exit_stack.enter_async_context(
+                ClientSession(
+                    read_stream,
+                    write_stream,
+                )
+            )
+        )
+
+        self.log(
+            "5️⃣ ClientSession criada."
+        )
+
+        try:
+
+            self.log(
+                "6️⃣ Enviando initialize() ao MCP..."
+            )
+
+            await asyncio.wait_for(
+                self.mcp_session.initialize(),
+                timeout=30,
+            )
+
+            self.log(
+                "7️⃣ MCP inicializado."
+            )
+
+        except asyncio.TimeoutError:
+
+            self.log(
+                "❌ Timeout de 30s aguardando initialize().",
+                "error",
+            )
+
+            raise
+
+        except Exception as exc:
+
+            self.log(
+                f"❌ Erro no initialize(): {exc}",
+                "error",
+            )
+
+            raise
+
+        self.log(
+            "8️⃣ Consultando ferramentas MCP..."
+        )
+
+        tools_result = (
+            await self.mcp_session.list_tools()
+        )
+
+        self.mcp_tools = (
+            tools_result.tools
+        )
+
+        self.log(
+            f"🔧 MCP conectado: "
+            f"{len(self.mcp_tools)} ferramentas."
         )
 
         for tool in self.mcp_tools:
+
             self.log_detail(
                 f"   • {tool.name}"
             )
 
     # ========================================================================
-    # OPENAI TOOLS
+    # BUILD OPENAI TOOLS
     # ========================================================================
 
     def build_openai_tools(self):
@@ -288,9 +417,22 @@ class PlanAppAgent:
             if tool.name in APPLICATION_CONTROLLED_TOOLS:
                 continue
 
-            schema = getattr(tool, "inputSchema", None)
+            schema = getattr(
+                tool,
+                "input_schema",
+                None,
+            )
 
             if schema is None:
+
+                schema = getattr(
+                    tool,
+                    "inputSchema",
+                    None,
+                )
+
+            if schema is None:
+
                 schema = {
                     "type": "object",
                     "properties": {},
@@ -299,17 +441,21 @@ class PlanAppAgent:
             description = getattr(
                 tool,
                 "description",
-                None,
+                ""
+            ) or ""
+
+            tools.append(
+                {
+                    "type": "function",
+                    "name": tool.name,
+                    "description": description,
+                    "parameters": schema,
+                }
             )
 
-            openai_tool = {
-                "type": "function",
-                "name": tool.name,
-                "description": description or "",
-                "parameters": schema,
-            }
-
-            tools.append(openai_tool)
+            self.log_detail(
+                f"🧩 Tool OpenAI: {tool.name}"
+            )
 
         return tools
 
@@ -321,19 +467,28 @@ class PlanAppAgent:
 
         self.registered = False
 
+        self.geocoded_points = []
+
         self.evaluate_executed = False
         self.evaluate_error = None
 
-        self.geocoded_points = []
+        self.last_evaluate_result = None
 
         self.map = None
 
+        self.visualizations = []
+
+        self.technical_context_added = False
+
+        self.last_agent_text = ""
+
         self.current_stage = None
+
         self.tool_count = 0
 
-        self.last_evaluate_result = None
+        self.messages = []
 
-        self.visualizations = []
+        self.last_response_id = None
 
         self.requested_frequency_value = None
         self.requested_frequency_unit = None
@@ -343,10 +498,6 @@ class PlanAppAgent:
         self.requested_rx_ha = None
 
         self.requested_on_rooftop = False
-
-        self.messages = []
-
-        self.last_response_id = None
 
         self.input_tokens = 0
         self.output_tokens = 0
@@ -358,21 +509,28 @@ class PlanAppAgent:
         self.estimated_total_cost_usd = 0.0
 
     # ========================================================================
-    # REGEX / PARÂMETROS DO ENLACE
+    # EXTRACT LINK PARAMETERS
     # ========================================================================
 
-    def extract_link_parameters(self, text):
+    def extract_link_parameters(
+        self,
+        text,
+    ):
 
         if not text:
             return
 
-        # ------------------------------------------------------------------
-        # Frequência
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # FREQUÊNCIA
+        # --------------------------------------------------------------------
 
         frequency_patterns = [
+
             r"(\d+(?:[.,]\d+)?)\s*(GHz|MHz|kHz|Hz)\b",
-            r"freq(?:uência|uency)?\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*(GHz|MHz|kHz|Hz)\b",
+
+            r"freq(?:uência|uency)?\s*[:=]?\s*"
+            r"(\d+(?:[.,]\d+)?)\s*"
+            r"(GHz|MHz|kHz|Hz)\b",
         ]
 
         for pattern in frequency_patterns:
@@ -387,7 +545,10 @@ class PlanAppAgent:
                 continue
 
             value = float(
-                match.group(1).replace(",", ".")
+                match.group(1).replace(
+                    ",",
+                    ".",
+                )
             )
 
             unit = match.group(2)
@@ -420,20 +581,21 @@ class PlanAppAgent:
 
             break
 
-        # ------------------------------------------------------------------
-        # TX / RX height
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # ALTURA TX
+        # --------------------------------------------------------------------
 
         tx_patterns = [
-            r"tx(?:_?ha| antenna height| height)?\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*m\b",
-            r"transmissor.*?(\d+(?:[.,]\d+)?)\s*m\b",
-            r"tx.*?(\d+(?:[.,]\d+)?)\s*m\b",
-        ]
 
-        rx_patterns = [
-            r"rx(?:_?ha| antenna height| height)?\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*m\b",
-            r"receptor.*?(\d+(?:[.,]\d+)?)\s*m\b",
-            r"rx.*?(\d+(?:[.,]\d+)?)\s*m\b",
+            r"tx(?:_?ha| antenna height| height)?"
+            r"\s*[:=]?\s*"
+            r"(\d+(?:[.,]\d+)?)\s*m\b",
+
+            r"transmissor.*?"
+            r"(\d+(?:[.,]\d+)?)\s*m\b",
+
+            r"tx.*?"
+            r"(\d+(?:[.,]\d+)?)\s*m\b",
         ]
 
         for pattern in tx_patterns:
@@ -445,10 +607,32 @@ class PlanAppAgent:
             )
 
             if match:
+
                 self.requested_tx_ha = float(
-                    match.group(1).replace(",", ".")
+                    match.group(1).replace(
+                        ",",
+                        ".",
+                    )
                 )
+
                 break
+
+        # --------------------------------------------------------------------
+        # ALTURA RX
+        # --------------------------------------------------------------------
+
+        rx_patterns = [
+
+            r"rx(?:_?ha| antenna height| height)?"
+            r"\s*[:=]?\s*"
+            r"(\d+(?:[.,]\d+)?)\s*m\b",
+
+            r"receptor.*?"
+            r"(\d+(?:[.,]\d+)?)\s*m\b",
+
+            r"rx.*?"
+            r"(\d+(?:[.,]\d+)?)\s*m\b",
+        ]
 
         for pattern in rx_patterns:
 
@@ -459,14 +643,19 @@ class PlanAppAgent:
             )
 
             if match:
+
                 self.requested_rx_ha = float(
-                    match.group(1).replace(",", ".")
+                    match.group(1).replace(
+                        ",",
+                        ".",
+                    )
                 )
+
                 break
 
-        # ------------------------------------------------------------------
-        # Caso o usuário informe uma altura única
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # ALTURA ÚNICA
+        # --------------------------------------------------------------------
 
         if (
             self.requested_tx_ha is None
@@ -474,7 +663,9 @@ class PlanAppAgent:
         ):
 
             generic_height = re.search(
-                r"(?:altura|height)\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*m\b",
+                r"(?:altura|height)"
+                r"\s*[:=]?\s*"
+                r"(\d+(?:[.,]\d+)?)\s*m\b",
                 text,
                 re.IGNORECASE,
             )
@@ -482,20 +673,24 @@ class PlanAppAgent:
             if generic_height:
 
                 value = float(
-                    generic_height.group(1).replace(",", ".")
+                    generic_height.group(1).replace(
+                        ",",
+                        ".",
+                    )
                 )
 
                 self.requested_tx_ha = value
                 self.requested_rx_ha = value
 
-        # ------------------------------------------------------------------
-        # Rooftop
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # ROOFTOP
+        # --------------------------------------------------------------------
 
         rooftop_patterns = [
+
             r"\brooftop\b",
-            r"\bno\s+telhado\b",
             r"\bno\s+teto\b",
+            r"\bno\s+telhado\b",
             r"\bsobre\s+o\s+telhado\b",
         ]
 
@@ -509,14 +704,13 @@ class PlanAppAgent:
         )
 
     # ========================================================================
-    # PARSE MCP
+    # PARSE MCP RESULT
     # ========================================================================
 
-    def parse_mcp_result(self, result):
-
-        # ------------------------------------------------------------------
-        # structuredContent
-        # ------------------------------------------------------------------
+    def parse_mcp_result(
+        self,
+        result,
+    ):
 
         structured = getattr(
             result,
@@ -525,6 +719,7 @@ class PlanAppAgent:
         )
 
         if structured is None:
+
             structured = getattr(
                 result,
                 "structured_content",
@@ -532,11 +727,17 @@ class PlanAppAgent:
             )
 
         if structured is not None:
-            return structured
 
-        # ------------------------------------------------------------------
-        # content
-        # ------------------------------------------------------------------
+            if isinstance(structured, str):
+
+                try:
+                    return json.loads(
+                        structured
+                    )
+                except Exception:
+                    return structured
+
+            return structured
 
         content = getattr(
             result,
@@ -558,22 +759,62 @@ class PlanAppAgent:
                     continue
 
                 try:
-                    return json.loads(text)
+
+                    return json.loads(
+                        text
+                    )
+
                 except Exception:
+
                     return text
 
         return None
 
     # ========================================================================
-    # ERROS MCP
+    # NORMALIZE RESULT
+    #
+    # Alguns servidores MCP podem devolver JSON como string.
     # ========================================================================
 
-    def contains_nested_error(self, value):
+    def normalize_result(
+        self,
+        value,
+    ):
+
+        if isinstance(value, str):
+
+            text = value.strip()
+
+            if not text:
+                return value
+
+            try:
+                return json.loads(text)
+            except Exception:
+                return value
+
+        return value
+
+    # ========================================================================
+    # FIND NESTED ERROR
+    # ========================================================================
+
+    def contains_nested_error(
+        self,
+        value,
+    ):
+
+        value = self.normalize_result(
+            value
+        )
 
         if isinstance(value, dict):
 
             status = str(
-                value.get("status", "")
+                value.get(
+                    "status",
+                    "",
+                )
             ).lower()
 
             if status in {
@@ -588,19 +829,31 @@ class PlanAppAgent:
 
             for child in value.values():
 
-                if self.contains_nested_error(child):
+                if self.contains_nested_error(
+                    child
+                ):
                     return True
 
         elif isinstance(value, list):
 
             for child in value:
 
-                if self.contains_nested_error(child):
+                if self.contains_nested_error(
+                    child
+                ):
                     return True
 
         return False
 
-    def is_mcp_error(self, result, parsed):
+    # ========================================================================
+    # MCP ERROR
+    # ========================================================================
+
+    def is_mcp_error(
+        self,
+        result,
+        parsed,
+    ):
 
         is_error = getattr(
             result,
@@ -609,6 +862,7 @@ class PlanAppAgent:
         )
 
         if is_error is None:
+
             is_error = getattr(
                 result,
                 "is_error",
@@ -618,105 +872,175 @@ class PlanAppAgent:
         if is_error:
             return True
 
-        return self.contains_nested_error(parsed)
+        return self.contains_nested_error(
+            parsed
+        )
 
     # ========================================================================
-    # LOG SAFE
+    # SAFE LOG
     # ========================================================================
 
-    def make_log_safe(self, value):
+    def make_log_safe(
+        self,
+        value,
+    ):
 
-        try:
-            if isinstance(value, dict):
+        value = self.normalize_result(
+            value
+        )
 
-                result = {}
+        if isinstance(value, dict):
 
-                for key, item in value.items():
+            result = {}
 
-                    if key == "data" and isinstance(item, str):
+            for key, item in value.items():
 
-                        if len(item) > 500:
-                            result[key] = (
-                                f"<base64: {len(item)} caracteres>"
-                            )
-                        else:
-                            result[key] = item
+                if (
+                    key == "data"
+                    and isinstance(item, str)
+                    and len(item) > 500
+                ):
 
-                    else:
-                        result[key] = self.make_log_safe(item)
+                    result[key] = (
+                        f"<base64: {len(item)} caracteres>"
+                    )
 
-                return result
+                else:
 
-            if isinstance(value, list):
+                    result[key] = (
+                        self.make_log_safe(
+                            item
+                        )
+                    )
 
-                return [
-                    self.make_log_safe(item)
-                    for item in value
-                ]
+            return result
 
-            return value
+        if isinstance(value, list):
 
-        except Exception:
+            return [
+                self.make_log_safe(item)
+                for item in value
+            ]
 
-            return "<objeto não serializável>"
+        return value
 
     # ========================================================================
-    # GEOCODING
+    # EXTRACT COORDINATES
     # ========================================================================
 
-    def extract_coordinates(self, value):
+    def extract_coordinates(
+        self,
+        value,
+    ):
 
-        if not isinstance(value, dict):
-            return None
+        value = self.normalize_result(
+            value
+        )
 
-        lat = None
-        lon = None
+        if isinstance(value, dict):
 
-        possible_lat_keys = [
-            "lat",
-            "latitude",
-            "y",
-        ]
+            lat = None
+            lon = None
 
-        possible_lon_keys = [
-            "lon",
-            "lng",
-            "longitude",
-            "x",
-        ]
+            # ---------------------------------------------------------------
+            # Latitude
+            # ---------------------------------------------------------------
 
-        for key in possible_lat_keys:
+            for key in (
+                "lat",
+                "latitude",
+                "y",
+            ):
 
-            if key in value:
+                if key in value:
 
-                try:
-                    lat = float(value[key])
-                    break
-                except Exception:
-                    pass
+                    try:
 
-        for key in possible_lon_keys:
+                        candidate = float(
+                            value[key]
+                        )
 
-            if key in value:
+                        if -90 <= candidate <= 90:
 
-                try:
-                    lon = float(value[key])
-                    break
-                except Exception:
-                    pass
+                            lat = candidate
 
-        if lat is not None and lon is not None:
-            return lat, lon
+                            break
 
-        # Busca recursiva
-        for child in value.values():
+                    except Exception:
+                        pass
 
-            result = self.extract_coordinates(child)
+            # ---------------------------------------------------------------
+            # Longitude
+            # ---------------------------------------------------------------
 
-            if result:
-                return result
+            for key in (
+                "lon",
+                "lng",
+                "longitude",
+                "x",
+            ):
+
+                if key in value:
+
+                    try:
+
+                        candidate = float(
+                            value[key]
+                        )
+
+                        if -180 <= candidate <= 180:
+
+                            lon = candidate
+
+                            break
+
+                    except Exception:
+                        pass
+
+            # ---------------------------------------------------------------
+            # Coordenadas encontradas
+            # ---------------------------------------------------------------
+
+            if (
+                lat is not None
+                and lon is not None
+            ):
+
+                return lat, lon
+
+            # ---------------------------------------------------------------
+            # Procurar recursivamente
+            # ---------------------------------------------------------------
+
+            for child in value.values():
+
+                result = (
+                    self.extract_coordinates(
+                        child
+                    )
+                )
+
+                if result:
+                    return result
+
+        elif isinstance(value, list):
+
+            for child in value:
+
+                result = (
+                    self.extract_coordinates(
+                        child
+                    )
+                )
+
+                if result:
+                    return result
 
         return None
+
+    # ========================================================================
+    # REGISTER GEOCODED POINT
+    # ========================================================================
 
     def register_geocoded_point(
         self,
@@ -724,10 +1048,38 @@ class PlanAppAgent:
         query=None,
     ):
 
-        coordinates = self.extract_coordinates(result)
+        result = self.normalize_result(
+            result
+        )
+
+        coordinates = (
+            self.extract_coordinates(
+                result
+            )
+        )
 
         if not coordinates:
-            return
+
+            self.log(
+                "⚠️ geocode_place não retornou "
+                "coordenadas válidas.",
+                "error",
+            )
+
+            self.log_detail(
+                "Resultado geocoding:"
+            )
+
+            self.log_detail(
+                json.dumps(
+                    self.make_log_safe(result),
+                    indent=2,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+
+            return False
 
         lat, lon = coordinates
 
@@ -737,17 +1089,31 @@ class PlanAppAgent:
             "lon": lon,
         }
 
+        # --------------------------------------------------------------------
         # Evita duplicação
+        # --------------------------------------------------------------------
+
         for existing in self.geocoded_points:
 
             if (
-                abs(existing["lat"] - lat) < 1e-9
+                abs(
+                    existing["lat"] - lat
+                ) < 1e-9
                 and
-                abs(existing["lon"] - lon) < 1e-9
+                abs(
+                    existing["lon"] - lon
+                ) < 1e-9
             ):
-                return
 
-        self.geocoded_points.append(point)
+                self.log_detail(
+                    "ℹ️ Coordenada já registrada."
+                )
+
+                return False
+
+        self.geocoded_points.append(
+            point
+        )
 
         self.log(
             f"📍 Ponto geocodificado: "
@@ -755,38 +1121,55 @@ class PlanAppAgent:
             f"({lat:.6f}, {lon:.6f})"
         )
 
+        self.log(
+            f"📍 Total de pontos: "
+            f"{len(self.geocoded_points)}"
+        )
+
+        # --------------------------------------------------------------------
+        # MAPA É ATUALIZADO IMEDIATAMENTE
+        # --------------------------------------------------------------------
+
         self.mostrar_mapa_apos_geocodificacao()
 
-    def summarize_geocode(self, result):
-
-        coordinates = self.extract_coordinates(result)
-
-        if coordinates:
-
-            lat, lon = coordinates
-
-            return (
-                f"Coordenadas encontradas: "
-                f"latitude={lat:.6f}, longitude={lon:.6f}"
-            )
-
-        return "Geocodificação concluída."
+        return True
 
     # ========================================================================
     # MAPA
     # ========================================================================
 
-    def mostrar_mapa_apos_geocodificacao(self):
+    def mostrar_mapa_apos_geocodificacao(
+        self,
+    ):
 
-        if len(self.geocoded_points) < 1:
+        count = len(
+            self.geocoded_points
+        )
+
+        if count == 0:
             return
+
+        self.log_detail(
+            f"🗺️ Atualizando mapa — "
+            f"{count} ponto(s)."
+        )
 
         try:
 
-            if len(self.geocoded_points) >= 2:
+            if count >= 2:
 
                 p1 = self.geocoded_points[0]
                 p2 = self.geocoded_points[1]
+
+                self.log_detail(
+                    f"   TX = "
+                    f"{p1['lat']}, {p1['lon']}"
+                )
+
+                self.log_detail(
+                    f"   RX = "
+                    f"{p2['lat']}, {p2['lon']}"
+                )
 
                 self.map = mostrar_mapa_enlace(
                     p1["lat"],
@@ -797,76 +1180,60 @@ class PlanAppAgent:
 
             else:
 
+                p1 = self.geocoded_points[0]
+
                 self.map = mostrar_mapa_enlace(
-                    self.geocoded_points[0]["lat"],
-                    self.geocoded_points[0]["lon"],
-                    self.geocoded_points[0]["lat"],
-                    self.geocoded_points[0]["lon"],
+                    p1["lat"],
+                    p1["lon"],
+                    p1["lat"],
+                    p1["lon"],
                 )
 
             self.log_detail(
-                "🗺️ Mapa atualizado."
+                f"🗺️ Objeto mapa criado: "
+                f"{type(self.map)}"
             )
 
             if self.map_callback:
 
-                try:
-                    self.map_callback(self.map)
-                except Exception as exc:
-                    self.log_detail(
-                        f"⚠️ Erro no map_callback: {exc}"
-                    )
+                self.log_detail(
+                    "🗺️ Chamando map_callback..."
+                )
+
+                self.map_callback(
+                    self.map
+                )
+
+                self.log_detail(
+                    "🗺️ map_callback executado."
+                )
+
+            else:
+
+                self.log_detail(
+                    "⚠️ map_callback inexistente."
+                )
 
         except Exception as exc:
 
-            self.log_detail(
-                f"⚠️ Erro ao gerar mapa: {exc}"
+            self.log(
+                f"❌ Erro ao gerar mapa: {exc}",
+                "error",
             )
 
     # ========================================================================
-    # RESUMO EVALUATE
+    # FIND RECURSIVE
     # ========================================================================
 
-    def summarize_evaluate(self, result):
+    def find_recursive(
+        self,
+        value,
+        keys,
+    ):
 
-        if not isinstance(result, dict):
-            return "Avaliação concluída."
-
-        lines = []
-
-        fspl = self.find_recursive(
-            result,
-            [
-                "fspl",
-                "free_space_path_loss",
-            ],
+        value = self.normalize_result(
+            value
         )
-
-        distance = self.find_recursive(
-            result,
-            [
-                "distance",
-                "distance_m",
-                "link_distance",
-            ],
-        )
-
-        if fspl is not None:
-            lines.append(
-                f"FSPL={fspl}"
-            )
-
-        if distance is not None:
-            lines.append(
-                f"distância={distance}"
-            )
-
-        if lines:
-            return " | ".join(lines)
-
-        return "Avaliação concluída."
-
-    def find_recursive(self, value, keys):
 
         if isinstance(value, dict):
 
@@ -900,10 +1267,69 @@ class PlanAppAgent:
         return None
 
     # ========================================================================
-    # USAGE / CUSTO
+    # SUMMARIZE EVALUATE
     # ========================================================================
 
-    def update_usage(self, response):
+    def summarize_evaluate(
+        self,
+        result,
+    ):
+
+        result = self.normalize_result(
+            result
+        )
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            return "Avaliação concluída."
+
+        parts = []
+
+        fspl = self.find_recursive(
+            result,
+            [
+                "fspl",
+                "free_space_path_loss",
+            ],
+        )
+
+        distance = self.find_recursive(
+            result,
+            [
+                "distance",
+                "distance_m",
+                "link_distance",
+            ],
+        )
+
+        if distance is not None:
+
+            parts.append(
+                f"distância={distance}"
+            )
+
+        if fspl is not None:
+
+            parts.append(
+                f"FSPL={fspl}"
+            )
+
+        if parts:
+
+            return " | ".join(parts)
+
+        return "Avaliação concluída."
+
+    # ========================================================================
+    # USAGE
+    # ========================================================================
+
+    def update_usage(
+        self,
+        response,
+    ):
 
         usage = getattr(
             response,
@@ -933,6 +1359,7 @@ class PlanAppAgent:
         )
 
         if total_tokens is None:
+
             total_tokens = (
                 input_tokens
                 + output_tokens
@@ -950,41 +1377,33 @@ class PlanAppAgent:
             total_tokens
         )
 
-        # --------------------------------------------------------------
-        # Cached input
-        # --------------------------------------------------------------
-
-        input_details = getattr(
+        details = getattr(
             usage,
             "input_tokens_details",
             None,
         )
 
-        if input_details is not None:
+        if details is not None:
 
-            cached_tokens = getattr(
-                input_details,
+            cached = getattr(
+                details,
                 "cached_tokens",
                 0,
             ) or 0
 
             self.cached_input_tokens += int(
-                cached_tokens
+                cached
             )
-
-        # --------------------------------------------------------------
-        # Custo estimado
-        # --------------------------------------------------------------
 
         self.estimated_input_cost_usd = (
             self.input_tokens
-            / 1_000_000.0
+            / 1_000_000
             * self.INPUT_PRICE_PER_MILLION
         )
 
         self.estimated_output_cost_usd = (
             self.output_tokens
-            / 1_000_000.0
+            / 1_000_000
             * self.OUTPUT_PRICE_PER_MILLION
         )
 
@@ -993,22 +1412,38 @@ class PlanAppAgent:
             + self.estimated_output_cost_usd
         )
 
+        self.log_detail(
+            "💰 OpenAI usage: "
+            f"in={self.input_tokens}, "
+            f"out={self.output_tokens}, "
+            f"total={self.total_tokens}"
+        )
+
     # ========================================================================
     # TECHNICAL RESULT
     # ========================================================================
 
-    def publish_technical_result(self, result):
+    def publish_technical_result(
+        self,
+        result,
+    ):
 
-        self.last_evaluate_result = result
+        self.last_evaluate_result = (
+            self.normalize_result(result)
+        )
 
         if self.result_callback:
 
             try:
-                self.result_callback(result)
+
+                self.result_callback(
+                    self.last_evaluate_result
+                )
+
             except Exception as exc:
 
                 self.log_detail(
-                    f"⚠️ Erro no result_callback: {exc}"
+                    f"⚠️ Erro result_callback: {exc}"
                 )
 
     # ========================================================================
@@ -1029,8 +1464,13 @@ class PlanAppAgent:
 
         self.tool_count += 1
 
+        self.log("")
         self.log(
             f"🔧 MCP TOOL: {tool_name}"
+        )
+
+        self.log_detail(
+            "Argumentos:"
         )
 
         self.log_detail(
@@ -1044,27 +1484,46 @@ class PlanAppAgent:
 
         try:
 
-            result = await self.mcp_session.call_tool(
-                tool_name,
-                arguments,
+            result = (
+                await self.mcp_session.call_tool(
+                    tool_name,
+                    arguments,
+                )
             )
 
         except Exception as exc:
 
             self.log(
-                f"❌ Erro ao executar {tool_name}: {exc}",
+                f"❌ MCP {tool_name}: {exc}",
                 "error",
             )
 
             if tool_name == "evaluate_link":
-                self.evaluate_error = str(exc)
+
+                self.evaluate_error = str(
+                    exc
+                )
 
             raise
 
-        parsed = self.parse_mcp_result(result)
+        parsed = (
+            self.parse_mcp_result(
+                result
+            )
+        )
 
-        safe_result = self.make_log_safe(
+        parsed = self.normalize_result(
             parsed
+        )
+
+        safe_result = (
+            self.make_log_safe(
+                parsed
+            )
+        )
+
+        self.log_detail(
+            "Resultado MCP:"
         )
 
         try:
@@ -1084,38 +1543,36 @@ class PlanAppAgent:
                 str(safe_result)
             )
 
-        # --------------------------------------------------------------
-        # Detecta erros reais, inclusive erros aninhados
-        # --------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # ERRO
+        # --------------------------------------------------------------------
 
         if self.is_mcp_error(
             result,
             parsed,
         ):
 
-            error_message = (
-                parsed
-                if isinstance(parsed, str)
-                else json.dumps(
-                    safe_result,
-                    ensure_ascii=False,
-                    default=str,
-                )
-            )
-
             self.log(
-                f"❌ MCP informou erro em {tool_name}.",
+                f"❌ MCP informou erro em "
+                f"{tool_name}.",
                 "error",
             )
 
             if tool_name == "evaluate_link":
-                self.evaluate_error = error_message
+
+                self.evaluate_error = (
+                    json.dumps(
+                        safe_result,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                )
 
             return parsed
 
-        # --------------------------------------------------------------
-        # Geocode
-        # --------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # GEOCODE
+        # --------------------------------------------------------------------
 
         if tool_name == "geocode_place":
 
@@ -1128,48 +1585,205 @@ class PlanAppAgent:
                 query=query,
             )
 
-        # --------------------------------------------------------------
-        # Evaluate
-        # --------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # EVALUATE
+        # --------------------------------------------------------------------
 
-        if tool_name == "evaluate_link":
+        elif tool_name == "evaluate_link":
+
+            self.log(
+                "📡 evaluate_link retornou com sucesso."
+            )
 
             self.evaluate_executed = True
+
             self.evaluate_error = None
 
             self.publish_technical_result(
                 parsed
             )
 
-            summary = self.summarize_evaluate(
-                parsed
+            summary = (
+                self.summarize_evaluate(
+                    parsed
+                )
             )
 
             self.log(
                 f"📡 Enlace avaliado: {summary}"
             )
 
-            # ----------------------------------------------------------
-            # Visualizações são sempre controladas pela aplicação.
-            # ----------------------------------------------------------
+            # ----------------------------------------------------------------
+            # VISUALIZAÇÕES
+            # ----------------------------------------------------------------
 
             await self.gerar_visualizacoes()
 
         return parsed
 
     # ========================================================================
-    # GERAR VISUALIZAÇÕES
+    # EVALUATE LINK — CONTROLADO 100% PELA APLICAÇÃO
     # ========================================================================
 
-    async def gerar_visualizacoes(self):
+    async def ensure_evaluate_link(
+        self,
+    ):
 
-        if not self.evaluate_executed:
-            return
+        self.log("")
+        self.log(
+            "========== EVALUATE CONTROLLER =========="
+        )
+
+        self.log(
+            f"geocoded_points = "
+            f"{len(self.geocoded_points)}"
+        )
+
+        self.log(
+            f"evaluate_executed = "
+            f"{self.evaluate_executed}"
+        )
+
+        self.log(
+            f"evaluate_error = "
+            f"{self.evaluate_error}"
+        )
+
+        # --------------------------------------------------------------------
+        # Já executado
+        # --------------------------------------------------------------------
+
+        if self.evaluate_executed:
+
+            self.log(
+                "ℹ️ evaluate_link já executado."
+            )
+
+            return self.last_evaluate_result
+
+        # --------------------------------------------------------------------
+        # Erro anterior
+        # --------------------------------------------------------------------
 
         if self.evaluate_error is not None:
 
+            self.log(
+                "⚠️ evaluate_link possui erro anterior.",
+                "error",
+            )
+
+            return None
+
+        # --------------------------------------------------------------------
+        # Precisamos de dois pontos
+        # --------------------------------------------------------------------
+
+        if len(
+            self.geocoded_points
+        ) < 2:
+
+            self.log(
+                "⚠️ Menos de dois pontos. "
+                "evaluate_link não será executado."
+            )
+
+            return None
+
+        tx = self.geocoded_points[0]
+        rx = self.geocoded_points[1]
+
+        # --------------------------------------------------------------------
+        # Defaults
+        # --------------------------------------------------------------------
+
+        tx_ha = (
+            self.requested_tx_ha
+            if self.requested_tx_ha is not None
+            else 7
+        )
+
+        rx_ha = (
+            self.requested_rx_ha
+            if self.requested_rx_ha is not None
+            else 7
+        )
+
+        freq_mhz = (
+            self.requested_frequency_mhz
+            if self.requested_frequency_mhz is not None
+            else 900
+        )
+
+        on_rooftop = (
+            self.requested_on_rooftop
+        )
+
+        arguments = {
+
+            "tx_lat": tx["lat"],
+            "tx_lon": tx["lon"],
+
+            "rx_lat": rx["lat"],
+            "rx_lon": rx["lon"],
+
+            "tx_ha": tx_ha,
+            "rx_ha": rx_ha,
+
+            "freq_mhz": freq_mhz,
+
+            "on_rooftop": on_rooftop,
+        }
+
+        self.log(
+            "📡 APLICAÇÃO executará evaluate_link."
+        )
+
+        self.log_detail(
+            "📡 Parâmetros finais:"
+        )
+
+        self.log_detail(
+            json.dumps(
+                arguments,
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+
+        result = (
+            await self.execute_mcp_tool(
+                "evaluate_link",
+                arguments,
+            )
+        )
+
+        self.log(
+            "========== FIM EVALUATE CONTROLLER =========="
+        )
+
+        return result
+
+    # ========================================================================
+    # VISUALIZAÇÕES
+    # ========================================================================
+
+    async def gerar_visualizacoes(
+        self,
+    ):
+
+        if not self.evaluate_executed:
+
             self.log_detail(
-                "⚠️ Visualizações não serão geradas: "
+                "⚠️ Visualizações canceladas: "
+                "evaluate_link não executado."
+            )
+
+            return
+
+        if self.evaluate_error:
+
+            self.log_detail(
+                "⚠️ Visualizações canceladas: "
                 "evaluate_link apresentou erro."
             )
 
@@ -1178,21 +1792,17 @@ class PlanAppAgent:
         if self.mcp_session is None:
 
             self.log_detail(
-                "⚠️ Não é possível gerar visualizações: "
-                "sessão MCP inexistente."
+                "⚠️ Sessão MCP inexistente."
             )
 
             return
 
+        self.log("")
         self.log(
-            "📊 Gerando visualizações do enlace..."
+            "📊 Gerando visualizações..."
         )
 
         self.visualizations = []
-
-        # ------------------------------------------------------------------
-        # Ordem determinística.
-        # ------------------------------------------------------------------
 
         etapas = [
 
@@ -1200,7 +1810,7 @@ class PlanAppAgent:
                 "DTM",
                 "link_area",
                 {
-                    "ds_string": "DTM"
+                    "ds_string": "DTM",
                 },
             ),
 
@@ -1208,7 +1818,7 @@ class PlanAppAgent:
                 "DSM",
                 "link_area",
                 {
-                    "ds_string": "DSM"
+                    "ds_string": "DSM",
                 },
             ),
 
@@ -1216,7 +1826,7 @@ class PlanAppAgent:
                 "COVER",
                 "link_area",
                 {
-                    "ds_string": "COVER"
+                    "ds_string": "COVER",
                 },
             ),
 
@@ -1251,7 +1861,11 @@ class PlanAppAgent:
             ),
         ]
 
-        for titulo, tool_name, arguments in etapas:
+        for (
+            titulo,
+            tool_name,
+            arguments,
+        ) in etapas:
 
             self.log_detail("")
             self.log_detail(
@@ -1260,23 +1874,33 @@ class PlanAppAgent:
 
             try:
 
-                result = await self.execute_mcp_tool(
-                    tool_name,
-                    arguments,
+                result = (
+                    await self.execute_mcp_tool(
+                        tool_name,
+                        arguments,
+                    )
                 )
 
             except Exception as exc:
 
                 self.log_detail(
-                    f"❌ Exceção em {titulo}: {exc}"
+                    f"❌ {titulo}: {exc}"
                 )
 
                 continue
 
-            if not isinstance(result, dict):
+            result = self.normalize_result(
+                result
+            )
+
+            if not isinstance(
+                result,
+                dict,
+            ):
 
                 self.log_detail(
-                    f"⚠️ Resultado inválido para {titulo}."
+                    f"⚠️ {titulo}: "
+                    "resultado não é dict."
                 )
 
                 continue
@@ -1295,20 +1919,16 @@ class PlanAppAgent:
             }:
 
                 self.log_detail(
-                    f"⚠️ Falha na visualização: {titulo}"
+                    f"⚠️ {titulo}: MCP retornou erro."
                 )
 
                 continue
 
-            kind = result.get(
-                "kind"
-            )
-
-            if kind != "image":
+            if result.get("kind") != "image":
 
                 self.log_detail(
                     f"ℹ️ {titulo}: "
-                    "resultado não visualizável."
+                    "não retornou imagem."
                 )
 
                 continue
@@ -1327,28 +1947,12 @@ class PlanAppAgent:
 
             try:
 
-                image_bytes = base64.b64decode(
-                    data,
-                    validate=True,
-                )
-
-                if not image_bytes:
-
-                    self.log_detail(
-                        f"⚠️ {titulo}: "
-                        "imagem decodificada vazia."
+                image_bytes = (
+                    base64.b64decode(
+                        data,
+                        validate=True,
                     )
-
-                    continue
-
-                # ------------------------------------------------------
-                # IMPORTANTE:
-                #
-                # Não usamos IPython.display.Image aqui.
-                #
-                # widgets.Image é necessário para que a imagem seja
-                # armazenada e renderizada corretamente pelo notebook UI.
-                # ------------------------------------------------------
+                )
 
                 widget = widgets.Image(
                     value=image_bytes,
@@ -1371,51 +1975,72 @@ class PlanAppAgent:
             except Exception as exc:
 
                 self.log_detail(
-                    f"❌ Erro ao decodificar "
-                    f"{titulo}: {exc}"
+                    f"❌ {titulo}: "
+                    f"erro base64: {exc}"
                 )
 
-        # ------------------------------------------------------------------
-        # Atualiza interface
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # CALLBACK
+        # --------------------------------------------------------------------
+
+        self.log(
+            f"📊 Total de visualizações: "
+            f"{len(self.visualizations)}"
+        )
 
         if self.visualization_callback:
 
             try:
 
+                self.log_detail(
+                    "📊 Chamando visualization_callback..."
+                )
+
                 self.visualization_callback(
                     self.visualizations
                 )
 
-            except Exception as exc:
-
                 self.log_detail(
-                    f"❌ Erro ao atualizar visualizações: {exc}"
+                    "📊 visualization_callback executado."
                 )
 
-        self.log(
-            f"📊 {len(self.visualizations)} "
-            "visualizações geradas."
-        )
+            except Exception as exc:
+
+                self.log(
+                    f"❌ Erro visualization_callback: "
+                    f"{exc}",
+                    "error",
+                )
+
+        else:
+
+            self.log_detail(
+                "⚠️ visualization_callback inexistente."
+            )
 
     # ========================================================================
     # REGISTER
     # ========================================================================
 
-    async def register_session(self):
+    async def register_session(
+        self,
+    ):
 
         if self.registered:
             return
 
         self.log(
-            f"📝 Registrando sessão: {self.user_id}"
+            f"📝 Registrando sessão: "
+            f"{self.user_id}"
         )
 
-        result = await self.execute_mcp_tool(
-            "register",
-            {
-                "user_id": self.user_id,
-            },
+        result = (
+            await self.execute_mcp_tool(
+                "register",
+                {
+                    "user_id": self.user_id,
+                },
+            )
         )
 
         self.registered = True
@@ -1427,122 +2052,67 @@ class PlanAppAgent:
         return result
 
     # ========================================================================
-    # EVALUATE LINK
+    # TECHNICAL CONTEXT
     # ========================================================================
 
-    async def ensure_evaluate_link(
+    def append_technical_context(
         self,
-        parameters=None,
     ):
-
-        if self.evaluate_executed:
-            return self.last_evaluate_result
-
-        if self.evaluate_error is not None:
-            return None
-
-        if len(self.geocoded_points) < 2:
-
-            self.log_detail(
-                "⚠️ Ainda não existem dois pontos "
-                "geocodificados para avaliar o enlace."
-            )
-
-            return None
-
-        tx = self.geocoded_points[0]
-        rx = self.geocoded_points[1]
-
-        # ------------------------------------------------------------------
-        # Parâmetros
-        # ------------------------------------------------------------------
-
-        tx_ha = (
-            self.requested_tx_ha
-            if self.requested_tx_ha is not None
-            else 7
-        )
-
-        rx_ha = (
-            self.requested_rx_ha
-            if self.requested_rx_ha is not None
-            else 7
-        )
-
-        freq_mhz = (
-            self.requested_frequency_mhz
-            if self.requested_frequency_mhz is not None
-            else 900
-        )
-
-        on_rooftop = self.requested_on_rooftop
-
-        arguments = {
-            "tx_lat": tx["lat"],
-            "tx_lon": tx["lon"],
-            "rx_lat": rx["lat"],
-            "rx_lon": rx["lon"],
-            "tx_ha": tx_ha,
-            "rx_ha": rx_ha,
-            "freq_mhz": freq_mhz,
-            "on_rooftop": on_rooftop,
-        }
-
-        self.log(
-            "📡 Executando avaliação do enlace..."
-        )
-
-        self.log_detail(
-            json.dumps(
-                arguments,
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
-
-        return await self.execute_mcp_tool(
-            "evaluate_link",
-            arguments,
-        )
-
-    # ========================================================================
-    # CONTEXTO TÉCNICO
-    # ========================================================================
-
-    def append_technical_context(self):
 
         if not self.last_evaluate_result:
             return
 
+        if self.technical_context_added:
+            return
+
         technical_context = {
+
             "status": "OK",
-            "technical_result": self.last_evaluate_result,
+
+            "technical_result":
+                self.last_evaluate_result,
+
         }
 
         self.messages.append(
             {
                 "role": "user",
+
                 "content": (
-                    "O resultado técnico oficial do PlanApp "
-                    "para o enlace é:\n"
-                    + json.dumps(
+                    "O resultado técnico oficial "
+                    "do PlanApp para o enlace é:\n"
+                    +
+                    json.dumps(
                         technical_context,
                         ensure_ascii=False,
                         default=str,
                     )
-                    + "\n\n"
-                    "Use estes dados como fonte de verdade "
-                    "para sua resposta final. "
-                    "Não invente valores técnicos."
+                    +
+                    "\n\n"
+                    "Use estes dados como fonte de "
+                    "verdade para sua resposta final. "
+                    "Não invente valores técnicos. "
+                    "A avaliação já foi executada "
+                    "pela aplicação. "
+                    "Não diga que ela será executada."
                 ),
             }
+        )
+
+        self.technical_context_added = True
+
+        self.log_detail(
+            "🧠 Resultado técnico adicionado "
+            "ao contexto do OpenAI."
         )
 
     # ========================================================================
     # SYSTEM PROMPT
     # ========================================================================
 
-    def system_prompt(self):
+    def system_prompt(
+        self,
+    ):
 
         return """
 Você é o PlanApp AI, assistente técnico especializado
@@ -1554,74 +2124,83 @@ REGRAS FUNDAMENTAIS:
 
 2. Nunca invente coordenadas.
 
-3. Nunca invente distância, FSPL, altura, frequência,
-   perda, visada ou qualquer outro resultado técnico.
+3. Nunca invente distância, FSPL, frequência,
+   altura, perda ou qualquer resultado técnico.
 
-4. Para encontrar coordenadas de locais fornecidos pelo usuário,
-   use a ferramenta geocode_place.
+4. Use geocode_place para encontrar coordenadas
+   dos locais mencionados pelo usuário.
 
-5. O sistema da aplicação controla evaluate_link.
-   Você NÃO deve chamar evaluate_link diretamente.
+5. NÃO execute evaluate_link.
+   evaluate_link é controlado exclusivamente pela aplicação.
 
-6. O sistema da aplicação também controla todas as visualizações.
-   Você NÃO deve chamar ferramentas de visualização diretamente.
+6. NÃO execute ferramentas de visualização.
+   As visualizações são controladas exclusivamente pela aplicação.
 
-7. Quando houver dois pontos geocodificados, a aplicação executará
-   automaticamente a avaliação do enlace.
+7. Quando a solicitação contiver dois locais,
+   obtenha os dois pontos usando geocode_place.
 
-8. Depois que evaluate_link for executado com sucesso,
-   a aplicação gerará automaticamente as visualizações disponíveis.
+8. Se apenas um ponto estiver disponível,
+   continue a interação e tente identificar/geocodificar
+   o segundo local quando ele estiver presente na solicitação.
 
-9. Use os resultados retornados pelo PlanApp para responder.
+9. Depois que dois locais forem geocodificados,
+   a aplicação executará automaticamente evaluate_link.
 
-10. Se uma ferramenta retornar erro, informe o problema.
-    Não invente um resultado alternativo.
+10. Depois de evaluate_link,
+    a aplicação gerará automaticamente
+    as visualizações disponíveis.
 
-11. Frequência:
-    - 450 MHz significa 450 MHz.
-    - 450 GHz significa 450000 MHz.
-    - 450 kHz significa 0.45 MHz.
-    - 450 Hz significa 0.00045 MHz.
+11. Quando receber o resultado técnico oficial,
+    use-o como fonte de verdade.
 
-12. Preserve na resposta a unidade originalmente informada pelo usuário
-    quando mencionar a frequência.
+12. Se uma ferramenta retornar erro,
+    informe o erro de forma objetiva.
 
-13. Se nenhuma frequência for informada, o padrão da aplicação é 900 MHz.
+13. Frequência:
+    - 450 MHz = 450 MHz
+    - 450 GHz = 450000 MHz
+    - 450 kHz = 0.45 MHz
+    - 450 Hz = 0.00045 MHz
 
-14. Se nenhuma altura for informada, o padrão da aplicação é:
+14. Se nenhuma frequência for informada,
+    a aplicação usa 900 MHz.
+
+15. Se nenhuma altura for informada:
     TX = 7 m
-    RX = 7 m
+    RX = 7 m.
 
-15. Se o usuário informar uma altura única, ela pode ser aplicada
-    a TX e RX.
+16. Se uma altura única for informada,
+    aplique-a a TX e RX.
 
-16. Se o usuário especificar alturas TX e RX separadamente,
-    preserve os valores.
+17. Preserve alturas TX/RX separadas quando informadas.
 
-17. Se o usuário especificar rooftop/telhado/teto,
-    preserve essa intenção.
+18. Preserve rooftop/telhado/teto quando informado.
 
-18. Não diga que uma visualização foi gerada se a aplicação
-    não tiver confirmado sua geração.
+19. Não diga que uma visualização foi gerada
+    sem confirmação da aplicação.
 
-19. Não produza JSON para o usuário final a menos que isso seja
-    explicitamente solicitado.
+20. Se o resultado técnico estiver presente,
+    considere a avaliação concluída.
 
-20. Responda de forma objetiva e técnica.
+21. Responda de forma objetiva e técnica.
 
-Seu trabalho principal é:
-- interpretar a solicitação;
-- identificar os locais;
-- utilizar geocodificação quando necessário;
-- fornecer contexto para a aplicação;
-- interpretar o resultado técnico oficial do PlanApp.
+22. Se a solicitação não fornecer dois locais,
+    explique o que está faltando em vez de afirmar
+    que houve falha de avaliação.
+
+23. Não diga que "não foram obtidos dois pontos"
+    se você ainda não tentou geocodificar os locais
+    presentes na solicitação.
 """
 
     # ========================================================================
-    # OPENAI RESPONSES API
+    # OPENAI CHAT
     # ========================================================================
 
-    async def openai_chat(self):
+    async def openai_chat(
+        self,
+        allow_tools=True,
+    ):
 
         if self.openai_client is None:
 
@@ -1629,21 +2208,32 @@ Seu trabalho principal é:
                 "Cliente OpenAI não inicializado."
             )
 
-        tools = self.build_openai_tools()
+        tools = (
+            self.build_openai_tools()
+            if allow_tools
+            else []
+        )
 
-        response = await self.openai_client.responses.create(
+        response = (
+            await self.openai_client.responses.create(
 
-            model=OPENAI_MODEL,
+                model=OPENAI_MODEL,
 
-            input=self.messages,
+                input=self.messages,
 
-            tools=tools,
+                tools=tools,
 
-            tool_choice="auto",
+                tool_choice=(
+                    "auto"
+                    if allow_tools
+                    else "none"
+                ),
 
-            reasoning={
-                "effort": OPENAI_REASONING_EFFORT,
-            },
+                reasoning={
+                    "effort":
+                        OPENAI_REASONING_EFFORT,
+                },
+            )
         )
 
         self.update_usage(
@@ -1659,10 +2249,13 @@ Seu trabalho principal é:
         return response
 
     # ========================================================================
-    # OUTPUT TEXT
+    # RESPONSE TEXT
     # ========================================================================
 
-    def response_text(self, response):
+    def response_text(
+        self,
+        response,
+    ):
 
         text = getattr(
             response,
@@ -1673,7 +2266,6 @@ Seu trabalho principal é:
         if text:
             return text
 
-        # Fallback
         output = getattr(
             response,
             "output",
@@ -1687,13 +2279,12 @@ Seu trabalho principal é:
 
         for item in output:
 
-            item_type = getattr(
+            if getattr(
                 item,
                 "type",
                 None,
-            )
+            ) != "message":
 
-            if item_type != "message":
                 continue
 
             content = getattr(
@@ -1707,23 +2298,21 @@ Seu trabalho principal é:
 
             for part in content:
 
-                part_type = getattr(
+                if getattr(
                     part,
                     "type",
                     None,
-                )
+                ) == "output_text":
 
-                if part_type == "output_text":
-
-                    text_value = getattr(
+                    value = getattr(
                         part,
                         "text",
                         None,
                     )
 
-                    if text_value:
+                    if value:
                         texts.append(
-                            text_value
+                            value
                         )
 
         return "\n".join(
@@ -1731,24 +2320,243 @@ Seu trabalho principal é:
         )
 
     # ========================================================================
+    # NORMALIZE FUNCTION CALL
+    # ========================================================================
+
+    def normalize_function_call(
+        self,
+        item,
+    ):
+
+        if isinstance(
+            item,
+            dict,
+        ):
+
+            if item.get(
+                "type"
+            ) != "function_call":
+
+                return None
+
+            call_id = item.get(
+                "call_id"
+            )
+
+            name = item.get(
+                "name"
+            )
+
+            arguments = item.get(
+                "arguments",
+                "{}",
+            )
+
+        else:
+
+            if getattr(
+                item,
+                "type",
+                None
+            ) != "function_call":
+
+                return None
+
+            call_id = getattr(
+                item,
+                "call_id",
+                None,
+            )
+
+            name = getattr(
+                item,
+                "name",
+                None,
+            )
+
+            arguments = getattr(
+                item,
+                "arguments",
+                "{}",
+            )
+
+        if isinstance(
+            arguments,
+            dict,
+        ):
+
+            arguments_dict = arguments
+
+        else:
+
+            try:
+
+                arguments_dict = json.loads(
+                    arguments or "{}"
+                )
+
+            except Exception as exc:
+
+                self.log(
+                    f"❌ Erro interpretando "
+                    f"argumentos de {name}: {exc}",
+                    "error",
+                )
+
+                arguments_dict = {}
+
+        if not isinstance(
+            arguments_dict,
+            dict,
+        ):
+
+            arguments_dict = {}
+
+        return {
+
+            "type":
+                "function_call",
+
+            "call_id":
+                call_id,
+
+            "name":
+                name,
+
+            "arguments":
+                json.dumps(
+                    arguments_dict,
+                    ensure_ascii=False,
+                ),
+
+            "arguments_dict":
+                arguments_dict,
+        }
+
+    # ========================================================================
+    # SANITIZE MESSAGES
+    # ========================================================================
+
+    def sanitize_messages(
+        self,
+    ):
+
+        sanitized = []
+
+        for item in self.messages:
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            item_type = item.get(
+                "type"
+            )
+
+            if item_type == "function_call":
+
+                sanitized.append(
+                    {
+                        "type":
+                            "function_call",
+
+                        "call_id":
+                            item.get(
+                                "call_id"
+                            ),
+
+                        "name":
+                            item.get(
+                                "name"
+                            ),
+
+                        "arguments":
+                            item.get(
+                                "arguments",
+                                "{}",
+                            ),
+                    }
+                )
+
+                continue
+
+            if item_type == "function_call_output":
+
+                sanitized.append(
+                    {
+                        "type":
+                            "function_call_output",
+
+                        "call_id":
+                            item.get(
+                                "call_id"
+                            ),
+
+                        "output":
+                            item.get(
+                                "output",
+                                "",
+                            ),
+                    }
+                )
+
+                continue
+
+            sanitized.append(
+                item
+            )
+
+        self.messages = sanitized
+
+    # ========================================================================
     # AGENT TURN
+    #
+    # O OpenAI conduz SOMENTE a geocodificação.
+    #
+    # Quando dois pontos são obtidos:
+    #
+    #       OpenAI
+    #          |
+    #          v
+    #       2 pontos
+    #          |
+    #          v
+    #     APPLICATION
+    #          |
+    #          v
+    #   evaluate_link
+    #
     # ========================================================================
 
     async def agent_turn(
         self,
-        user_text,
     ):
+
+        self.last_agent_text = ""
 
         for iteration in range(
             MAX_AGENT_ITERATIONS
         ):
 
             self.current_stage = (
-                f"OpenAI — iteração "
+                f"OpenAI — iteração {iteration + 1}"
+            )
+
+            self.log("")
+            self.log(
+                f"🤖 OpenAI — iteração "
                 f"{iteration + 1}"
             )
 
-            response = await self.openai_chat()
+            self.sanitize_messages()
+
+            response = (
+                await self.openai_chat(
+                    allow_tools=True
+                )
+            )
 
             output = getattr(
                 response,
@@ -1758,101 +2566,96 @@ Seu trabalho principal é:
 
             function_calls = []
 
+            # ----------------------------------------------------------------
+            # FUNCTION CALLS
+            # ----------------------------------------------------------------
+
             for item in output:
 
-                item_type = getattr(
-                    item,
-                    "type",
-                    None,
-                )
-
-                if item_type == "function_call":
-
-                    function_calls.append(
+                normalized = (
+                    self.normalize_function_call(
                         item
                     )
-
-            # --------------------------------------------------------------
-            # Nenhuma chamada de ferramenta:
-            # resposta final do modelo.
-            # --------------------------------------------------------------
-
-            if not function_calls:
-
-                text = self.response_text(
-                    response
                 )
 
-                if text:
+                if normalized is None:
+                    continue
 
-                    self.messages.append(
-                        {
-                            "role": "assistant",
-                            "content": text,
-                        }
-                    )
+                self.log(
+                    f"📌 Function call: "
+                    f"{normalized['name']}"
+                )
 
-                return text
+                self.log_detail(
+                    f"arguments = "
+                    f"{normalized['arguments']}"
+                )
 
-            # --------------------------------------------------------------
-            # Processa chamadas de ferramentas
-            # --------------------------------------------------------------
+                self.messages.append(
+                    {
+                        "type":
+                            "function_call",
+
+                        "call_id":
+                            normalized[
+                                "call_id"
+                            ],
+
+                        "name":
+                            normalized[
+                                "name"
+                            ],
+
+                        "arguments":
+                            normalized[
+                                "arguments"
+                            ],
+                    }
+                )
+
+                function_calls.append(
+                    normalized
+                )
+
+            # ----------------------------------------------------------------
+            # EXECUTA SOMENTE TOOLS NÃO CONTROLADAS
+            # ----------------------------------------------------------------
 
             for call in function_calls:
 
-                tool_name = getattr(
-                    call,
-                    "name",
-                    None,
-                )
+                tool_name = call["name"]
 
-                call_id = getattr(
-                    call,
-                    "call_id",
-                    None,
-                )
+                call_id = call["call_id"]
 
-                arguments_text = getattr(
-                    call,
-                    "arguments",
-                    "{}",
-                )
+                arguments = call[
+                    "arguments_dict"
+                ]
 
-                try:
+                if tool_name in (
+                    APPLICATION_CONTROLLED_TOOLS
+                ):
 
-                    arguments = json.loads(
-                        arguments_text
+                    self.log(
+                        f"⚠️ {tool_name} "
+                        "é controlada pela aplicação."
                     )
-
-                except Exception:
-
-                    arguments = {}
-
-                self.log(
-                    f"🤖 OpenAI solicitou: "
-                    f"{tool_name}"
-                )
-
-                # ----------------------------------------------------------
-                # Segurança adicional:
-                # o modelo não pode executar ferramentas controladas
-                # pela aplicação.
-                # ----------------------------------------------------------
-
-                if tool_name in APPLICATION_CONTROLLED_TOOLS:
 
                     tool_result = {
                         "status": "ERROR",
                         "error": (
-                            "Esta ferramenta é controlada "
-                            "pela aplicação e não pode ser "
-                            "executada diretamente pelo modelo."
+                            "Ferramenta controlada "
+                            "pela aplicação."
                         ),
                     }
 
                 else:
 
                     try:
+
+                        self.log(
+                            f"🚀 Enviando para MCP: "
+                            f"{tool_name}"
+                        )
 
                         tool_result = (
                             await self.execute_mcp_tool(
@@ -1861,47 +2664,120 @@ Seu trabalho principal é:
                             )
                         )
 
+                        self.log(
+                            f"📥 MCP retornou: "
+                            f"{tool_name}"
+                        )
+
                     except Exception as exc:
+
+                        self.log(
+                            f"❌ Erro {tool_name}: "
+                            f"{exc}",
+                            "error",
+                        )
 
                         tool_result = {
                             "status": "ERROR",
                             "error": str(exc),
                         }
 
-                # ----------------------------------------------------------
-                # Responses API:
-                # devolve resultado da função ao modelo.
-                # ----------------------------------------------------------
-
                 self.messages.append(
                     {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": json.dumps(
-                            tool_result,
-                            ensure_ascii=False,
-                            default=str,
-                        ),
+                        "type":
+                            "function_call_output",
+
+                        "call_id":
+                            call_id,
+
+                        "output":
+                            json.dumps(
+                                tool_result,
+                                ensure_ascii=False,
+                                default=str,
+                            ),
                     }
                 )
 
-            # --------------------------------------------------------------
-            # Depois de dois pontos, a aplicação avalia automaticamente.
-            # --------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # DOIS PONTOS
+            #
+            # IMPORTANTE:
+            #
+            # Não fazemos outra chamada ao OpenAI.
+            #
+            # A aplicação assume o controle imediatamente.
+            # ----------------------------------------------------------------
 
-            if (
-                len(self.geocoded_points) >= 2
-                and not self.evaluate_executed
-                and self.evaluate_error is None
-            ):
+            if len(
+                self.geocoded_points
+            ) >= 2:
+
+                self.log("")
+                self.log(
+                    "📍 Dois pontos geocodificados."
+                )
+
+                self.log_detail(
+                    json.dumps(
+                        self.geocoded_points,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+
+                self.log(
+                    "📡 Transferindo controle "
+                    "para a aplicação."
+                )
 
                 await self.ensure_evaluate_link()
 
-                if self.evaluate_executed:
+                self.log(
+                    "📡 Retorno de evaluate_link "
+                    "recebido pelo controlador."
+                )
 
-                    self.append_technical_context()
+                return ""
 
-        return ""
+            # ----------------------------------------------------------------
+            # NENHUMA FUNCTION CALL
+            # ----------------------------------------------------------------
+
+            if not function_calls:
+
+                text = (
+                    self.response_text(
+                        response
+                    )
+                )
+
+                if text:
+
+                    self.last_agent_text = text
+
+                    self.messages.append(
+                        {
+                            "role":
+                                "assistant",
+
+                            "content":
+                                text,
+                        }
+                    )
+
+                    self.log_detail(
+                        "🤖 OpenAI respondeu sem "
+                        "chamar ferramentas."
+                    )
+
+                return text
+
+        self.log(
+            "⚠️ MAX_AGENT_ITERATIONS atingido."
+        )
+
+        return self.last_agent_text
 
     # ========================================================================
     # ASK
@@ -1914,51 +2790,129 @@ Seu trabalho principal é:
 
         self.reset_state()
 
+        # --------------------------------------------------------------------
+        # Limpa visualizações anteriores
+        # --------------------------------------------------------------------
+
         if self.visualization_callback:
 
             try:
-                self.visualization_callback([])
+
+                self.visualization_callback(
+                    []
+                )
+
             except Exception:
                 pass
+
+        # --------------------------------------------------------------------
+        # Extrai parâmetros diretamente da solicitação
+        # --------------------------------------------------------------------
 
         self.extract_link_parameters(
             user_text
         )
 
-        self.current_stage = "Inicialização"
-
+        self.log("")
         self.log(
-            "🚀 Iniciando PlanApp AI..."
+            "================================================"
+        )
+        self.log(
+            "🚀 PLANAPP AI — NOVA EXECUÇÃO"
+        )
+        self.log(
+            "================================================"
         )
 
         try:
 
+            # ----------------------------------------------------------------
+            # CONNECT
+            # ----------------------------------------------------------------
+
             await self.connect()
 
+            # ----------------------------------------------------------------
+            # REGISTER
+            # ----------------------------------------------------------------
+
             await self.register_session()
+
+            # ----------------------------------------------------------------
+            # HISTÓRICO
+            # ----------------------------------------------------------------
 
             self.messages = [
 
                 {
-                    "role": "system",
-                    "content": self.system_prompt(),
+                    "role":
+                        "system",
+
+                    "content":
+                        self.system_prompt(),
                 },
 
                 {
-                    "role": "user",
-                    "content": user_text,
+                    "role":
+                        "user",
+
+                    "content":
+                        user_text,
                 },
             ]
 
-            final_text = await self.agent_turn(
-                user_text
+            # ----------------------------------------------------------------
+            # OPENAI + GEOCODE
+            # ----------------------------------------------------------------
+
+            agent_text = (
+                await self.agent_turn()
             )
 
-            # --------------------------------------------------------------
-            # Garantia:
-            # se o modelo terminou antes da avaliação, a aplicação
-            # ainda executa evaluate_link automaticamente.
-            # --------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # ESTADO IMEDIATAMENTE APÓS AGENT TURN
+            # ----------------------------------------------------------------
+
+            self.log("")
+            self.log(
+                "========== ESTADO APÓS AGENT TURN =========="
+            )
+
+            self.log(
+                f"geocoded_points = "
+                f"{len(self.geocoded_points)}"
+            )
+
+            self.log(
+                f"evaluate_executed = "
+                f"{self.evaluate_executed}"
+            )
+
+            self.log(
+                f"evaluate_error = "
+                f"{self.evaluate_error}"
+            )
+
+            self.log(
+                f"last_evaluate_result = "
+                f"{self.last_evaluate_result is not None}"
+            )
+
+            self.log(
+                f"last_agent_text = "
+                f"{bool(self.last_agent_text)}"
+            )
+
+            self.log(
+                "============================================"
+            )
+
+            # ----------------------------------------------------------------
+            # FALLBACK DETERMINÍSTICO
+            #
+            # Se temos dois pontos por qualquer motivo e ainda não avaliamos,
+            # a aplicação assume o controle.
+            # ----------------------------------------------------------------
 
             if (
                 len(self.geocoded_points) >= 2
@@ -1966,58 +2920,130 @@ Seu trabalho principal é:
                 and self.evaluate_error is None
             ):
 
+                self.log(
+                    "📡 Fallback determinístico: "
+                    "executando evaluate_link."
+                )
+
                 await self.ensure_evaluate_link()
 
-            # --------------------------------------------------------------
-            # Atualiza mapa
-            # --------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # MAPA FINAL
+            # ----------------------------------------------------------------
 
-            if len(self.geocoded_points) >= 2:
+            if len(
+                self.geocoded_points
+            ) >= 2:
+
+                self.log(
+                    "🗺️ Atualizando mapa final..."
+                )
 
                 self.mostrar_mapa_apos_geocodificacao()
 
-            # --------------------------------------------------------------
-            # Contexto técnico final
-            # --------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # EVALUATE OK
+            # ----------------------------------------------------------------
 
             if self.evaluate_executed:
 
                 self.append_technical_context()
 
-                # ----------------------------------------------------------
-                # Se ainda não houver texto final adequado, fazemos uma
-                # chamada final do modelo usando o resultado técnico.
-                # ----------------------------------------------------------
+                self.log("")
+                self.log(
+                    "🧠 Gerando resposta técnica final..."
+                )
 
-                if not final_text:
+                self.sanitize_messages()
 
-                    final_response = (
-                        await self.openai_chat()
+                final_response = (
+                    await self.openai_chat(
+                        allow_tools=False
                     )
+                )
+
+                final_text = (
+                    self.response_text(
+                        final_response
+                    )
+                )
+
+                if final_text:
+
+                    self.messages.append(
+                        {
+                            "role":
+                                "assistant",
+
+                            "content":
+                                final_text,
+                        }
+                    )
+
+                else:
 
                     final_text = (
-                        self.response_text(
-                            final_response
-                        )
+                        self.last_agent_text
+                        or
+                        "A avaliação do enlace "
+                        "foi concluída."
                     )
 
-                    if final_text:
+            # ----------------------------------------------------------------
+            # EVALUATE COM ERRO
+            # ----------------------------------------------------------------
 
-                        self.messages.append(
-                            {
-                                "role": "assistant",
-                                "content": final_text,
-                            }
-                        )
+            elif self.evaluate_error:
 
-            # --------------------------------------------------------------
-            # Resultado final
-            # --------------------------------------------------------------
+                self.log(
+                    "⚠️ Avaliação não concluída "
+                    "por erro do PlanApp."
+                )
+
+                final_text = (
+                    "Não foi possível concluir "
+                    "a avaliação do enlace. "
+                    "O PlanApp retornou um erro."
+                )
+
+            # ----------------------------------------------------------------
+            # SEM AVALIAÇÃO
+            #
+            # IMPORTANTE:
+            #
+            # Não apagamos mais a resposta do OpenAI.
+            # ----------------------------------------------------------------
+
+            else:
+
+                if self.last_agent_text:
+
+                    final_text = (
+                        self.last_agent_text
+                    )
+
+                elif agent_text:
+
+                    final_text = agent_text
+
+                else:
+
+                    final_text = (
+                        "Não foi possível identificar "
+                        "dois locais válidos para realizar "
+                        "a avaliação do enlace."
+                    )
+
+            # ----------------------------------------------------------------
+            # STATUS FINAL
+            # ----------------------------------------------------------------
+
+            self.log("")
 
             if self.evaluate_error:
 
                 self.log(
-                    "❌ Avaliação do enlace terminou com erro.",
+                    "❌ Avaliação terminou com erro.",
                     "error",
                 )
 
@@ -2030,12 +3056,36 @@ Seu trabalho principal é:
             else:
 
                 self.log(
-                    "ℹ️ Nenhuma avaliação de enlace foi executada."
+                    "⚠️ Nenhuma avaliação foi executada."
                 )
+
+            # ----------------------------------------------------------------
+            # CUSTO
+            # ----------------------------------------------------------------
 
             self.log(
                 "💰 Custo estimado da execução: "
-                f"US$ {self.estimated_total_cost_usd:.6f}"
+                f"US$ "
+                f"{self.estimated_total_cost_usd:.6f}"
+            )
+
+            self.log(
+                f"   Input tokens: "
+                f"{self.input_tokens}"
+            )
+
+            self.log(
+                f"   Output tokens: "
+                f"{self.output_tokens}"
+            )
+
+            self.log(
+                f"   Total tokens: "
+                f"{self.total_tokens}"
+            )
+
+            self.log(
+                "================================================"
             )
 
             return final_text
@@ -2053,7 +3103,9 @@ Seu trabalho principal é:
     # CLOSE
     # ========================================================================
 
-    async def close(self):
+    async def close(
+        self,
+    ):
 
         try:
 
@@ -2062,6 +3114,7 @@ Seu trabalho principal é:
         finally:
 
             self.mcp_session = None
+
             self.openai_client = None
 
             self.log_detail(
@@ -2083,11 +3136,21 @@ async def run_agent(
 ):
 
     agent = PlanAppAgent(
-        progress_callback=progress_callback,
-        map_callback=map_callback,
-        log_callback=log_callback,
-        result_callback=result_callback,
-        visualization_callback=visualization_callback,
+
+        progress_callback=
+            progress_callback,
+
+        map_callback=
+            map_callback,
+
+        log_callback=
+            log_callback,
+
+        result_callback=
+            result_callback,
+
+        visualization_callback=
+            visualization_callback,
     )
 
     try:
