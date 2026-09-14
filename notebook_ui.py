@@ -98,20 +98,6 @@ def iniciar_planapp():
     )
 
     # ========================================================
-    # LOG MCP
-    # ========================================================
-
-    log_execucao = widgets.Output(
-        layout=widgets.Layout(
-            border="1px solid #ddd",
-            padding="8px",
-            height="350px",
-            overflow="auto",
-            width="100%",
-        )
-    )
-
-    # ========================================================
     # RESULTADO TÉCNICO
     # ========================================================
 
@@ -161,7 +147,6 @@ def iniciar_planapp():
 
     estado = {
         "status_count": 0,
-        "log_count": 0,
         "visualizacao_count": 0,
         "mapa_count": 0,
         "resultado_count": 0,
@@ -173,9 +158,59 @@ def iniciar_planapp():
 
     def atualizar_status(mensagem):
 
-        estado["status_count"] += 1
+        if mensagem is None:
+            return
 
-        texto = str(mensagem)
+        texto = str(mensagem).strip()
+
+        if not texto:
+            return
+
+        # ----------------------------------------------------
+        # Segurança:
+        #
+        # O agent_openai atual ainda pode mandar alguns logs
+        # técnicos através do progress_callback.
+        #
+        # Ignoramos aqui mensagens puramente técnicas.
+        # A versão nova do agent_openai terá um callback
+        # separado para status.
+        # ----------------------------------------------------
+
+        mensagens_ignoradas = {
+            "=" * 10,
+            "=" * 20,
+            "=" * 30,
+            "=" * 40,
+            "=" * 50,
+            "=" * 60,
+        }
+
+        if texto in mensagens_ignoradas:
+            return
+
+        if texto.startswith("MCP TOOL:"):
+            return
+
+        if texto.startswith("MCP RESULT:"):
+            return
+
+        if texto.startswith("Argumentos:"):
+            return
+
+        if texto.startswith("Resultado MCP:"):
+            return
+
+        if texto.startswith("Tool:"):
+            return
+
+        if texto.startswith("OpenAI response"):
+            return
+
+        if texto.startswith("Tokens"):
+            return
+
+        estado["status_count"] += 1
 
         status.value = (
             "<b>Status:</b> "
@@ -195,32 +230,6 @@ def iniciar_planapp():
 
             print(
                 f"[ERRO CALLBACK STATUS] {repr(exc)}"
-            )
-
-    # ========================================================
-    # CALLBACK — LOG MCP
-    # ========================================================
-
-    def atualizar_log(mensagem):
-
-        estado["log_count"] += 1
-
-        texto = str(mensagem)
-
-        try:
-
-            with log_execucao:
-
-                print(
-                    f"[LOG #{estado['log_count']}] "
-                    f"{texto}"
-                )
-
-        except Exception as exc:
-
-            # Último recurso: não deixar a exceção desaparecer.
-            print(
-                f"[ERRO CALLBACK LOG] {repr(exc)}"
             )
 
     # ========================================================
@@ -298,27 +307,33 @@ def iniciar_planapp():
 
         try:
 
+            # ------------------------------------------------
+            # Sempre limpar primeiro.
+            # ------------------------------------------------
+
             mapa_output.children = []
 
             if mapa is None:
-
                 return
 
             # ------------------------------------------------
-            # O mapa precisa ser um Widget.
+            # Caso normal:
+            # ipyleaflet.Map é um widgets.Widget.
             # ------------------------------------------------
 
             if isinstance(mapa, widgets.Widget):
 
-                mapa_output.children = [
-                    mapa
-                ]
+                mapa_output.children = (
+                    mapa,
+                )
 
                 return
 
             # ------------------------------------------------
-            # Caso venha um objeto de display/IPython,
-            # colocamos dentro de Output.
+            # Alguns objetos de mapa podem não ser reconhecidos
+            # diretamente como Widget.
+            #
+            # Nesse caso usamos Output + display().
             # ------------------------------------------------
 
             output = widgets.Output(
@@ -331,15 +346,19 @@ def iniciar_planapp():
 
                 display(mapa)
 
-            mapa_output.children = [
-                output
-            ]
+            mapa_output.children = (
+                output,
+            )
 
         except Exception as exc:
 
-            output = widgets.Output()
+            erro = widgets.Output(
+                layout=widgets.Layout(
+                    width="100%",
+                )
+            )
 
-            with output:
+            with erro:
 
                 print(
                     "❌ Erro ao exibir mapa:"
@@ -351,9 +370,9 @@ def iniciar_planapp():
 
                 traceback.print_exc()
 
-            mapa_output.children = [
-                output
-            ]
+            mapa_output.children = (
+                erro,
+            )
 
     # ========================================================
     # CONVERSÃO DE IMAGEM
@@ -447,7 +466,9 @@ def iniciar_planapp():
 
         return widgets.HTML(
             value=(
-                "<pre>"
+                "<pre style='"
+                "white-space:pre-wrap;"
+                "'>"
                 + html.escape(str(item))
                 + "</pre>"
             )
@@ -465,7 +486,7 @@ def iniciar_planapp():
 
             if not visualizacoes:
 
-                visualizacoes_output.children = []
+                visualizacoes_output.children = ()
 
                 return
 
@@ -531,9 +552,9 @@ def iniciar_planapp():
 
                 traceback.print_exc()
 
-            visualizacoes_output.children = [
-                erro
-            ]
+            visualizacoes_output.children = (
+                erro,
+            )
 
     # ========================================================
     # CRIA AGENTE
@@ -542,7 +563,6 @@ def iniciar_planapp():
     agent = PlanAppAgent(
         progress_callback=atualizar_status,
         map_callback=atualizar_mapa,
-        log_callback=atualizar_log,
         result_callback=atualizar_resultado_tecnico,
         visualization_callback=atualizar_visualizacoes,
     )
@@ -567,11 +587,15 @@ def iniciar_planapp():
 
         resposta.value = ""
 
-        mapa_output.children = []
+        mapa_output.children = ()
 
-        visualizacoes_output.children = []
+        visualizacoes_output.children = ()
 
         resultado_tecnico_output.clear_output(
+            wait=True
+        )
+
+        historico_status.clear_output(
             wait=True
         )
 
@@ -581,37 +605,17 @@ def iniciar_planapp():
                 "🟡 Iniciando análise..."
             )
 
-            atualizar_log(
-                "=================================================="
-            )
-
-            atualizar_log(
-                "🚀 INÍCIO DA EXECUÇÃO"
-            )
-
-            atualizar_log(
-                "=================================================="
-            )
-
-            atualizar_log(
-                f"Solicitação: {texto}"
-            )
-
             resultado = await agent.ask(
                 texto
             )
 
-            atualizar_log(
-                "=================================================="
+            atualizar_status(
+                "🟢 Análise concluída."
             )
 
-            atualizar_log(
-                "🏁 EXECUÇÃO FINALIZADA"
-            )
-
-            atualizar_log(
-                "=================================================="
-            )
+            # ------------------------------------------------
+            # Resposta final
+            # ------------------------------------------------
 
             resposta.value = (
                 "<div style='"
@@ -638,29 +642,7 @@ def iniciar_planapp():
                 f"❌ Erro na execução: {exc}"
             )
 
-            try:
-
-                with log_execucao:
-
-                    print("")
-                    print(
-                        "=================================================="
-                    )
-                    print(
-                        "❌ EXCEÇÃO NA INTERFACE"
-                    )
-                    print(
-                        "=================================================="
-                    )
-                    print(
-                        repr(exc)
-                    )
-
-                    traceback.print_exc()
-
-            except Exception:
-
-                pass
+            traceback.print_exc()
 
         finally:
 
@@ -684,15 +666,7 @@ def iniciar_planapp():
                 f"❌ Não foi possível iniciar: {exc}"
             )
 
-            with log_execucao:
-
-                print(
-                    "❌ ERRO AO CRIAR TASK"
-                )
-
-                print(
-                    repr(exc)
-                )
+            traceback.print_exc()
 
     botao_analisar.on_click(
         ao_clicar_analisar
@@ -718,17 +692,13 @@ def iniciar_planapp():
             wait=True
         )
 
-        log_execucao.clear_output(
-            wait=True
-        )
-
         resultado_tecnico_output.clear_output(
             wait=True
         )
 
-        mapa_output.children = []
+        mapa_output.children = ()
 
-        visualizacoes_output.children = []
+        visualizacoes_output.children = ()
 
         # ----------------------------------------------------
         # Fecha agente anterior
@@ -740,9 +710,12 @@ def iniciar_planapp():
                 agent.close()
             )
 
-        except Exception:
+        except Exception as exc:
 
-            pass
+            print(
+                "Erro fechando agente anterior:",
+                repr(exc),
+            )
 
         # ----------------------------------------------------
         # Novo agente
@@ -751,7 +724,6 @@ def iniciar_planapp():
         agent = PlanAppAgent(
             progress_callback=atualizar_status,
             map_callback=atualizar_mapa,
-            log_callback=atualizar_log,
             result_callback=atualizar_resultado_tecnico,
             visualization_callback=atualizar_visualizacoes,
         )
@@ -775,22 +747,6 @@ def iniciar_planapp():
             ),
             status,
             historico_status,
-        ],
-        layout=widgets.Layout(
-            width="100%",
-        ),
-    )
-
-    # ========================================================
-    # PAINEL MCP
-    # ========================================================
-
-    painel_mcp = widgets.VBox(
-        [
-            widgets.HTML(
-                value="<h4>🔧 MCP / Log de execução</h4>"
-            ),
-            log_execucao,
         ],
         layout=widgets.Layout(
             width="100%",
@@ -899,7 +855,6 @@ def iniciar_planapp():
             entrada,
             botoes,
             painel_status,
-            painel_mcp,
             painel_resultado,
             painel_mapa,
             painel_visualizacoes,

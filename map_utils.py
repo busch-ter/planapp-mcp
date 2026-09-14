@@ -11,7 +11,10 @@ from ipyleaflet import (
 
 
 def mostrar_mapa_enlace(
-    agent,
+    tx_lat,
+    tx_lon,
+    rx_lat,
+    rx_lon,
     margin=0.20,
     min_span=0.005,
     min_zoom=10,
@@ -20,44 +23,91 @@ def mostrar_mapa_enlace(
     """
     Cria e retorna o mapa do enlace.
 
+    Parâmetros
+    ----------
+    tx_lat : float
+        Latitude do transmissor.
+
+    tx_lon : float
+        Longitude do transmissor.
+
+    rx_lat : float
+        Latitude do receptor.
+
+    rx_lon : float
+        Longitude do receptor.
+
+    margin : float
+        Margem percentual aplicada aos limites do mapa.
+
+    min_span : float
+        Extensão mínima dos limites em graus.
+
+    min_zoom : int
+        Zoom inicial do mapa.
+
+    max_zoom : int
+        Reservado para controle futuro do zoom máximo.
+
+    Retorno
+    -------
+    ipyleaflet.Map
+        Widget de mapa pronto para ser exibido pelo Jupyter.
+
+    IMPORTANTE
+    ----------
     Esta função NÃO executa display().
     """
 
-    points = getattr(
-        agent,
-        "geocoded_points",
-        []
-    )
+    # ========================================================
+    # COORDENADAS
+    # ========================================================
 
-    if len(points) < 2:
+    try:
+
+        tx_lat = float(tx_lat)
+        tx_lon = float(tx_lon)
+
+        rx_lat = float(rx_lat)
+        rx_lon = float(rx_lon)
+
+    except (TypeError, ValueError) as exc:
 
         raise ValueError(
-            "São necessários pelo menos dois "
-            "pontos geocodificados."
+            "Coordenadas TX/RX inválidas."
+        ) from exc
+
+    # ========================================================
+    # VALIDAÇÃO
+    # ========================================================
+
+    if not (
+        -90.0 <= tx_lat <= 90.0
+    ):
+        raise ValueError(
+            f"Latitude TX inválida: {tx_lat}"
         )
 
-    # ========================================================
-    # TX / RX
-    # ========================================================
+    if not (
+        -180.0 <= tx_lon <= 180.0
+    ):
+        raise ValueError(
+            f"Longitude TX inválida: {tx_lon}"
+        )
 
-    tx = points[0]
-    rx = points[1]
+    if not (
+        -90.0 <= rx_lat <= 90.0
+    ):
+        raise ValueError(
+            f"Latitude RX inválida: {rx_lat}"
+        )
 
-    tx_lat = float(
-        tx["lat"]
-    )
-
-    tx_lon = float(
-        tx["lon"]
-    )
-
-    rx_lat = float(
-        rx["lat"]
-    )
-
-    rx_lon = float(
-        rx["lon"]
-    )
+    if not (
+        -180.0 <= rx_lon <= 180.0
+    ):
+        raise ValueError(
+            f"Longitude RX inválida: {rx_lon}"
+        )
 
     # ========================================================
     # CENTRO
@@ -77,32 +127,32 @@ def mostrar_mapa_enlace(
 
     lat_min = min(
         tx_lat,
-        rx_lat
+        rx_lat,
     )
 
     lat_max = max(
         tx_lat,
-        rx_lat
+        rx_lat,
     )
 
     lon_min = min(
         tx_lon,
-        rx_lon
+        rx_lon,
     )
 
     lon_max = max(
         tx_lon,
-        rx_lon
+        rx_lon,
     )
 
     lat_span = max(
         lat_max - lat_min,
-        min_span
+        min_span,
     )
 
     lon_span = max(
         lon_max - lon_min,
-        min_span
+        min_span,
     )
 
     lat_margin = (
@@ -131,7 +181,7 @@ def mostrar_mapa_enlace(
     m = Map(
         center=(
             center_lat,
-            center_lon
+            center_lon,
         ),
         zoom=min_zoom,
         scroll_wheel_zoom=True,
@@ -148,13 +198,10 @@ def mostrar_mapa_enlace(
     marker_tx = Marker(
         location=(
             tx_lat,
-            tx_lon
+            tx_lon,
         ),
         draggable=False,
-        title=tx.get(
-            "name",
-            "TX"
-        ),
+        title="TX",
     )
 
     # ========================================================
@@ -164,28 +211,25 @@ def mostrar_mapa_enlace(
     marker_rx = Marker(
         location=(
             rx_lat,
-            rx_lon
+            rx_lon,
         ),
         draggable=False,
-        title=rx.get(
-            "name",
-            "RX"
-        ),
+        title="RX",
     )
 
     # ========================================================
-    # LINHA
+    # LINHA DO ENLACE
     # ========================================================
 
     line = Polyline(
         locations=[
             (
                 tx_lat,
-                tx_lon
+                tx_lon,
             ),
             (
                 rx_lat,
-                rx_lon
+                rx_lon,
             ),
         ],
         weight=4,
@@ -208,7 +252,7 @@ def mostrar_mapa_enlace(
     )
 
     # ========================================================
-    # BOUNDS
+    # AJUSTE AUTOMÁTICO DOS LIMITES
     # ========================================================
 
     m.fit_bounds(
@@ -217,14 +261,14 @@ def mostrar_mapa_enlace(
 
     # ========================================================
     # METADADOS
+    #
+    # Mantemos referências aos objetos para que possam ser
+    # acessados posteriormente pela aplicação.
     # ========================================================
 
     m.tx = marker_tx
-
     m.rx = marker_rx
-
     m.link = line
-
     m.link_bounds = bounds
 
     # ========================================================

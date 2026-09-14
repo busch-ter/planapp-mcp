@@ -39,6 +39,19 @@
 # O LLM NÃO escolhe visualizações.
 # O LLM NÃO executa evaluate_link.
 #
+# LOG:
+#
+#   log()
+#       -> arquivo técnico
+#       -> terminal quando DEBUG=True
+#
+#   status()
+#       -> somente interface Jupyter
+#
+# Arquivo:
+#
+#   ~/work/planapp-mcp/logs/planapp_agent_YYYYMMDD.log
+#
 # ============================================================================
 
 
@@ -48,6 +61,7 @@ import json
 import os
 import re
 
+from datetime import datetime
 from contextlib import AsyncExitStack
 
 from openai import AsyncOpenAI
@@ -118,10 +132,36 @@ class PlanAppAgent:
         # --------------------------------------------------------------------
 
         self.progress_callback = progress_callback
+
         self.map_callback = map_callback
+
+        # Mantido por compatibilidade com versões anteriores.
+        # A interface nova não precisa mais utilizá-lo.
         self.log_callback = log_callback
+
         self.result_callback = result_callback
-        self.visualization_callback = visualization_callback
+
+        self.visualization_callback = (
+            visualization_callback
+        )
+
+        # --------------------------------------------------------------------
+        # LOG TÉCNICO
+        # --------------------------------------------------------------------
+
+        self.log_dir = os.path.expanduser(
+            "~/work/planapp-mcp/logs"
+        )
+
+        os.makedirs(
+            self.log_dir,
+            exist_ok=True,
+        )
+
+        self.log_file = os.path.join(
+            self.log_dir,
+            f"planapp_agent_{datetime.now():%Y%m%d}.log",
+        )
 
         # --------------------------------------------------------------------
         # MCP
@@ -218,7 +258,7 @@ class PlanAppAgent:
         self.OUTPUT_PRICE_PER_MILLION = 1.20
 
     # ========================================================================
-    # LOG
+    # LOG TÉCNICO
     # ========================================================================
 
     def log(
@@ -226,20 +266,90 @@ class PlanAppAgent:
         texto,
         tipo="processing",
     ):
+        """
+        Registra informação técnica.
+
+        IMPORTANTE:
+
+        Este método NÃO envia mais mensagens para
+        progress_callback.
+
+        Portanto, logs como:
+
+            ==================================================
+            MCP TOOL
+            Argumentos
+            Resultado MCP
+            JSON
+            tokens
+            custo
+
+        não aparecem mais no painel Status.
+
+        Eles ficam no arquivo técnico e no terminal.
+        """
+
+        if texto is None:
+            return
+
+        texto = str(texto)
+
+        timestamp = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        linha = (
+            f"[{timestamp}] "
+            f"[{str(tipo).upper()}] "
+            f"{texto}"
+        )
+
+        # --------------------------------------------------------------------
+        # Terminal
+        # --------------------------------------------------------------------
 
         if DEBUG:
-            print(texto)
 
-        if self.progress_callback:
+            print(
+                linha
+            )
 
-            try:
-                self.progress_callback(texto)
-            except Exception:
-                pass
+        # --------------------------------------------------------------------
+        # Arquivo
+        # --------------------------------------------------------------------
+
+        try:
+
+            with open(
+                self.log_file,
+                "a",
+                encoding="utf-8",
+            ) as logfile:
+
+                logfile.write(
+                    linha + "\n"
+                )
+
+        except Exception as exc:
+
+            if DEBUG:
+
+                print(
+                    "[ERRO AO ESCREVER LOG] "
+                    f"{repr(exc)}"
+                )
+
+        # --------------------------------------------------------------------
+        # Compatibilidade:
+        #
+        # log_callback antigo pode continuar sendo utilizado por código
+        # externo. A nova notebook_ui não o utiliza.
+        # --------------------------------------------------------------------
 
         if self.log_callback:
 
             try:
+
                 self.log_callback(
                     texto,
                     tipo,
@@ -248,12 +358,77 @@ class PlanAppAgent:
             except TypeError:
 
                 try:
-                    self.log_callback(texto)
+
+                    self.log_callback(
+                        texto
+                    )
+
                 except Exception:
                     pass
 
             except Exception:
                 pass
+
+    # ========================================================================
+    # STATUS — SOMENTE INTERFACE
+    # ========================================================================
+
+    def status(
+        self,
+        mensagem,
+    ):
+        """
+        Envia uma mensagem amigável para a interface.
+
+        O status NÃO deve conter:
+            - JSON;
+            - argumentos MCP;
+            - resultados MCP;
+            - detalhes internos;
+            - separadores;
+            - informações de debug.
+
+        A mensagem também é registrada no log técnico.
+        """
+
+        if mensagem is None:
+            return
+
+        texto = str(
+            mensagem
+        ).strip()
+
+        if not texto:
+            return
+
+        # --------------------------------------------------------------------
+        # Registrar no log técnico
+        # --------------------------------------------------------------------
+
+        self.log(
+            texto,
+            "status",
+        )
+
+        # --------------------------------------------------------------------
+        # Interface
+        # --------------------------------------------------------------------
+
+        if self.progress_callback:
+
+            try:
+
+                self.progress_callback(
+                    texto
+                )
+
+            except Exception as exc:
+
+                self.log(
+                    "Erro no progress_callback: "
+                    f"{repr(exc)}",
+                    "error",
+                )
 
     # ========================================================================
     # LOG DETAIL
@@ -290,11 +465,11 @@ class PlanAppAgent:
         )
 
         self.log(
-            "✅ Cliente OpenAI inicializado."
+            "Cliente OpenAI inicializado."
         )
 
         self.log_detail(
-            f"🤖 Modelo: {OPENAI_MODEL}"
+            f"Modelo: {OPENAI_MODEL}"
         )
 
     # ========================================================================
@@ -305,6 +480,10 @@ class PlanAppAgent:
 
         self.current_stage = (
             "Conectando ao OpenAI/MCP"
+        )
+
+        self.status(
+            "🔌 Conectando ao PlanApp..."
         )
 
         self.log(
@@ -366,7 +545,7 @@ class PlanAppAgent:
         except asyncio.TimeoutError:
 
             self.log(
-                "❌ Timeout de 30s aguardando initialize().",
+                "Timeout de 30s aguardando initialize().",
                 "error",
             )
 
@@ -375,7 +554,7 @@ class PlanAppAgent:
         except Exception as exc:
 
             self.log(
-                f"❌ Erro no initialize(): {exc}",
+                f"Erro no initialize(): {exc}",
                 "error",
             )
 
@@ -394,7 +573,7 @@ class PlanAppAgent:
         )
 
         self.log(
-            f"🔧 MCP conectado: "
+            f"MCP conectado: "
             f"{len(self.mcp_tools)} ferramentas."
         )
 
@@ -403,6 +582,10 @@ class PlanAppAgent:
             self.log_detail(
                 f"   • {tool.name}"
             )
+
+        self.status(
+            "🟢 Conexão com o PlanApp estabelecida."
+        )
 
     # ========================================================================
     # BUILD OPENAI TOOLS
@@ -772,8 +955,6 @@ class PlanAppAgent:
 
     # ========================================================================
     # NORMALIZE RESULT
-    #
-    # Alguns servidores MCP podem devolver JSON como string.
     # ========================================================================
 
     def normalize_result(
@@ -1115,14 +1296,18 @@ class PlanAppAgent:
             point
         )
 
-        self.log(
-            f"📍 Ponto geocodificado: "
-            f"{query or 'local'} "
-            f"({lat:.6f}, {lon:.6f})"
+        self.status(
+            f"📍 Ponto identificado: "
+            f"{query or 'local'}"
         )
 
-        self.log(
-            f"📍 Total de pontos: "
+        self.log_detail(
+            f"Coordenadas: "
+            f"{lat:.6f}, {lon:.6f}"
+        )
+
+        self.log_detail(
+            f"Total de pontos: "
             f"{len(self.geocoded_points)}"
         )
 
@@ -1162,12 +1347,12 @@ class PlanAppAgent:
                 p2 = self.geocoded_points[1]
 
                 self.log_detail(
-                    f"   TX = "
+                    f"TX = "
                     f"{p1['lat']}, {p1['lon']}"
                 )
 
                 self.log_detail(
-                    f"   RX = "
+                    f"RX = "
                     f"{p2['lat']}, {p2['lon']}"
                 )
 
@@ -1591,6 +1776,10 @@ class PlanAppAgent:
 
         elif tool_name == "evaluate_link":
 
+            self.status(
+                "📊 Avaliação técnica do enlace concluída."
+            )
+
             self.log(
                 "📡 evaluate_link retornou com sucesso."
             )
@@ -1734,6 +1923,10 @@ class PlanAppAgent:
             "on_rooftop": on_rooftop,
         }
 
+        self.status(
+            "📡 Avaliando o enlace..."
+        )
+
         self.log(
             "📡 APLICAÇÃO executará evaluate_link."
         )
@@ -1796,6 +1989,10 @@ class PlanAppAgent:
             )
 
             return
+
+        self.status(
+            "📈 Gerando visualizações técnicas..."
+        )
 
         self.log("")
         self.log(
@@ -2018,6 +2215,10 @@ class PlanAppAgent:
                 "⚠️ visualization_callback inexistente."
             )
 
+        self.status(
+            "📈 Visualizações técnicas concluídas."
+        )
+
     # ========================================================================
     # REGISTER
     # ========================================================================
@@ -2045,8 +2246,12 @@ class PlanAppAgent:
 
         self.registered = True
 
+        self.status(
+            "🟢 Sessão PlanApp iniciada."
+        )
+
         self.log(
-            "✅ Sessão PlanApp registrada."
+            "Sessão PlanApp registrada."
         )
 
         return result
@@ -2701,17 +2906,15 @@ REGRAS FUNDAMENTAIS:
 
             # ----------------------------------------------------------------
             # DOIS PONTOS
-            #
-            # IMPORTANTE:
-            #
-            # Não fazemos outra chamada ao OpenAI.
-            #
-            # A aplicação assume o controle imediatamente.
             # ----------------------------------------------------------------
 
             if len(
                 self.geocoded_points
             ) >= 2:
+
+                self.status(
+                    "📍 Os dois pontos do enlace foram identificados."
+                )
 
                 self.log("")
                 self.log(
@@ -2865,6 +3068,10 @@ REGRAS FUNDAMENTAIS:
             # OPENAI + GEOCODE
             # ----------------------------------------------------------------
 
+            self.status(
+                "📍 Identificando os locais do enlace..."
+            )
+
             agent_text = (
                 await self.agent_turn()
             )
@@ -2909,9 +3116,6 @@ REGRAS FUNDAMENTAIS:
 
             # ----------------------------------------------------------------
             # FALLBACK DETERMINÍSTICO
-            #
-            # Se temos dois pontos por qualquer motivo e ainda não avaliamos,
-            # a aplicação assume o controle.
             # ----------------------------------------------------------------
 
             if (
@@ -2948,6 +3152,10 @@ REGRAS FUNDAMENTAIS:
             if self.evaluate_executed:
 
                 self.append_technical_context()
+
+                self.status(
+                    "🤖 Preparando a resposta final..."
+                )
 
                 self.log("")
                 self.log(
@@ -3008,10 +3216,6 @@ REGRAS FUNDAMENTAIS:
 
             # ----------------------------------------------------------------
             # SEM AVALIAÇÃO
-            #
-            # IMPORTANTE:
-            #
-            # Não apagamos mais a resposta do OpenAI.
             # ----------------------------------------------------------------
 
             else:
@@ -3047,16 +3251,28 @@ REGRAS FUNDAMENTAIS:
                     "error",
                 )
 
+                self.status(
+                    "❌ A avaliação não pôde ser concluída."
+                )
+
             elif self.evaluate_executed:
 
                 self.log(
                     "✅ Avaliação do enlace concluída."
                 )
 
+                self.status(
+                    "🟢 Análise concluída."
+                )
+
             else:
 
                 self.log(
                     "⚠️ Nenhuma avaliação foi executada."
+                )
+
+                self.status(
+                    "⚠️ A análise não foi executada."
                 )
 
             # ----------------------------------------------------------------
@@ -3070,17 +3286,17 @@ REGRAS FUNDAMENTAIS:
             )
 
             self.log(
-                f"   Input tokens: "
+                f"Input tokens: "
                 f"{self.input_tokens}"
             )
 
             self.log(
-                f"   Output tokens: "
+                f"Output tokens: "
                 f"{self.output_tokens}"
             )
 
             self.log(
-                f"   Total tokens: "
+                f"Total tokens: "
                 f"{self.total_tokens}"
             )
 
@@ -3095,6 +3311,10 @@ REGRAS FUNDAMENTAIS:
             self.log(
                 f"❌ Erro no PlanApp AI: {exc}",
                 "error",
+            )
+
+            self.status(
+                f"❌ Erro na execução: {exc}"
             )
 
             raise
