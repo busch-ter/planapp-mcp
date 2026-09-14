@@ -8,10 +8,10 @@ import ipywidgets as widgets
 from IPython.display import display
 
 import agent_openai
+import agent_ollama
 
 agent_openai = importlib.reload(agent_openai)
-
-PlanAppAgent = agent_openai.PlanAppAgent
+agent_ollama = importlib.reload(agent_ollama)
 
 
 # ============================================================
@@ -30,6 +30,31 @@ def iniciar_planapp():
             🛰️ PlanApp AI — Planejamento de Enlaces
         </h2>
         """
+    )
+
+    # ========================================================
+    # SELEÇÃO DO AGENTE
+    # ========================================================
+
+    agente_selector = widgets.Dropdown(
+        options=[
+            (
+                "OpenAI (GPT-5.6 Luna)",
+                "openai",
+            ),
+            (
+                "Ollama (Qwen 3 8B)",
+                "ollama",
+            ),
+        ],
+        value="openai",
+        description="🤖 Agente:",
+        layout=widgets.Layout(
+            width="350px",
+        ),
+        style={
+            "description_width": "80px",
+        },
     )
 
     # ========================================================
@@ -153,6 +178,34 @@ def iniciar_planapp():
     }
 
     # ========================================================
+    # CRIAÇÃO DO AGENTE
+    # ========================================================
+
+    def criar_agente(tipo_agente):
+
+        if tipo_agente == "openai":
+
+            return agent_openai.PlanAppAgent(
+                progress_callback=atualizar_status,
+                map_callback=atualizar_mapa,
+                result_callback=atualizar_resultado_tecnico,
+                visualization_callback=atualizar_visualizacoes,
+            )
+
+        if tipo_agente == "ollama":
+
+            return agent_ollama.PlanAppAgent(
+                progress_callback=atualizar_status,
+                map_callback=atualizar_mapa,
+                result_callback=atualizar_resultado_tecnico,
+                visualization_callback=atualizar_visualizacoes,
+            )
+
+        raise ValueError(
+            f"Agente desconhecido: {tipo_agente}"
+        )
+
+    # ========================================================
     # CALLBACK — STATUS
     # ========================================================
 
@@ -169,12 +222,7 @@ def iniciar_planapp():
         # ----------------------------------------------------
         # Segurança:
         #
-        # O agent_openai atual ainda pode mandar alguns logs
-        # técnicos através do progress_callback.
-        #
-        # Ignoramos aqui mensagens puramente técnicas.
-        # A versão nova do agent_openai terá um callback
-        # separado para status.
+        # Ignoramos mensagens puramente técnicas.
         # ----------------------------------------------------
 
         mensagens_ignoradas = {
@@ -557,14 +605,11 @@ def iniciar_planapp():
             )
 
     # ========================================================
-    # CRIA AGENTE
+    # AGENTE INICIAL
     # ========================================================
 
-    agent = PlanAppAgent(
-        progress_callback=atualizar_status,
-        map_callback=atualizar_mapa,
-        result_callback=atualizar_resultado_tecnico,
-        visualization_callback=atualizar_visualizacoes,
+    agent = criar_agente(
+        agente_selector.value
     )
 
     # ========================================================
@@ -585,6 +630,21 @@ def iniciar_planapp():
 
         botao_analisar.disabled = True
 
+        # ----------------------------------------------------
+        # Garante que o agente em uso corresponde à seleção
+        # atual da interface.
+        # ----------------------------------------------------
+
+        agente_selecionado = agente_selector.value
+
+        nonlocal agent
+
+        agente_atual = (
+            "OpenAI (GPT-5.6 Luna)"
+            if agente_selecionado == "openai"
+            else "Ollama (Qwen 3 8B)"
+        )
+
         resposta.value = ""
 
         mapa_output.children = ()
@@ -602,8 +662,44 @@ def iniciar_planapp():
         try:
 
             atualizar_status(
+                f"🤖 Agente selecionado: {agente_atual}"
+            )
+
+            atualizar_status(
                 "🟡 Iniciando análise..."
             )
+
+            # ------------------------------------------------
+            # Se o usuário mudou o agente desde a última
+            # análise, cria um novo agente do tipo escolhido.
+            # ------------------------------------------------
+
+            tipo_atual = getattr(
+                agent,
+                "_planapp_agent_type",
+                None,
+            )
+
+            if tipo_atual != agente_selecionado:
+
+                try:
+
+                    await agent.close()
+
+                except Exception as exc:
+
+                    print(
+                        "Erro fechando agente anterior:",
+                        repr(exc),
+                    )
+
+                agent = criar_agente(
+                    agente_selecionado
+                )
+
+                agent._planapp_agent_type = (
+                    agente_selecionado
+                )
 
             resultado = await agent.ask(
                 texto
@@ -718,18 +814,37 @@ def iniciar_planapp():
             )
 
         # ----------------------------------------------------
-        # Novo agente
+        # Novo agente conforme seleção atual
         # ----------------------------------------------------
 
-        agent = PlanAppAgent(
-            progress_callback=atualizar_status,
-            map_callback=atualizar_mapa,
-            result_callback=atualizar_resultado_tecnico,
-            visualization_callback=atualizar_visualizacoes,
+        try:
+
+            agent = criar_agente(
+                agente_selector.value
+            )
+
+            agent._planapp_agent_type = (
+                agente_selector.value
+            )
+
+        except Exception as exc:
+
+            atualizar_status(
+                f"❌ Erro criando agente: {exc}"
+            )
+
+            traceback.print_exc()
+
+            return
+
+        agente_atual = (
+            "OpenAI (GPT-5.6 Luna)"
+            if agente_selector.value == "openai"
+            else "Ollama (Qwen 3 8B)"
         )
 
         atualizar_status(
-            "🔄 Nova análise pronta."
+            f"🔄 Nova análise pronta — {agente_atual}."
         )
 
     botao_nova.on_click(
@@ -852,6 +967,20 @@ def iniciar_planapp():
     interface = widgets.VBox(
         [
             titulo,
+
+            # ------------------------------------------------
+            # Seletor do agente
+            # ------------------------------------------------
+
+            widgets.HBox(
+                [
+                    agente_selector,
+                ],
+                layout=widgets.Layout(
+                    margin="0 0 8px 0",
+                ),
+            ),
+
             entrada,
             botoes,
             painel_status,
@@ -871,5 +1000,13 @@ def iniciar_planapp():
     # ========================================================
 
     display(interface)
+
+    # --------------------------------------------------------
+    # Marca o tipo do agente inicial.
+    # --------------------------------------------------------
+
+    agent._planapp_agent_type = (
+        agente_selector.value
+    )
 
     return interface, agent
