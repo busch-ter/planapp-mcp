@@ -21,7 +21,7 @@
 #      +--> visualizações
 #      |
 #      v
-#   OpenAI — resposta final
+#   OpenAI — análise técnica final
 #
 #
 # REGRAS ARQUITETURAIS
@@ -29,7 +29,8 @@
 # O OpenAI é responsável por:
 #   - interpretar a solicitação;
 #   - identificar os locais;
-#   - solicitar geocodificação.
+#   - solicitar geocodificação;
+#   - interpretar o resultado técnico final.
 #
 # A aplicação é responsável por:
 #   - evaluate_link;
@@ -38,6 +39,7 @@
 #
 # O LLM NÃO escolhe visualizações.
 # O LLM NÃO executa evaluate_link.
+#
 #
 # LOG:
 #
@@ -48,9 +50,10 @@
 #   status()
 #       -> somente interface Jupyter
 #
-# Arquivo:
+# Cada execução possui seu próprio arquivo:
 #
-#   ~/work/planapp-mcp/logs/planapp_agent_YYYYMMDD.log
+#   ~/work/planapp-mcp/logs/
+#       planapp_agent_YYYYMMDD_HHMMSS.log
 #
 # ============================================================================
 
@@ -158,9 +161,27 @@ class PlanAppAgent:
             exist_ok=True,
         )
 
+        # --------------------------------------------------------------------
+        # IMPORTANTE:
+        #
+        # Cada instância do agente recebe um arquivo próprio.
+        #
+        # Exemplo:
+        #
+        # planapp_agent_20260914_154237.log
+        #
+        # Assim múltiplas execuções no mesmo dia não compartilham
+        # nem sobrescrevem o mesmo arquivo.
+        # --------------------------------------------------------------------
+
+        self.log_started_at = datetime.now()
+
         self.log_file = os.path.join(
             self.log_dir,
-            f"planapp_agent_{datetime.now():%Y%m%d}.log",
+            (
+                "planapp_agent_"
+                f"{self.log_started_at:%Y%m%d_%H%M%S}.log"
+            ),
         )
 
         # --------------------------------------------------------------------
@@ -1632,6 +1653,60 @@ class PlanAppAgent:
                 )
 
     # ========================================================================
+    # BUILD TECHNICAL ANALYSIS CONTEXT
+    # ========================================================================
+
+    def build_technical_analysis_context(
+        self,
+    ):
+        """
+        Monta um contexto técnico estruturado para o GPT.
+
+        O backend continua sendo a fonte de verdade.
+        Este método apenas organiza os dados para que o modelo
+        possa interpretá-los de forma mais útil.
+        """
+
+        result = self.normalize_result(
+            self.last_evaluate_result
+        )
+
+        context = {
+
+            "link_parameters": {
+                "frequency_mhz":
+                    self.requested_frequency_mhz
+                    if self.requested_frequency_mhz
+                    is not None
+                    else 900,
+
+                "tx_height_m":
+                    self.requested_tx_ha
+                    if self.requested_tx_ha
+                    is not None
+                    else 7,
+
+                "rx_height_m":
+                    self.requested_rx_ha
+                    if self.requested_rx_ha
+                    is not None
+                    else 7,
+
+                "on_rooftop":
+                    self.requested_on_rooftop,
+            },
+
+            "endpoints": (
+                self.geocoded_points[:2]
+            ),
+
+            "official_planapp_result":
+                result,
+        }
+
+        return context
+
+    # ========================================================================
     # EXECUTE MCP TOOL
     # ========================================================================
 
@@ -2270,36 +2345,54 @@ class PlanAppAgent:
         if self.technical_context_added:
             return
 
-        technical_context = {
-
-            "status": "OK",
-
-            "technical_result":
-                self.last_evaluate_result,
-
-        }
+        technical_context = (
+            self.build_technical_analysis_context()
+        )
 
         self.messages.append(
             {
                 "role": "user",
 
                 "content": (
-                    "O resultado técnico oficial "
-                    "do PlanApp para o enlace é:\n"
+                    "A avaliação técnica já foi "
+                    "executada pela aplicação PlanApp.\n\n"
+
+                    "A seguir está o contexto técnico "
+                    "oficial da execução:\n\n"
+
                     +
                     json.dumps(
                         technical_context,
                         ensure_ascii=False,
+                        indent=2,
                         default=str,
                     )
+
                     +
+
                     "\n\n"
                     "Use estes dados como fonte de "
-                    "verdade para sua resposta final. "
-                    "Não invente valores técnicos. "
-                    "A avaliação já foi executada "
-                    "pela aplicação. "
-                    "Não diga que ela será executada."
+                    "verdade para sua resposta final.\n\n"
+
+                    "IMPORTANTE:\n"
+                    "- Não invente valores.\n"
+                    "- Não recalcule o enlace.\n"
+                    "- Não altere os valores fornecidos.\n"
+                    "- Não execute nenhuma ferramenta.\n"
+                    "- Interprete tecnicamente os resultados.\n"
+                    "- Explique o significado dos principais "
+                    "indicadores.\n"
+                    "- Considere frequência, alturas TX/RX "
+                    "e rooftop.\n"
+                    "- Considere distância, FSPL, difração, "
+                    "clearance, terreno, vegetação, "
+                    "edificações e picos de terreno quando "
+                    "esses dados estiverem disponíveis.\n"
+                    "- O status do PlanApp deve ser tratado "
+                    "como a classificação oficial da avaliação.\n"
+                    "- Não transforme 'OK' em uma garantia "
+                    "absoluta de qualidade ou disponibilidade "
+                    "do enlace."
                 ),
             }
         )
@@ -2307,8 +2400,8 @@ class PlanAppAgent:
         self.technical_context_added = True
 
         self.log_detail(
-            "🧠 Resultado técnico adicionado "
-            "ao contexto do OpenAI."
+            "🧠 Resultado técnico estruturado "
+            "adicionado ao contexto do OpenAI."
         )
 
     # ========================================================================
@@ -2323,14 +2416,38 @@ class PlanAppAgent:
 Você é o PlanApp AI, assistente técnico especializado
 em planejamento e avaliação de enlaces de rádio.
 
-REGRAS FUNDAMENTAIS:
+Sua função é auxiliar o usuário na interpretação técnica
+de resultados produzidos pelo PlanApp.
+
+======================================================================
+ARQUITETURA
+======================================================================
+
+O PlanApp possui duas responsabilidades distintas:
+
+OPENAI:
+- interpretar a solicitação;
+- identificar os locais;
+- solicitar geocodificação;
+- interpretar o resultado técnico final.
+
+APLICAÇÃO:
+- executar evaluate_link;
+- gerar o mapa;
+- gerar todas as visualizações;
+- calcular os resultados técnicos.
+
+======================================================================
+REGRAS FUNDAMENTAIS
+======================================================================
 
 1. O PlanApp é a fonte de verdade para resultados técnicos.
 
 2. Nunca invente coordenadas.
 
 3. Nunca invente distância, FSPL, frequência,
-   altura, perda ou qualquer resultado técnico.
+   altura, perda, clearance, difração ou qualquer
+   outro resultado técnico.
 
 4. Use geocode_place para encontrar coordenadas
    dos locais mencionados pelo usuário.
@@ -2361,6 +2478,10 @@ REGRAS FUNDAMENTAIS:
 12. Se uma ferramenta retornar erro,
     informe o erro de forma objetiva.
 
+======================================================================
+PARÂMETROS
+======================================================================
+
 13. Frequência:
     - 450 MHz = 450 MHz
     - 450 GHz = 450000 MHz
@@ -2381,19 +2502,142 @@ REGRAS FUNDAMENTAIS:
 
 18. Preserve rooftop/telhado/teto quando informado.
 
+======================================================================
+ANÁLISE TÉCNICA FINAL
+======================================================================
+
+Quando o resultado técnico oficial estiver disponível,
+NÃO se limite a repetir os números retornados pelo PlanApp.
+
+Sua tarefa é transformar os resultados numéricos
+em uma análise técnica clara e útil.
+
+A resposta deve:
+
+1. Apresentar o status oficial do PlanApp.
+
+2. Informar os principais parâmetros da execução:
+   - frequência;
+   - altura TX;
+   - altura RX;
+   - rooftop;
+   - distância.
+
+3. Interpretar o FSPL.
+
+4. Interpretar o resultado de difração,
+   sem inventar um limite de aprovação que não
+   esteja definido pelo PlanApp.
+
+5. Interpretar os valores de clearance.
+
+6. Analisar separadamente:
+   - terreno;
+   - vegetação;
+   - edificações.
+
+7. Quando existirem picos de terreno,
+   indicar sua posição normalizada no percurso
+   e explicar sua relevância.
+
+8. Se não houver contribuição de edificações,
+   informar explicitamente que não foram identificadas
+   obstruções por edificações no perfil analisado.
+
+9. Se houver contribuição de terreno ou vegetação,
+   explicar que esses elementos influenciam o perfil
+   de propagação.
+
+10. Não afirmar que todo o enlace está livre de obstrução
+    apenas porque o clearance em TX e RX é positivo.
+
+11. Não afirmar que um enlace é "excelente",
+    "garantido", "perfeito" ou equivalente sem
+    suporte explícito nos dados.
+
+12. Não transformar "OK" em garantia absoluta.
+    Diga que o enlace foi classificado como OK
+    segundo os critérios do PlanApp.
+
+13. Não diga que a avaliação apenas "foi processada
+    com sucesso". Interprete o resultado.
+
+14. Se frequência ou alturas estiverem disponíveis
+    no contexto da execução, informe-as.
+    Não diga que estão ausentes.
+
+======================================================================
+ESTRUTURA RECOMENDADA
+======================================================================
+
+Use uma estrutura semelhante a:
+
+## Análise do enlace
+
+Apresente:
+- Status
+- Distância
+- Frequência
+- Alturas TX/RX
+- Rooftop
+- FSPL
+- Difração
+- Clearance
+
+## Perfil do enlace
+
+Explique:
+- terreno;
+- vegetação;
+- edificações;
+- relação desses fatores com o perfil.
+
+## Pontos críticos
+
+Explique:
+- principais picos de terreno;
+- posição normalizada;
+- clearance;
+- outros fatores relevantes disponíveis.
+
+## Conclusão
+
+Faça uma conclusão objetiva de 2 ou 3 frases,
+respondendo essencialmente:
+
+"O que os resultados do PlanApp indicam
+sobre este enlace?"
+
+======================================================================
+ESTILO
+======================================================================
+
+- Português técnico e claro.
+- Evite texto excessivamente genérico.
+- Evite repetir números sem explicação.
+- Prefira frases que relacionem o número ao
+  comportamento do enlace.
+- Não faça recomendações de engenharia que não
+  possam ser sustentadas pelos dados.
+- Não invente margem de enlace, potência,
+  sensibilidade, disponibilidade ou modulação.
+- Não invente critérios de aprovação.
+
+======================================================================
+OUTRAS REGRAS
+======================================================================
+
 19. Não diga que uma visualização foi gerada
     sem confirmação da aplicação.
 
 20. Se o resultado técnico estiver presente,
     considere a avaliação concluída.
 
-21. Responda de forma objetiva e técnica.
-
-22. Se a solicitação não fornecer dois locais,
+21. Se a solicitação não fornecer dois locais,
     explique o que está faltando em vez de afirmar
     que houve falha de avaliação.
 
-23. Não diga que "não foram obtidos dois pontos"
+22. Não diga que "não foram obtidos dois pontos"
     se você ainda não tentou geocodificar os locais
     presentes na solicitação.
 """
@@ -3027,6 +3271,20 @@ REGRAS FUNDAMENTAIS:
             "================================================"
         )
 
+        # --------------------------------------------------------------------
+        # Identificação da execução no log
+        # --------------------------------------------------------------------
+
+        self.log(
+            f"📁 Log da execução: "
+            f"{self.log_file}"
+        )
+
+        self.log_detail(
+            f"🕒 Início da execução: "
+            f"{self.log_started_at:%Y-%m-%d %H:%M:%S}"
+        )
+
         try:
 
             # ----------------------------------------------------------------
@@ -3159,7 +3417,7 @@ REGRAS FUNDAMENTAIS:
 
                 self.log("")
                 self.log(
-                    "🧠 Gerando resposta técnica final..."
+                    "🧠 Gerando análise técnica final..."
                 )
 
                 self.sanitize_messages()
