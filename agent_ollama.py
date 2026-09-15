@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 from contextlib import AsyncExitStack
@@ -43,6 +44,8 @@ DEFAULT_RX_HA = 7
 DEFAULT_ON_ROOFTOP = False
 
 MAX_AGENT_ITERATIONS = 12
+
+LOG_DIR = os.path.expanduser("~/work/planapp-mcp/logs")
 
 
 # ============================================================
@@ -148,6 +151,68 @@ class PlanAppAgent:
 
         self.visualizations = []
 
+        # ----------------------------------------------------
+        # Log em arquivo — um arquivo por execução
+        # ----------------------------------------------------
+        self.file_logger = None
+        self.file_log_handler = None
+        self.log_file_path = None
+
+
+    # ========================================================
+    # LOG EM ARQUIVO
+    # ========================================================
+
+    def start_file_log(self):
+        """Cria um arquivo de log independente para esta execução."""
+
+        self.close_file_log()
+        os.makedirs(LOG_DIR, exist_ok=True)
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file_path = os.path.join(
+            LOG_DIR,
+            f"planapp_agent_ollama_{timestamp}.log",
+        )
+
+        logger_name = f"planapp_agent_ollama_{id(self)}"
+        self.file_logger = logging.getLogger(logger_name)
+        self.file_logger.setLevel(logging.DEBUG)
+        self.file_logger.propagate = False
+
+        self.file_log_handler = logging.FileHandler(
+            self.log_file_path, encoding="utf-8"
+        )
+        self.file_log_handler.setLevel(logging.DEBUG)
+        self.file_log_handler.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        self.file_logger.addHandler(self.file_log_handler)
+
+        self.file_logger.info("=" * 80)
+        self.file_logger.info("PLANAPP AI — OLLAMA / QWEN")
+        self.file_logger.info("Log iniciado")
+        self.file_logger.info(f"Modelo: {OLLAMA_MODEL}")
+        self.file_logger.info(f"MCP_URL: {MCP_URL}")
+        self.file_logger.info(f"USER_ID: {USER_ID}")
+        self.file_logger.info("=" * 80)
+
+    def close_file_log(self):
+        """Fecha e remove o handler do log em arquivo."""
+        if self.file_logger is not None and self.file_log_handler is not None:
+            try:
+                self.file_logger.removeHandler(self.file_log_handler)
+            except Exception:
+                pass
+            try:
+                self.file_log_handler.close()
+            except Exception:
+                pass
+        self.file_log_handler = None
+        self.file_logger = None
+
 
     # ========================================================
     # STATUS
@@ -160,6 +225,12 @@ class PlanAppAgent:
         Argumentos e resultados brutos do MCP NÃO devem passar
         por este método.
         """
+
+        if self.file_logger:
+            try:
+                self.file_logger.info(str(message))
+            except Exception:
+                pass
 
         if self.progress_callback:
             try:
@@ -176,6 +247,12 @@ class PlanAppAgent:
         """
         Envia logs técnicos para o painel de log MCP.
         """
+
+        if self.file_logger:
+            try:
+                self.file_logger.info(str(message))
+            except Exception:
+                pass
 
         if self.log_callback:
             try:
@@ -1103,8 +1180,14 @@ COMPORTAMENTO DA RESPOSTA:
 
         try:
 
+            p1 = self.geocoded_points[0]
+            p2 = self.geocoded_points[1]
+
             self.map = mostrar_mapa_enlace(
-                self
+                p1["lat"],
+                p1["lon"],
+                p2["lat"],
+                p2["lon"],
             )
 
             if self.map_callback:
@@ -2019,6 +2102,14 @@ COMPORTAMENTO DA RESPOSTA:
     ):
 
         # ----------------------------------------------------
+        # Log em arquivo desta execução
+        # ----------------------------------------------------
+
+        self.start_file_log()
+        self.log_detail("Solicitação do usuário:")
+        self.log_detail(str(text))
+
+        # ----------------------------------------------------
         # Reset da execução
         # ----------------------------------------------------
 
@@ -2207,6 +2298,12 @@ COMPORTAMENTO DA RESPOSTA:
                 "🟡 Análise concluída sem avaliação técnica."
             )
 
+        self.log_detail("=" * 80)
+        self.log_detail("Análise finalizada.")
+        if self.log_file_path:
+            self.log_detail(f"Arquivo de log: {self.log_file_path}")
+        self.log_detail("=" * 80)
+
         return resultado
 
 
@@ -2225,3 +2322,4 @@ COMPORTAMENTO DA RESPOSTA:
             self.mcp_session = None
             self.mcp_tools = []
             self.connected = False
+            self.close_file_log()

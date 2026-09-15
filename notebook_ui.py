@@ -9,9 +9,11 @@ from IPython.display import display
 
 import agent_openai
 import agent_ollama
+import agent_openrouter
 
 agent_openai = importlib.reload(agent_openai)
 agent_ollama = importlib.reload(agent_ollama)
+agent_openrouter = importlib.reload(agent_openrouter)
 
 
 # ============================================================
@@ -45,6 +47,10 @@ def iniciar_planapp():
             (
                 "Ollama (Qwen 3 8B)",
                 "ollama",
+            ),
+            (
+                "OpenRouter",
+                "openrouter",
             ),
         ],
         value="openai",
@@ -195,6 +201,15 @@ def iniciar_planapp():
         if tipo_agente == "ollama":
 
             return agent_ollama.PlanAppAgent(
+                progress_callback=atualizar_status,
+                map_callback=atualizar_mapa,
+                result_callback=atualizar_resultado_tecnico,
+                visualization_callback=atualizar_visualizacoes,
+            )
+
+        if tipo_agente == "openrouter":
+
+            return agent_openrouter.PlanAppAgent(
                 progress_callback=atualizar_status,
                 map_callback=atualizar_mapa,
                 result_callback=atualizar_resultado_tecnico,
@@ -639,11 +654,27 @@ def iniciar_planapp():
 
         nonlocal agent
 
-        agente_atual = (
-            "OpenAI (GPT-5.6 Luna)"
-            if agente_selecionado == "openai"
-            else "Ollama (Qwen 3 8B)"
-        )
+        if agente_selecionado == "openai":
+
+            agente_atual = (
+                "OpenAI (GPT-5.6 Luna)"
+            )
+
+        elif agente_selecionado == "ollama":
+
+            agente_atual = (
+                "Ollama (Qwen 3 8B)"
+            )
+
+        elif agente_selecionado == "openrouter":
+
+            agente_atual = (
+                "OpenRouter"
+            )
+
+        else:
+
+            agente_atual = agente_selecionado
 
         resposta.value = ""
 
@@ -837,11 +868,27 @@ def iniciar_planapp():
 
             return
 
-        agente_atual = (
-            "OpenAI (GPT-5.6 Luna)"
-            if agente_selector.value == "openai"
-            else "Ollama (Qwen 3 8B)"
-        )
+        if agente_selector.value == "openai":
+
+            agente_atual = (
+                "OpenAI (GPT-5.6 Luna)"
+            )
+
+        elif agente_selector.value == "ollama":
+
+            agente_atual = (
+                "Ollama (Qwen 3 8B)"
+            )
+
+        elif agente_selector.value == "openrouter":
+
+            agente_atual = (
+                "OpenRouter"
+            )
+
+        else:
+
+            agente_atual = agente_selector.value
 
         atualizar_status(
             f"🔄 Nova análise pronta — {agente_atual}."
