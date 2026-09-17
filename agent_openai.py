@@ -14,8 +14,10 @@
 #    v
 # aplicação -> evaluate_link
 #    |
-#    +--> mapa
+#    +--> mapa interativo
 #    +--> visualizações
+#    |
+#    +--> relatório técnico / PDF
 #    |
 #    v
 # análise técnica final
@@ -24,6 +26,7 @@
 # ============================================================
 
 import asyncio
+import base64
 import json
 import os
 
@@ -42,10 +45,8 @@ from agent_common import (
     APPLICATION_CONTROLLED_TOOLS,
 )
 
+from report_generator import ReportGenerator
 
-# ============================================================
-# OPENAI
-# ============================================================
 
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
@@ -61,28 +62,15 @@ OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY"
 )
 
-
 MAX_AGENT_ITERATIONS = 8
 
 
-# ============================================================
-# PREÇOS
-# ============================================================
-
 INPUT_PRICE_PER_MILLION = 0.20
-
 CACHED_INPUT_PRICE_PER_MILLION = 0.02
-
 OUTPUT_PRICE_PER_MILLION = 1.20
 
 
-# ============================================================
-# AGENTE
-# ============================================================
-
-class PlanAppAgent(
-    PlanAppAgentCommon
-):
+class PlanAppAgent(PlanAppAgentCommon):
 
     AGENT_NAME = "PLANAPP AI — OPENAI"
 
@@ -103,17 +91,7 @@ class PlanAppAgent(
             visualization_callback=visualization_callback,
         )
 
-
-        # --------------------------------------------------------
-        # OpenAI
-        # --------------------------------------------------------
-
         self.client = None
-
-
-        # --------------------------------------------------------
-        # Estado OpenAI
-        # --------------------------------------------------------
 
         self.registered = False
 
@@ -123,32 +101,36 @@ class PlanAppAgent(
 
         self.last_response_id = None
 
+        self.technical_report = ""
 
-        # --------------------------------------------------------
-        # Usage
-        # --------------------------------------------------------
+        # SOLICITAÇÃO ORIGINAL DO USUÁRIO
+        self.user_request = ""
 
+        self.report_pdf_path = None
+
+        # MAPA
+        self.map = None
+        self.map_image_bytes = None
+
+        # VISUALIZAÇÕES
+        self.visualizations = []
+        self.visualization_images = []
+
+        # USAGE / CUSTOS
         self.input_tokens = 0
-
         self.cached_input_tokens = 0
-
         self.output_tokens = 0
 
         self.input_cost = 0.0
-
         self.cached_input_cost = 0.0
-
         self.output_cost = 0.0
-
         self.total_cost = 0.0
 
-
-    # ============================================================
+    # ========================================================================
     # SYSTEM PROMPT
-    # ============================================================
+    # ========================================================================
 
     def system_prompt(self):
-
         return """
 Você é o PlanApp AI, assistente técnico do PlanApp.
 
@@ -157,90 +139,74 @@ O PlanApp é a fonte oficial dos resultados técnicos.
 REGRAS:
 
 1. Nunca invente valores.
-
 2. Nunca invente unidades.
-
 3. Nunca altere resultados retornados pelo PlanApp.
-
 4. Não recalcule valores técnicos quando o PlanApp já os forneceu.
-
-5. Quando o usuário fornecer duas localidades, utilize
-   geocode_place para obter suas coordenadas.
-
-6. Depois de obtidos os dois pontos, a aplicação executará
-   automaticamente evaluate_link.
-
+5. Quando o usuário fornecer duas localidades, utilize geocode_place para obter suas coordenadas.
+6. Depois de obtidos os dois pontos, a aplicação executará automaticamente evaluate_link.
 7. NÃO execute evaluate_link diretamente.
-
 8. evaluate_link é controlado pela aplicação.
-
 9. Mapa e visualizações também são controlados pela aplicação.
-
 10. Não peça ao usuário para executar ferramentas.
-
 11. Preserve frequência, TX, RX e rooftop solicitados.
-
 12. Frequências podem ser informadas em GHz, MHz, kHz ou Hz.
-
 13. Padrões:
        900 MHz
        TX 7 m
        RX 7 m
        rooftop=false
-
 14. FSPL significa perda de percurso em espaço livre.
-
 15. FSPL não significa interferência.
-
-16. Não conclua viabilidade do enlace sem dados suficientes.
-
+16. Não conclua viabilidade do enlace sem um critério técnico explícito.
 17. Não invente potência TX.
-
 18. Não invente ganho de antena.
-
 19. Não invente sensibilidade do receptor.
-
 20. Não invente margem de enlace.
-
-21. Não interprete campos sem definição explícita.
-
-22. Não atribua significado próprio a core, fresnel,
-    boundary, delta_diffra, VV, v_v ou d_norm.
-
+21. Não atribua significado físico a campos cuja definição não esteja explicitamente documentada pelo PlanApp.
+22. Não atribua significado próprio a core, fresnel, boundary, delta_diffra, VV, v_v ou d_norm.
 23. Não converta radianos para graus.
+24. status OK significa somente que a execução foi realizada com sucesso.
+25. O resultado fornecido pela aplicação é a fonte de verdade.
+26. O relatório técnico fornecido pela aplicação é apenas uma apresentação estruturada dos dados reais do PlanApp.
+27. Não altere, recalcule ou contradiga os valores presentes no relatório técnico.
+28. Diferencie claramente parâmetros solicitados pelo usuário de parâmetros efetivamente enviados ao PlanApp.
+29. Se um campo técnico não tiver definição explícita, apresente o valor somente como resultado retornado pelo PlanApp, sem atribuir significado adicional.
 
-24. status OK significa somente que a execução foi realizada
-    com sucesso.
-
-25. A resposta final deve ser em português do Brasil.
-
-26. Seja técnico, claro e objetivo.
-
-27. O resultado fornecido pela aplicação é a fonte de verdade.
+30. A resposta técnica NÃO deve ser apenas uma reprodução do JSON.
+31. Organize os resultados em seções claras.
+32. Faça uma síntese objetiva dos resultados efetivamente retornados.
+33. Pode comparar numericamente valores que já foram retornados pelo PlanApp.
+34. Pode destacar diferenças entre parâmetros solicitados e parâmetros efetivamente utilizados.
+35. Pode destacar distância, FSPL, delta_diffra, resultados de terreno, vegetação, edificações e resultados geométricos quando esses valores estiverem presentes.
+36. Ao apresentar conjuntos como terreno, vegetação ou edificações, deixe claro que são resultados retornados pelo PlanApp.
+37. Não atribua interpretação física adicional aos nomes dos campos quando sua definição não estiver documentada.
+38. Informe quais etapas foram efetivamente executadas quando essa informação estiver disponível.
+39. Diferencie claramente:
+       - dados fornecidos pelo usuário;
+       - parâmetros efetivamente utilizados;
+       - resultados retornados pelo PlanApp;
+       - limitações da interpretação.
+40. Não declare o enlace como viável ou inviável sem um critério técnico explícito.
+41. Não invente uma margem, limiar, classificação ou conclusão de engenharia que não esteja presente nos dados.
+42. A resposta final deve ser em português do Brasil.
+43. Seja técnico, claro, objetivo e informativo.
+44. Prefira uma análise estruturada a uma simples listagem de campos.
 """
 
-
-    # ============================================================
-    # OPENAI CLIENT
-    # ============================================================
+    # ========================================================================
+    # OPENAI
+    # ========================================================================
 
     async def connect_openai(self):
 
         if not OPENAI_API_KEY:
-
             raise RuntimeError(
                 "OPENAI_API_KEY não encontrada."
             )
 
-
         self.client = AsyncOpenAI(
             api_key=OPENAI_API_KEY
         )
-
-
-    # ============================================================
-    # OPENAI TOOLS
-    # ============================================================
 
     def build_openai_tools(self):
 
@@ -260,7 +226,6 @@ REGRAS:
             if name in APPLICATION_CONTROLLED_TOOLS:
                 continue
 
-
             schema = getattr(
                 tool,
                 "input_schema",
@@ -275,45 +240,34 @@ REGRAS:
                     None,
                 )
 
-
             if schema is None:
 
                 schema = {
-                    "type":
-                        "object",
-
-                    "properties":
-                        {},
+                    "type": "object",
+                    "properties": {},
                 }
 
-
-            tools.append({
-
-                "type":
-                    "function",
-
-                "name":
-                    name,
-
-                "description":
-                    getattr(
-                        tool,
-                        "description",
-                        "",
-                    )
-                    or "",
-
-                "parameters":
-                    schema,
-            })
-
+            tools.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": (
+                        getattr(
+                            tool,
+                            "description",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "parameters": schema,
+                }
+            )
 
         return tools
 
-
-    # ============================================================
+    # ========================================================================
     # USAGE
-    # ============================================================
+    # ========================================================================
 
     def update_usage(
         self,
@@ -329,13 +283,11 @@ REGRAS:
         if usage is None:
             return
 
-
         input_tokens = getattr(
             usage,
             "input_tokens",
             0,
         ) or 0
-
 
         output_tokens = getattr(
             usage,
@@ -343,16 +295,13 @@ REGRAS:
             0,
         ) or 0
 
-
         cached_tokens = 0
-
 
         details = getattr(
             usage,
             "input_tokens_details",
             None,
         )
-
 
         if details:
 
@@ -361,7 +310,6 @@ REGRAS:
                 "cached_tokens",
                 0,
             ) or 0
-
 
         self.input_tokens += (
             input_tokens
@@ -375,13 +323,11 @@ REGRAS:
             cached_tokens
         )
 
-
         normal_input_tokens = max(
             input_tokens
             - cached_tokens,
             0,
         )
-
 
         self.input_cost += (
             normal_input_tokens
@@ -389,13 +335,11 @@ REGRAS:
             * INPUT_PRICE_PER_MILLION
         )
 
-
         self.cached_input_cost += (
             cached_tokens
             / 1_000_000
             * CACHED_INPUT_PRICE_PER_MILLION
         )
-
 
         self.output_cost += (
             output_tokens
@@ -403,13 +347,11 @@ REGRAS:
             * OUTPUT_PRICE_PER_MILLION
         )
 
-
         self.total_cost = (
             self.input_cost
             + self.cached_input_cost
             + self.output_cost
         )
-
 
         self.log_detail(
             "OpenAI usage: "
@@ -419,11 +361,6 @@ REGRAS:
             f"cost=${self.total_cost:.6f}"
         )
 
-
-    # ============================================================
-    # RESPONSES API
-    # ============================================================
-
     async def openai_chat(
         self,
         input_data,
@@ -432,30 +369,18 @@ REGRAS:
     ):
 
         if self.client is None:
-
             await self.connect_openai()
 
-
         kwargs = {
-
-            "model":
-                OPENAI_MODEL,
-
-            "input":
-                input_data,
-
+            "model": OPENAI_MODEL,
+            "input": input_data,
             "reasoning": {
-
-                "effort":
-                    OPENAI_REASONING_EFFORT,
+                "effort": OPENAI_REASONING_EFFORT
             },
         }
 
-
         if tools:
-
             kwargs["tools"] = tools
-
 
         if previous_response_id:
 
@@ -463,34 +388,21 @@ REGRAS:
                 "previous_response_id"
             ] = previous_response_id
 
-
-        response = await (
-            self.client.responses.create(
-                **kwargs
-            )
+        response = await self.client.responses.create(
+            **kwargs
         )
-
 
         self.update_usage(
             response
         )
 
-
-        self.last_response_id = (
-            getattr(
-                response,
-                "id",
-                None,
-            )
+        self.last_response_id = getattr(
+            response,
+            "id",
+            None,
         )
 
-
         return response
-
-
-    # ============================================================
-    # NORMALIZA OUTPUT
-    # ============================================================
 
     def response_text(
         self,
@@ -503,21 +415,16 @@ REGRAS:
             None,
         )
 
-
         if text:
-
             return text
 
-
         parts = []
-
 
         output = getattr(
             response,
             "output",
             None,
         ) or []
-
 
         for item in output:
 
@@ -527,40 +434,31 @@ REGRAS:
                 None,
             )
 
+            if item_type != "message":
+                continue
 
-            if item_type == "message":
+            content = getattr(
+                item,
+                "content",
+                None,
+            ) or []
 
-                content = getattr(
-                    item,
-                    "content",
+            for block in content:
+
+                block_text = getattr(
+                    block,
+                    "text",
                     None,
-                ) or []
+                )
 
-
-                for block in content:
-
-                    block_text = getattr(
-                        block,
-                        "text",
-                        None,
+                if block_text:
+                    parts.append(
+                        block_text
                     )
-
-
-                    if block_text:
-
-                        parts.append(
-                            block_text
-                        )
-
 
         return "\n".join(
             parts
         ).strip()
-
-
-    # ============================================================
-    # TOOL CALLS
-    # ============================================================
 
     def response_tool_calls(
         self,
@@ -569,13 +467,11 @@ REGRAS:
 
         calls = []
 
-
         output = getattr(
             response,
             "output",
             None,
         ) or []
-
 
         for item in output:
 
@@ -585,10 +481,8 @@ REGRAS:
                 None,
             )
 
-
             if item_type != "function_call":
                 continue
-
 
             name = getattr(
                 item,
@@ -596,13 +490,11 @@ REGRAS:
                 None,
             )
 
-
             arguments = getattr(
                 item,
                 "arguments",
                 "{}",
             )
-
 
             call_id = getattr(
                 item,
@@ -610,26 +502,19 @@ REGRAS:
                 None,
             )
 
-
-            calls.append({
-
-                "name":
-                    name,
-
-                "arguments":
-                    arguments,
-
-                "call_id":
-                    call_id,
-            })
-
+            calls.append(
+                {
+                    "name": name,
+                    "arguments": arguments,
+                    "call_id": call_id,
+                }
+            )
 
         return calls
 
-
-    # ============================================================
-    # APPEND TECHNICAL CONTEXT
-    # ============================================================
+    # ========================================================================
+    # CONTEXTO TÉCNICO
+    # ========================================================================
 
     def append_technical_context(
         self,
@@ -642,193 +527,25 @@ REGRAS:
             )
         )
 
-
-        self.messages.append({
-
-            "role":
-                "user",
-
-            "content":
-                json.dumps(
+        self.messages.append(
+            {
+                "role": "user",
+                "content": json.dumps(
                     context,
                     ensure_ascii=False,
                     default=str,
                 ),
-        })
-
+            }
+        )
 
         self.technical_context_added = True
 
-
-    # ============================================================
-    # AGENT TURN
-    # ============================================================
-
-    async def agent_turn(self):
-
-        for _ in range(
-            MAX_AGENT_ITERATIONS
-        ):
-
-            response = await (
-                self.openai_chat(
-                    self.messages,
-                    self.build_openai_tools(),
-                    self.last_response_id,
-                )
-            )
-
-
-            tool_calls = (
-                self.response_tool_calls(
-                    response
-                )
-            )
-
-
-            text = self.response_text(
-                response
-            )
-
-
-            if text:
-
-                self.last_agent_text = (
-                    text
-                )
-
-
-            if not tool_calls:
-
-                if (
-                    len(
-                        self.geocoded_points
-                    ) >= 2
-                    and
-                    not self.evaluate_executed
-                ):
-
-                    result = await (
-                        self.ensure_evaluate_link()
-                    )
-
-
-                    if result is not None:
-
-                        self.append_technical_context(
-                            result
-                        )
-
-                        self.last_response_id = None
-
-                        continue
-
-
-                return text
-
-
-            # ----------------------------------------------------
-            # Tool calls
-            # ----------------------------------------------------
-
-            tool_outputs = []
-
-
-            for call in tool_calls:
-
-                name = call["name"]
-
-
-                if name in APPLICATION_CONTROLLED_TOOLS:
-
-                    self.log_detail(
-                        "⚠️ Ferramenta "
-                        f"{name} é controlada "
-                        "pela aplicação."
-                    )
-
-                    continue
-
-
-                try:
-
-                    arguments = json.loads(
-                        call["arguments"]
-                        or "{}"
-                    )
-
-                except Exception:
-
-                    arguments = {}
-
-
-                result = await (
-                    self.execute_mcp_tool(
-                        name,
-                        arguments,
-                    )
-                )
-
-
-                tool_outputs.append({
-
-                    "type":
-                        "function_call_output",
-
-                    "call_id":
-                        call["call_id"],
-
-                    "output":
-                        json.dumps(
-                            result,
-                            ensure_ascii=False,
-                            default=str,
-                        ),
-                })
-
-
-            if tool_outputs:
-
-                self.messages.extend(
-                    tool_outputs
-                )
-
-
-            if (
-                len(
-                    self.geocoded_points
-                ) >= 2
-                and
-                not self.evaluate_executed
-            ):
-
-                result = await (
-                    self.ensure_evaluate_link()
-                )
-
-
-                if result is not None:
-
-                    self.append_technical_context(
-                        result
-                    )
-
-                    self.last_response_id = None
-
-
-        return (
-            "Não foi possível concluir "
-            "o processamento dentro do "
-            "limite de iterações."
-        )
-
-
-    # ============================================================
+    # ========================================================================
     # MAPA
-    # ============================================================
+    # ========================================================================
 
     async def mostrar_mapa_apos_geocodificacao(
-        self
+        self,
     ):
 
         if len(
@@ -837,28 +554,35 @@ REGRAS:
 
             return
 
-
         try:
 
             from map_utils import (
                 mostrar_mapa_enlace,
+                gerar_imagem_mapa_enlace,
             )
 
+            p1 = (
+                self.geocoded_points[0]
+            )
 
-            p1 = self.geocoded_points[0]
+            p2 = (
+                self.geocoded_points[1]
+            )
 
-            p2 = self.geocoded_points[1]
+            tx_lat = p1["lat"]
+            tx_lon = p1["lon"]
 
+            rx_lat = p2["lat"]
+            rx_lon = p2["lon"]
 
             self.map = (
                 mostrar_mapa_enlace(
-                    p1["lat"],
-                    p1["lon"],
-                    p2["lat"],
-                    p2["lon"],
+                    tx_lat,
+                    tx_lon,
+                    rx_lat,
+                    rx_lon,
                 )
             )
-
 
             if self.map_callback:
 
@@ -866,6 +590,19 @@ REGRAS:
                     self.map
                 )
 
+            self.map_image_bytes = (
+                gerar_imagem_mapa_enlace(
+                    tx_lat,
+                    tx_lon,
+                    rx_lat,
+                    rx_lon,
+                )
+            )
+
+            self.log_detail(
+                "Imagem estática do mapa OSM "
+                "preparada para o relatório."
+            )
 
         except Exception as exc:
 
@@ -873,15 +610,12 @@ REGRAS:
                 f"⚠️ Erro no mapa: {exc}"
             )
 
-
-    # ============================================================
+    # ========================================================================
     # VISUALIZAÇÕES
-    #
-    # Mantida como ponto específico do agente.
-    # ============================================================
+    # ========================================================================
 
     async def gerar_visualizacoes(
-        self
+        self,
     ):
 
         if not self.evaluate_executed:
@@ -890,57 +624,42 @@ REGRAS:
         if self.evaluate_error:
             return
 
-
         tools = [
-
             (
                 "link_area",
-                {
-                    "ds_string": "DTM"
-                },
+                {"ds_string": "DTM"},
                 "DTM",
             ),
-
             (
                 "link_area",
-                {
-                    "ds_string": "DSM"
-                },
+                {"ds_string": "DSM"},
                 "DSM",
             ),
-
             (
                 "link_area",
-                {
-                    "ds_string": "COVER"
-                },
+                {"ds_string": "COVER"},
                 "COVER",
             ),
-
             (
                 "link_profile",
                 {},
                 "Perfil",
             ),
-
             (
                 "lulc_fresnel",
                 {},
                 "LULC / Fresnel",
             ),
-
             (
                 "bldg_prepare",
                 {},
                 "Buildings prepare",
             ),
-
             (
                 "bldg_fresnel",
                 {},
                 "Buildings / Fresnel",
             ),
-
             (
                 "bldg_profile",
                 {},
@@ -948,9 +667,9 @@ REGRAS:
             ),
         ]
 
-
         self.visualizations = []
 
+        self.visualization_images = []
 
         for (
             tool_name,
@@ -960,13 +679,12 @@ REGRAS:
 
             try:
 
-                raw = await (
-                    self.execute_mcp_tool_raw(
+                raw = (
+                    await self.execute_mcp_tool_raw(
                         tool_name,
                         arguments,
                     )
                 )
-
 
                 parsed = (
                     self.parse_mcp_result(
@@ -974,50 +692,65 @@ REGRAS:
                     )
                 )
 
-
                 if not isinstance(
                     parsed,
                     dict,
                 ):
-
+                    self.log_detail(
+                        f"⚠️ {title}: resultado não é um objeto."
+                    )
                     continue
-
 
                 if parsed.get(
                     "kind"
                 ) != "image":
 
+                    self.log_detail(
+                        f"⚠️ {title}: resultado não contém imagem."
+                    )
                     continue
-
 
                 data = parsed.get(
                     "data"
                 )
 
-
                 if not data:
+                    self.log_detail(
+                        f"⚠️ {title}: imagem sem dados."
+                    )
                     continue
 
-
                 image_bytes = (
-                    __import__(
-                        "base64"
-                    ).b64decode(
+                    base64.b64decode(
                         data
                     )
                 )
 
-
                 image = widgets.Image(
-                    value=image_bytes
+                    value=image_bytes,
+                    format="png",
+                    layout=widgets.Layout(
+                        width="100%",
+                        height="auto",
+                    ),
                 )
-
 
                 self.visualizations.append(
                     image
                 )
 
+                self.visualization_images.append(
+                    {
+                        "title": title,
+                        "data": image_bytes,
+                        "mime_type": "image/png",
+                    }
+                )
 
+                # IMPORTANTE:
+                # O callback recebe UMA imagem e o título.
+                # O notebook_ui.py adiciona essa imagem
+                # incrementalmente ao VBox.
                 if self.visualization_callback:
 
                     self.visualization_callback(
@@ -1025,6 +758,9 @@ REGRAS:
                         title,
                     )
 
+                self.log_detail(
+                    f"Visualização preparada: {title}"
+                )
 
             except Exception as exc:
 
@@ -1033,15 +769,404 @@ REGRAS:
                     f"{title}: {exc}"
                 )
 
+        self.log_detail(
+            "Total de visualizações "
+            f"preparadas: "
+            f"{len(self.visualization_images)}"
+        )
 
-    # ============================================================
-    # FINAL RESPONSE
-    # ============================================================
+    # ========================================================================
+    # RELATÓRIO
+    # ========================================================================
+
+    def build_report(
+        self,
+        technical_result,
+    ):
+
+        requested_parameters = {
+            "frequency": getattr(
+                self,
+                "requested_frequency",
+                None,
+            ),
+            "frequency_unit": getattr(
+                self,
+                "requested_frequency_unit",
+                None,
+            ),
+            "frequency_text": getattr(
+                self,
+                "requested_frequency_text",
+                None,
+            ),
+            "tx_ha": getattr(
+                self,
+                "requested_tx_ha",
+                None,
+            ),
+            "rx_ha": getattr(
+                self,
+                "requested_rx_ha",
+                None,
+            ),
+        }
+
+        link_parameters = getattr(
+            self,
+            "link_parameters",
+            {},
+        )
+
+        if not isinstance(
+            link_parameters,
+            dict,
+        ):
+
+            link_parameters = {}
+
+        effective_parameters = {
+            "freq_mhz": link_parameters.get(
+                "freq_mhz",
+                DEFAULT_FREQ_MHZ,
+            ),
+            "tx_ha": link_parameters.get(
+                "tx_ha",
+                DEFAULT_TX_HA,
+            ),
+            "rx_ha": link_parameters.get(
+                "rx_ha",
+                DEFAULT_RX_HA,
+            ),
+            "on_rooftop": link_parameters.get(
+                "on_rooftop",
+                DEFAULT_ON_ROOFTOP,
+            ),
+        }
+
+        # --------------------------------------------------------------------
+        # GARANTIR IMAGEM DO MAPA
+        # --------------------------------------------------------------------
+
+        if (
+            self.map_image_bytes is None
+            and len(
+                self.geocoded_points
+            ) >= 2
+        ):
+
+            try:
+
+                from map_utils import (
+                    gerar_imagem_mapa_enlace
+                )
+
+                p1 = (
+                    self.geocoded_points[0]
+                )
+
+                p2 = (
+                    self.geocoded_points[1]
+                )
+
+                self.map_image_bytes = (
+                    gerar_imagem_mapa_enlace(
+                        p1["lat"],
+                        p1["lon"],
+                        p2["lat"],
+                        p2["lon"],
+                    )
+                )
+
+            except Exception as exc:
+
+                self.log_detail(
+                    "⚠️ Não foi possível "
+                    "gerar imagem do mapa "
+                    "para o relatório: "
+                    f"{exc}"
+                )
+
+        # --------------------------------------------------------------------
+        # GERADOR
+        # --------------------------------------------------------------------
+
+        generator = ReportGenerator(
+            requested_params=requested_parameters,
+            effective_params=effective_parameters,
+            technical_result=technical_result,
+            geocoded_points=self.geocoded_points,
+            map_image=self.map_image_bytes,
+            visualization_images=self.visualization_images,
+            user_request=self.user_request,
+        )
+
+        report = generator.generate_report(
+            include_raw_result=False
+        )
+
+        self.technical_report = report
+
+        # --------------------------------------------------------------------
+        # PDF
+        # --------------------------------------------------------------------
+
+        pdf_path = generator.generate_pdf(
+            report_text=report,
+            include_raw_result=False,
+        )
+
+        self.report_pdf_path = pdf_path
+
+        self.log_detail(
+            "Relatório PDF gerado: "
+            f"{pdf_path}"
+        )
+
+        self.log_detail(
+            "Mapa no relatório: "
+            + (
+                "SIM"
+                if self.map_image_bytes
+                else "NÃO"
+            )
+        )
+
+        self.log_detail(
+            "Visualizações no relatório: "
+            f"{len(self.visualization_images)}"
+        )
+
+        return report
+
+    # ========================================================================
+    # AGENT TURN
+    # ========================================================================
+
+    async def agent_turn(
+        self,
+    ):
+
+        response = await self.openai_chat(
+            self.messages,
+            self.build_openai_tools(),
+            previous_response_id=None,
+        )
+
+        for iteration in range(
+            MAX_AGENT_ITERATIONS
+        ):
+
+            tool_calls = (
+                self.response_tool_calls(
+                    response
+                )
+            )
+
+            text = self.response_text(
+                response
+            )
+
+            if text:
+                self.last_agent_text = text
+
+            if not tool_calls:
+
+                if (
+                    len(
+                        self.geocoded_points
+                    ) >= 2
+                    and not self.evaluate_executed
+                ):
+
+                    result = (
+                        await self.ensure_evaluate_link()
+                    )
+
+                    if result is not None:
+
+                        self.append_technical_context(
+                            result
+                        )
+
+                        response = (
+                            await self.openai_chat(
+                                self.messages,
+                                self.build_openai_tools(),
+                                previous_response_id=None,
+                            )
+                        )
+
+                        continue
+
+                return text
+
+            tool_outputs = []
+
+            for call in tool_calls:
+
+                name = call["name"]
+
+                call_id = call[
+                    "call_id"
+                ]
+
+                if not call_id:
+
+                    self.log_detail(
+                        f"⚠️ Tool call {name} "
+                        "não possui call_id."
+                    )
+
+                    continue
+
+                if name in APPLICATION_CONTROLLED_TOOLS:
+
+                    self.log_detail(
+                        f"⚠️ Ferramenta {name} "
+                        "é controlada pela aplicação."
+                    )
+
+                    continue
+
+                try:
+
+                    arguments = json.loads(
+                        call["arguments"]
+                        or "{}"
+                    )
+
+                except Exception as exc:
+
+                    self.log_detail(
+                        f"⚠️ Argumentos inválidos "
+                        f"para {name}: {exc}"
+                    )
+
+                    arguments = {}
+
+                self.log_detail(
+                    f"Executando ferramenta MCP: "
+                    f"{name}"
+                )
+
+                result = (
+                    await self.execute_mcp_tool(
+                        name,
+                        arguments,
+                    )
+                )
+
+                tool_outputs.append(
+                    {
+                        "type":
+                            "function_call_output",
+                        "call_id":
+                            call_id,
+                        "output":
+                            json.dumps(
+                                result,
+                                ensure_ascii=False,
+                                default=str,
+                            ),
+                    }
+                )
+
+            if tool_outputs:
+
+                response_id = getattr(
+                    response,
+                    "id",
+                    None,
+                )
+
+                if not response_id:
+
+                    raise RuntimeError(
+                        "A resposta da OpenAI "
+                        "contendo function_call "
+                        "não possui response.id."
+                    )
+
+                response = (
+                    await self.openai_chat(
+                        tool_outputs,
+                        self.build_openai_tools(),
+                        previous_response_id=response_id,
+                    )
+                )
+
+                if (
+                    len(
+                        self.geocoded_points
+                    ) >= 2
+                    and not self.evaluate_executed
+                ):
+
+                    result = (
+                        await self.ensure_evaluate_link()
+                    )
+
+                    if result is not None:
+
+                        self.append_technical_context(
+                            result
+                        )
+
+                        response = (
+                            await self.openai_chat(
+                                self.messages,
+                                self.build_openai_tools(),
+                                previous_response_id=None,
+                            )
+                        )
+
+                continue
+
+            if (
+                len(
+                    self.geocoded_points
+                ) >= 2
+                and not self.evaluate_executed
+            ):
+
+                result = (
+                    await self.ensure_evaluate_link()
+                )
+
+                if result is not None:
+
+                    self.append_technical_context(
+                        result
+                    )
+
+                    response = (
+                        await self.openai_chat(
+                            self.messages,
+                            self.build_openai_tools(),
+                            previous_response_id=None,
+                        )
+                    )
+
+                    continue
+
+            return text
+
+        return (
+            "Não foi possível concluir "
+            "o processamento dentro do "
+            "limite de iterações."
+        )
+
+    # ========================================================================
+    # RESPOSTA FINAL
+    # ========================================================================
 
     async def generate_final_response(
         self,
         original_text,
         technical_result,
+        technical_report=None,
     ):
 
         context = (
@@ -1050,69 +1175,116 @@ REGRAS:
             )
         )
 
+        if technical_report is None:
+            technical_report = ""
 
         input_data = [
-
             {
-                "role":
-                    "system",
-
-                "content":
-                    self.system_prompt(),
+                "role": "system",
+                "content": self.system_prompt(),
             },
-
             {
-                "role":
-                    "user",
-
-                "content":
-                    original_text,
+                "role": "user",
+                "content": original_text,
             },
-
             {
-                "role":
-                    "user",
-
-                "content":
-                    json.dumps(
-                        context,
-                        ensure_ascii=False,
-                        default=str,
-                    ),
-            },
-
-            {
-                "role":
-                    "user",
-
-                "content":
-                    (
-                        "Produza a resposta técnica "
-                        "final em português do Brasil. "
-                        "Use exclusivamente os dados "
-                        "retornados pelo PlanApp."
-                    ),
+                "role": "user",
+                "content": json.dumps(
+                    context,
+                    ensure_ascii=False,
+                    default=str,
+                ),
             },
         ]
 
+        if technical_report:
 
-        response = await (
-            self.openai_chat(
-                input_data,
-                tools=None,
-                previous_response_id=None,
+            input_data.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "RELATÓRIO TÉCNICO "
+                        "GERADO PELA APLICAÇÃO:\n\n"
+                        + technical_report
+                    ),
+                }
             )
+
+        input_data.append(
+            {
+                "role": "user",
+                "content": """
+Produza a análise técnica final em português do Brasil.
+
+Use exclusivamente os dados retornados pelo PlanApp e, quando disponível, o relatório técnico gerado pela aplicação.
+
+A resposta deve ser organizada e informativa, e não apenas uma reprodução do JSON.
+
+Estruture a resposta, quando houver dados suficientes, contemplando:
+
+1. Identificação do enlace
+   - localidades TX e RX;
+   - coordenadas;
+   - distância, se retornada.
+
+2. Parâmetros
+   - frequência solicitada;
+   - altura TX solicitada;
+   - altura RX solicitada;
+   - rooftop solicitado;
+   - parâmetros efetivamente utilizados pelo PlanApp.
+
+3. Resultados principais
+   - FSPL;
+   - delta_diffra;
+   - outros resultados principais efetivamente retornados.
+
+4. Resultados dos dados geoespaciais
+   - terreno;
+   - vegetação/COVER;
+   - edificações;
+   - outros conjuntos retornados.
+
+5. Resultados geométricos
+   - apresente os valores retornados pelo PlanApp;
+   - não atribua significado físico a campos cuja definição não esteja explicitamente documentada.
+
+6. Execução
+   - indique objetivamente quais etapas foram executadas quando essa informação estiver disponível.
+
+7. Observações e limitações
+   - diferencie dados efetivamente calculados pelo PlanApp de interpretações que exigiriam critérios técnicos adicionais.
+
+IMPORTANTE:
+
+- Não invente valores.
+- Não altere valores.
+- Não altere unidades.
+- Não faça cálculos técnicos adicionais.
+- Não transforme radianos em graus.
+- Não invente potência, ganho, sensibilidade, margem ou limiares.
+- Não atribua significado próprio a core, fresnel, boundary, delta_diffra, VV, v_v ou d_norm.
+- Não declare o enlace como viável ou inviável sem um critério técnico explícito.
+- Não diga que um enlace está "bom", "ruim", "aprovado" ou "reprovado" sem um critério documentado.
+- Quando um valor não tiver definição explícita, apresente-o simplesmente como resultado retornado pelo PlanApp.
+- Faça uma síntese técnica clara dos dados disponíveis.
+""",
+            }
         )
 
+        response = await self.openai_chat(
+            input_data,
+            tools=None,
+            previous_response_id=None,
+        )
 
         return self.response_text(
             response
         )
 
-
-    # ============================================================
+    # ========================================================================
     # ASK
-    # ============================================================
+    # ========================================================================
 
     async def ask(
         self,
@@ -1125,9 +1297,7 @@ REGRAS:
                 "OPENAI_API_KEY não encontrada."
             )
 
-
         self.reset_common_state()
-
 
         self.registered = False
 
@@ -1137,6 +1307,22 @@ REGRAS:
 
         self.last_response_id = None
 
+        self.technical_report = ""
+
+        self.report_pdf_path = None
+
+        # IMPORTANTE:
+        # guardar exatamente a solicitação recebida
+        # para utilização posterior no relatório.
+        self.user_request = text
+
+        self.map = None
+
+        self.map_image_bytes = None
+
+        self.visualizations = []
+
+        self.visualization_images = []
 
         self.input_tokens = 0
 
@@ -1152,11 +1338,9 @@ REGRAS:
 
         self.total_cost = 0.0
 
-
         self.extract_link_parameters(
             text
         )
-
 
         await self.connect_openai()
 
@@ -1164,46 +1348,29 @@ REGRAS:
 
         await self.register()
 
-
         self.messages = [
-
             {
-                "role":
-                    "system",
-
-                "content":
-                    self.system_prompt(),
+                "role": "system",
+                "content": self.system_prompt(),
             },
-
             {
-                "role":
-                    "user",
-
-                "content":
-                    text,
+                "role": "user",
+                "content": text,
             },
         ]
 
-
         await self.agent_turn()
-
-
-        # --------------------------------------------------------
-        # Garantia final de evaluate_link
-        # --------------------------------------------------------
 
         if (
             len(
                 self.geocoded_points
             ) >= 2
-            and
-            not self.evaluate_executed
+            and not self.evaluate_executed
         ):
 
-            result = await (
-                self.ensure_evaluate_link()
+            result = (
+                await self.ensure_evaluate_link()
             )
-
 
             if result is not None:
 
@@ -1211,17 +1378,26 @@ REGRAS:
                     result
                 )
 
+        if len(
+            self.geocoded_points
+        ) >= 2:
 
-        # --------------------------------------------------------
-        # Resposta técnica final
-        # --------------------------------------------------------
+            await self.mostrar_mapa_apos_geocodificacao()
+
+        if (
+            self.evaluate_executed
+            and not self.evaluate_error
+        ):
+
+            await self.gerar_visualizacoes()
 
         if self.evaluate_executed:
 
-            answer = await (
-                self.generate_final_response(
+            answer = (
+                await self.generate_final_response(
                     text,
                     self.last_evaluate_result,
+                    technical_report=None,
                 )
             )
 
@@ -1229,33 +1405,14 @@ REGRAS:
 
             answer = self.last_agent_text
 
-
-        # --------------------------------------------------------
-        # Mapa final
-        # --------------------------------------------------------
-
-        if (
-            len(
-                self.geocoded_points
-            ) >= 2
-            and
-            self.map is None
-        ):
-
-            await (
-                self.mostrar_mapa_apos_geocodificacao()
-            )
-
-
         return answer
 
-
-    # ============================================================
+    # ========================================================================
     # CLOSE
-    # ============================================================
+    # ========================================================================
 
     async def close(
-        self
+        self,
     ):
 
         await super().close()

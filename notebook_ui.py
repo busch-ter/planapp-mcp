@@ -2,22 +2,37 @@ import asyncio
 import html
 import importlib
 import json
+import re
 import traceback
+from pathlib import Path
 
 import ipywidgets as widgets
-from IPython.display import display
+from IPython.display import display, FileLink
 
 import agent_openai
 import agent_ollama
 import agent_openrouter
 
-agent_openai = importlib.reload(agent_openai)
-agent_ollama = importlib.reload(agent_ollama)
-agent_openrouter = importlib.reload(agent_openrouter)
+
+# ============================================================
+# RELOAD DOS AGENTES
+# ============================================================
+
+agent_openai = importlib.reload(
+    agent_openai
+)
+
+agent_ollama = importlib.reload(
+    agent_ollama
+)
+
+agent_openrouter = importlib.reload(
+    agent_openrouter
+)
 
 
 # ============================================================
-# INTERFACE PLANAPP AI
+# PLANAPP AI
 # ============================================================
 
 def iniciar_planapp():
@@ -56,10 +71,10 @@ def iniciar_planapp():
         value="openai",
         description="🤖 Agente:",
         layout=widgets.Layout(
-            width="350px",
+            width="350px"
         ),
         style={
-            "description_width": "80px",
+            "description_width": "80px"
         },
     )
 
@@ -70,8 +85,9 @@ def iniciar_planapp():
     entrada = widgets.Textarea(
         value="",
         placeholder=(
-            "Exemplo: Analise um enlace entre a Praça da República "
-            "e o Largo do Paissandu em São Paulo."
+            "Exemplo: Analise um enlace entre "
+            "a Praça da República e o Largo "
+            "do Paissandu em São Paulo."
         ),
         layout=widgets.Layout(
             width="100%",
@@ -88,7 +104,17 @@ def iniciar_planapp():
         button_style="primary",
         icon="search",
         layout=widgets.Layout(
-            width="180px",
+            width="180px"
+        ),
+    )
+
+    botao_relatorio = widgets.Button(
+        description="📄 Gerar relatório técnico",
+        button_style="success",
+        icon="file-text",
+        disabled=True,
+        layout=widgets.Layout(
+            width="220px"
         ),
     )
 
@@ -96,17 +122,18 @@ def iniciar_planapp():
         description="🔄 Nova análise",
         icon="refresh",
         layout=widgets.Layout(
-            width="150px",
+            width="150px"
         ),
     )
 
     botoes = widgets.HBox(
         [
             botao_analisar,
+            botao_relatorio,
             botao_nova,
         ],
         layout=widgets.Layout(
-            margin="8px 0 12px 0",
+            margin="8px 0 12px 0"
         ),
     )
 
@@ -115,7 +142,10 @@ def iniciar_planapp():
     # ========================================================
 
     status = widgets.HTML(
-        value="<b>Status:</b> Aguardando solicitação."
+        value=(
+            "<b>Status:</b> "
+            "Aguardando solicitação."
+        )
     )
 
     historico_status = widgets.Output(
@@ -143,13 +173,34 @@ def iniciar_planapp():
     )
 
     # ========================================================
+    # RELATÓRIO
+    # ========================================================
+
+    relatorio_output = widgets.Output(
+        layout=widgets.Layout(
+            border="1px solid #ddd",
+            padding="10px",
+            max_height="900px",
+            overflow="auto",
+            width="100%",
+        )
+    )
+
+    relatorio_download = widgets.Output(
+        layout=widgets.Layout(
+            padding="8px 10px",
+            width="100%",
+        )
+    )
+
+    # ========================================================
     # VISUALIZAÇÕES
     # ========================================================
 
     visualizacoes_output = widgets.VBox(
         [],
         layout=widgets.Layout(
-            width="100%",
+            width="100%"
         ),
     )
 
@@ -160,20 +211,33 @@ def iniciar_planapp():
     mapa_output = widgets.VBox(
         [],
         layout=widgets.Layout(
-            width="100%",
+            width="100%"
         ),
     )
 
     # ========================================================
-    # RESPOSTA DO AGENTE
+    # RESPOSTA FINAL
+    #
+    # IMPORTANTE:
+    # Voltamos a usar HTML aqui.
+    #
+    # O problema anterior aconteceu porque Output + Markdown
+    # estava deixando a renderização da resposta dependente
+    # do contexto de display do notebook.
     # ========================================================
 
     resposta = widgets.HTML(
-        value=""
+        value="",
+        layout=widgets.Layout(
+            width="100%",
+            border="1px solid #ddd",
+            padding="12px",
+            margin="10px 0 0 0",
+        ),
     )
 
     # ========================================================
-    # CONTADORES
+    # ESTADO
     # ========================================================
 
     estado = {
@@ -181,13 +245,251 @@ def iniciar_planapp():
         "visualizacao_count": 0,
         "mapa_count": 0,
         "resultado_count": 0,
+        "analise_concluida": False,
+        "relatorio_gerado": False,
+        "ultimo_resultado": None,
     }
+
+    # ========================================================
+    # LIMPAR MARKDOWN GERADO PELO MODELO
+    # ========================================================
+
+    def limpar_markdown_resposta(
+        texto
+    ):
+
+        texto = str(
+            texto
+        )
+
+        substituicoes = [
+            (
+                r"\###",
+                "###",
+            ),
+            (
+                r"\##",
+                "##",
+            ),
+            (
+                r"\#",
+                "#",
+            ),
+            (
+                r"\*\*",
+                "**",
+            ),
+            (
+                r"\*",
+                "*",
+            ),
+            (
+                r"\-",
+                "-",
+            ),
+            (
+                r"\`",
+                "`",
+            ),
+        ]
+
+        for origem, destino in substituicoes:
+
+            texto = texto.replace(
+                origem,
+                destino,
+            )
+
+        return texto.strip()
+
+    # ========================================================
+    # RENDERIZAR RESPOSTA FINAL
+    # ========================================================
+
+    def renderizar_resposta(
+        texto
+    ):
+
+        if texto is None:
+
+            texto = ""
+
+        texto = str(
+            texto
+        ).strip()
+
+        # ----------------------------------------------------
+        # FALLBACK
+        #
+        # Caso a chamada ask() tenha retornado vazio, tenta
+        # recuperar o último texto produzido pelo agente.
+        # ----------------------------------------------------
+
+        if not texto:
+
+            texto_agente = getattr(
+                agent,
+                "last_agent_text",
+                "",
+            )
+
+            if texto_agente:
+
+                texto = str(
+                    texto_agente
+                ).strip()
+
+        if not texto:
+
+            texto = (
+                "⚠️ O agente não retornou "
+                "texto de análise."
+            )
+
+        texto = limpar_markdown_resposta(
+            texto
+        )
+
+        # ----------------------------------------------------
+        # ESCAPE HTML
+        # ----------------------------------------------------
+
+        texto = html.escape(
+            texto
+        )
+
+        # ----------------------------------------------------
+        # TÍTULOS
+        # ----------------------------------------------------
+
+        texto = re.sub(
+            r"^### (.+)$",
+            r"<h4 style='margin:14px 0 6px 0;'>\1</h4>",
+            texto,
+            flags=re.MULTILINE,
+        )
+
+        texto = re.sub(
+            r"^## (.+)$",
+            r"<h3 style='margin:16px 0 7px 0;'>\1</h3>",
+            texto,
+            flags=re.MULTILINE,
+        )
+
+        texto = re.sub(
+            r"^# (.+)$",
+            r"<h2 style='margin:18px 0 8px 0;'>\1</h2>",
+            texto,
+            flags=re.MULTILINE,
+        )
+
+        # ----------------------------------------------------
+        # NEGRITO
+        # ----------------------------------------------------
+
+        texto = re.sub(
+            r"\*\*(.+?)\*\*",
+            r"<b>\1</b>",
+            texto,
+        )
+
+        # ----------------------------------------------------
+        # CÓDIGO INLINE
+        # ----------------------------------------------------
+
+        texto = re.sub(
+            r"`([^`]+)`",
+            r"<code>\1</code>",
+            texto,
+        )
+
+        # ----------------------------------------------------
+        # PROCESSAMENTO DAS LINHAS
+        # ----------------------------------------------------
+
+        linhas = texto.split(
+            "\n"
+        )
+
+        resultado_html = []
+
+        lista_aberta = False
+
+        for linha in linhas:
+
+            linha = linha.strip()
+
+            if linha.startswith(
+                "- "
+            ):
+
+                if not lista_aberta:
+
+                    resultado_html.append(
+                        "<ul style='margin-top:6px;'>"
+                    )
+
+                    lista_aberta = True
+
+                resultado_html.append(
+                    "<li>"
+                    + linha[2:]
+                    + "</li>"
+                )
+
+            else:
+
+                if lista_aberta:
+
+                    resultado_html.append(
+                        "</ul>"
+                    )
+
+                    lista_aberta = False
+
+                if linha:
+
+                    resultado_html.append(
+                        "<p style='margin:7px 0;'>"
+                        + linha
+                        + "</p>"
+                    )
+
+        if lista_aberta:
+
+            resultado_html.append(
+                "</ul>"
+            )
+
+        corpo = "\n".join(
+            resultado_html
+        )
+
+        resposta.value = (
+            "<div style='"
+            "font-family:Arial,sans-serif;"
+            "font-size:14px;"
+            "line-height:1.6;"
+            "color:#222;"
+            "'>"
+            "<div style='"
+            "font-size:16px;"
+            "font-weight:bold;"
+            "margin-bottom:12px;"
+            "'>"
+            "💬 Resposta do PlanApp AI"
+            "</div>"
+            + corpo
+            + "</div>"
+        )
 
     # ========================================================
     # CRIAÇÃO DO AGENTE
     # ========================================================
 
-    def criar_agente(tipo_agente):
+    def criar_agente(
+        tipo_agente
+    ):
 
         if tipo_agente == "openai":
 
@@ -217,28 +519,30 @@ def iniciar_planapp():
             )
 
         raise ValueError(
-            f"Agente desconhecido: {tipo_agente}"
+            f"Agente desconhecido: "
+            f"{tipo_agente}"
         )
 
     # ========================================================
     # CALLBACK — STATUS
     # ========================================================
 
-    def atualizar_status(mensagem):
+    def atualizar_status(
+        mensagem
+    ):
 
         if mensagem is None:
             return
 
-        texto = str(mensagem).strip()
+        texto = str(
+            mensagem
+        ).strip()
 
         if not texto:
             return
 
-        # ----------------------------------------------------
-        # Segurança:
-        #
-        # Ignoramos mensagens puramente técnicas.
-        # ----------------------------------------------------
+        # Evita poluir o painel com detalhes internos
+        # que já aparecem nos logs do agente.
 
         mensagens_ignoradas = {
             "=" * 10,
@@ -252,32 +556,50 @@ def iniciar_planapp():
         if texto in mensagens_ignoradas:
             return
 
-        if texto.startswith("MCP TOOL:"):
+        if texto.startswith(
+            "MCP TOOL:"
+        ):
             return
 
-        if texto.startswith("MCP RESULT:"):
+        if texto.startswith(
+            "MCP RESULT:"
+        ):
             return
 
-        if texto.startswith("Argumentos:"):
+        if texto.startswith(
+            "Argumentos:"
+        ):
             return
 
-        if texto.startswith("Resultado MCP:"):
+        if texto.startswith(
+            "Resultado MCP:"
+        ):
             return
 
-        if texto.startswith("Tool:"):
+        if texto.startswith(
+            "Tool:"
+        ):
             return
 
-        if texto.startswith("OpenAI response"):
+        if texto.startswith(
+            "OpenAI response"
+        ):
             return
 
-        if texto.startswith("Tokens"):
+        if texto.startswith(
+            "Tokens"
+        ):
             return
 
-        estado["status_count"] += 1
+        estado[
+            "status_count"
+        ] += 1
 
         status.value = (
             "<b>Status:</b> "
-            + html.escape(texto)
+            + html.escape(
+                texto
+            )
         )
 
         try:
@@ -292,16 +614,35 @@ def iniciar_planapp():
         except Exception as exc:
 
             print(
-                f"[ERRO CALLBACK STATUS] {repr(exc)}"
+                "[ERRO CALLBACK STATUS] "
+                f"{repr(exc)}"
             )
 
     # ========================================================
     # CALLBACK — RESULTADO TÉCNICO
     # ========================================================
 
-    def atualizar_resultado_tecnico(resultado):
+    def atualizar_resultado_tecnico(
+        resultado
+    ):
 
-        estado["resultado_count"] += 1
+        estado[
+            "resultado_count"
+        ] += 1
+
+        estado[
+            "ultimo_resultado"
+        ] = resultado
+
+        estado[
+            "analise_concluida"
+        ] = (
+            resultado is not None
+        )
+
+        botao_relatorio.disabled = (
+            resultado is None
+        )
 
         try:
 
@@ -326,7 +667,8 @@ def iniciar_planapp():
                 if resultado is None:
 
                     print(
-                        "Nenhum resultado técnico foi retornado."
+                        "Nenhum resultado técnico "
+                        "foi retornado."
                     )
 
                     return
@@ -364,27 +706,25 @@ def iniciar_planapp():
     # CALLBACK — MAPA
     # ========================================================
 
-    def atualizar_mapa(mapa):
+    def atualizar_mapa(
+        mapa
+    ):
 
-        estado["mapa_count"] += 1
+        estado[
+            "mapa_count"
+        ] += 1
 
         try:
 
-            # ------------------------------------------------
-            # Sempre limpar primeiro.
-            # ------------------------------------------------
-
-            mapa_output.children = []
+            mapa_output.children = ()
 
             if mapa is None:
                 return
 
-            # ------------------------------------------------
-            # Caso normal:
-            # ipyleaflet.Map é um widgets.Widget.
-            # ------------------------------------------------
-
-            if isinstance(mapa, widgets.Widget):
+            if isinstance(
+                mapa,
+                widgets.Widget,
+            ):
 
                 mapa_output.children = (
                     mapa,
@@ -392,22 +732,17 @@ def iniciar_planapp():
 
                 return
 
-            # ------------------------------------------------
-            # Alguns objetos de mapa podem não ser reconhecidos
-            # diretamente como Widget.
-            #
-            # Nesse caso usamos Output + display().
-            # ------------------------------------------------
-
             output = widgets.Output(
                 layout=widgets.Layout(
-                    width="100%",
+                    width="100%"
                 )
             )
 
             with output:
 
-                display(mapa)
+                display(
+                    mapa
+                )
 
             mapa_output.children = (
                 output,
@@ -417,7 +752,7 @@ def iniciar_planapp():
 
             erro = widgets.Output(
                 layout=widgets.Layout(
-                    width="100%",
+                    width="100%"
                 )
             )
 
@@ -438,26 +773,28 @@ def iniciar_planapp():
             )
 
     # ========================================================
-    # CONVERSÃO DE IMAGEM
+    # CONVERSÃO DE VISUALIZAÇÃO
     # ========================================================
 
-    def converter_visualizacao(item):
+    def converter_visualizacao(
+        item
+    ):
 
-        # ----------------------------------------------------
-        # Já é um Widget
-        # ----------------------------------------------------
-
-        if isinstance(item, widgets.Widget):
+        if isinstance(
+            item,
+            widgets.Widget,
+        ):
 
             return item
 
-        # ----------------------------------------------------
-        # Dicionário retornado pelo MCP
-        # ----------------------------------------------------
+        if isinstance(
+            item,
+            dict,
+        ):
 
-        if isinstance(item, dict):
-
-            kind = item.get("kind")
+            kind = item.get(
+                "kind"
+            )
 
             if kind == "image":
 
@@ -469,12 +806,17 @@ def iniciar_planapp():
                     "data"
                 )
 
-                if encoding == "base64" and data:
+                if (
+                    encoding == "base64"
+                    and data
+                ):
 
                     import base64
 
-                    image_bytes = base64.b64decode(
-                        data
+                    image_bytes = (
+                        base64.b64decode(
+                            data
+                        )
                     )
 
                     return widgets.Image(
@@ -485,10 +827,6 @@ def iniciar_planapp():
                             height="auto",
                         ),
                     )
-
-            # ------------------------------------------------
-            # Qualquer outro resultado textual
-            # ------------------------------------------------
 
             texto = json.dumps(
                 item,
@@ -503,16 +841,17 @@ def iniciar_planapp():
                     "white-space:pre-wrap;"
                     "margin:10px 0;"
                     "'>"
-                    + html.escape(texto)
+                    + html.escape(
+                        texto
+                    )
                     + "</pre>"
                 )
             )
 
-        # ----------------------------------------------------
-        # Bytes diretamente
-        # ----------------------------------------------------
-
-        if isinstance(item, bytes):
+        if isinstance(
+            item,
+            bytes,
+        ):
 
             return widgets.Image(
                 value=item,
@@ -523,16 +862,14 @@ def iniciar_planapp():
                 ),
             )
 
-        # ----------------------------------------------------
-        # Objeto desconhecido
-        # ----------------------------------------------------
-
         return widgets.HTML(
             value=(
                 "<pre style='"
                 "white-space:pre-wrap;"
                 "'>"
-                + html.escape(str(item))
+                + html.escape(
+                    str(item)
+                )
                 + "</pre>"
             )
         )
@@ -541,62 +878,71 @@ def iniciar_planapp():
     # CALLBACK — VISUALIZAÇÕES
     # ========================================================
 
-    def atualizar_visualizacoes(visualizacoes):
+    def atualizar_visualizacoes(
+        imagem,
+        titulo=None,
+    ):
 
-        estado["visualizacao_count"] += 1
+        estado[
+            "visualizacao_count"
+        ] += 1
 
         try:
 
-            if not visualizacoes:
-
-                visualizacoes_output.children = ()
-
+            if imagem is None:
                 return
 
-            children = []
+            # ------------------------------------------------
+            # NOVO CONTRATO:
+            #
+            # agent_openai.py:
+            #
+            # visualization_callback(
+            #     image,
+            #     title,
+            # )
+            #
+            # Portanto recebemos UMA imagem por chamada.
+            # ------------------------------------------------
 
-            for index, item in enumerate(
-                visualizacoes,
-                start=1,
-            ):
+            children = list(
+                visualizacoes_output.children
+            )
 
-                if item is None:
-                    continue
+            if titulo:
 
-                try:
-
-                    widget = converter_visualizacao(
-                        item
+                children.append(
+                    widgets.HTML(
+                        value=(
+                            "<h4 style='"
+                            "margin:12px 0 6px 0;'>"
+                            + html.escape(
+                                str(titulo)
+                            )
+                            + "</h4>"
+                        )
                     )
+                )
 
-                    if widget is not None:
+            widget = (
+                converter_visualizacao(
+                    imagem
+                )
+            )
 
-                        children.append(
-                            widget
-                        )
+            if widget is not None:
 
-                except Exception as exc:
-
-                    erro = widgets.Output()
-
-                    with erro:
-
-                        print(
-                            f"❌ Erro na visualização #{index}"
-                        )
-
-                        print(
-                            repr(exc)
-                        )
-
-                        traceback.print_exc()
-
-                    children.append(
-                        erro
-                    )
+                children.append(
+                    widget
+                )
 
             visualizacoes_output.children = (
                 tuple(children)
+            )
+
+            atualizar_status(
+                "🖼️ Visualização exibida: "
+                f"{titulo or 'imagem'}"
             )
 
         except Exception as exc:
@@ -606,7 +952,8 @@ def iniciar_planapp():
             with erro:
 
                 print(
-                    "❌ ERRO NO CALLBACK DE VISUALIZAÇÕES"
+                    "❌ ERRO NO CALLBACK "
+                    "DE VISUALIZAÇÕES"
                 )
 
                 print(
@@ -615,8 +962,364 @@ def iniciar_planapp():
 
                 traceback.print_exc()
 
+            children = list(
+                visualizacoes_output.children
+            )
+
+            children.append(
+                erro
+            )
+
             visualizacoes_output.children = (
-                erro,
+                tuple(children)
+            )
+
+    # ========================================================
+    # GERAÇÃO DO RELATÓRIO
+    # ========================================================
+
+    def gerar_relatorio():
+
+        estado[
+            "relatorio_gerado"
+        ] = False
+
+        relatorio_output.clear_output(
+            wait=True
+        )
+
+        relatorio_download.clear_output(
+            wait=True
+        )
+
+        if (
+            estado[
+                "ultimo_resultado"
+            ] is None
+        ):
+
+            with relatorio_output:
+
+                print(
+                    "⚠️ Nenhum resultado técnico disponível."
+                )
+
+                print(
+                    "Execute primeiro uma análise de enlace."
+                )
+
+            return
+
+        try:
+
+            atualizar_status(
+                "📄 Gerando relatório técnico..."
+            )
+
+            # ------------------------------------------------
+            # GERAÇÃO PELO AGENTE
+            # ------------------------------------------------
+
+            if hasattr(
+                agent,
+                "build_report",
+            ):
+
+                relatorio = (
+                    agent.build_report(
+                        estado[
+                            "ultimo_resultado"
+                        ]
+                    )
+                )
+
+            elif hasattr(
+                agent,
+                "technical_report",
+            ):
+
+                relatorio = (
+                    agent.technical_report
+                )
+
+            else:
+
+                with relatorio_output:
+
+                    print(
+                        "⚠️ Este agente ainda "
+                        "não disponibiliza "
+                        "a geração de relatório técnico."
+                    )
+
+                atualizar_status(
+                    "⚠️ Relatório ainda não "
+                    "implementado para este agente."
+                )
+
+                return
+
+            if not relatorio:
+
+                with relatorio_output:
+
+                    print(
+                        "⚠️ O relatório técnico "
+                        "não foi gerado."
+                    )
+
+                atualizar_status(
+                    "⚠️ O relatório técnico "
+                    "não foi gerado."
+                )
+
+                return
+
+            estado[
+                "relatorio_gerado"
+            ] = True
+
+            # ------------------------------------------------
+            # TEXTO
+            # ------------------------------------------------
+
+            with relatorio_output:
+
+                print(
+                    "=================================================="
+                )
+
+                print(
+                    "📄 RELATÓRIO TÉCNICO DO PLANAPP AI"
+                )
+
+                print(
+                    "=================================================="
+                )
+
+                print()
+
+                print(
+                    str(relatorio)
+                )
+
+                # ------------------------------------------------
+                # MAPA
+                # ------------------------------------------------
+
+                mapa = getattr(
+                    agent,
+                    "map",
+                    None,
+                )
+
+                if mapa is not None:
+
+                    print()
+                    print(
+                        "=================================================="
+                    )
+
+                    print(
+                        "🗺️ MAPA DO ENLACE"
+                    )
+
+                    print(
+                        "=================================================="
+                    )
+
+                    try:
+
+                        display(
+                            mapa
+                        )
+
+                    except Exception as exc:
+
+                        print(
+                            "⚠️ Não foi possível "
+                            "exibir o mapa:"
+                        )
+
+                        print(
+                            repr(exc)
+                        )
+
+                # ------------------------------------------------
+                # VISUALIZAÇÕES
+                # ------------------------------------------------
+
+                visualizacoes = getattr(
+                    agent,
+                    "visualizations",
+                    [],
+                )
+
+                imagens = getattr(
+                    agent,
+                    "visualization_images",
+                    [],
+                )
+
+                if visualizacoes:
+
+                    print()
+                    print(
+                        "=================================================="
+                    )
+
+                    print(
+                        "📈 VISUALIZAÇÕES TÉCNICAS"
+                    )
+
+                    print(
+                        "=================================================="
+                    )
+
+                    for index, image in enumerate(
+                        visualizacoes
+                    ):
+
+                        title = None
+
+                        if (
+                            index
+                            < len(imagens)
+                            and isinstance(
+                                imagens[index],
+                                dict,
+                            )
+                        ):
+
+                            title = (
+                                imagens[index].get(
+                                    "title"
+                                )
+                            )
+
+                        if title:
+
+                            display(
+                                widgets.HTML(
+                                    value=(
+                                        "<h4 style='"
+                                        "margin:12px 0 6px 0;'>"
+                                        + html.escape(
+                                            str(title)
+                                        )
+                                        + "</h4>"
+                                    )
+                                )
+                            )
+
+                        try:
+
+                            display(
+                                image
+                            )
+
+                        except Exception as exc:
+
+                            print(
+                                "⚠️ Erro exibindo "
+                                f"visualização #{index + 1}: "
+                                f"{exc}"
+                            )
+
+            # ------------------------------------------------
+            # PDF
+            # ------------------------------------------------
+
+            pdf_path = getattr(
+                agent,
+                "report_pdf_path",
+                None,
+            )
+
+            if pdf_path:
+
+                pdf_path = Path(
+                    pdf_path
+                )
+
+            if (
+                pdf_path
+                and pdf_path.exists()
+            ):
+
+                tamanho = (
+                    pdf_path.stat().st_size
+                )
+
+                with relatorio_download:
+
+                    display(
+                        widgets.HTML(
+                            value=(
+                                "<div style='"
+                                "padding:10px;"
+                                "margin-top:5px;"
+                                "border:1px solid #ddd;"
+                                "border-radius:6px;"
+                                "'>"
+                                "<b>📄 Relatório PDF pronto</b>"
+                                "<br>"
+                                f"<span>{html.escape(pdf_path.name)}</span>"
+                                "<br><br>"
+                                f"<span>Tamanho: {tamanho:,} bytes</span>"
+                                "</div>"
+                            )
+                        )
+                    )
+
+                    display(
+                        FileLink(
+                            str(pdf_path),
+                            result_html_prefix="📥 ",
+                            result_html_suffix=(
+                                " — Baixar relatório PDF"
+                            ),
+                        )
+                    )
+
+                atualizar_status(
+                    "🟢 Relatório técnico gerado "
+                    "e PDF disponível para download."
+                )
+
+            else:
+
+                with relatorio_download:
+
+                    print(
+                        "⚠️ O relatório textual foi "
+                        "gerado, mas o arquivo PDF "
+                        "não foi localizado."
+                    )
+
+                atualizar_status(
+                    "⚠️ Relatório gerado, "
+                    "mas PDF não localizado."
+                )
+
+        except Exception as exc:
+
+            with relatorio_output:
+
+                print(
+                    "❌ Erro ao gerar relatório técnico."
+                )
+
+                print()
+
+                print(
+                    repr(exc)
+                )
+
+                traceback.print_exc()
+
+            atualizar_status(
+                f"❌ Erro ao gerar relatório: {exc}"
             )
 
     # ========================================================
@@ -627,13 +1330,19 @@ def iniciar_planapp():
         agente_selector.value
     )
 
+    agent._planapp_agent_type = (
+        agente_selector.value
+    )
+
     # ========================================================
-    # EXECUÇÃO
+    # EXECUÇÃO DA ANÁLISE
     # ========================================================
 
     async def executar_analise_async():
 
-        texto = entrada.value.strip()
+        texto = (
+            entrada.value.strip()
+        )
 
         if not texto:
 
@@ -645,12 +1354,11 @@ def iniciar_planapp():
 
         botao_analisar.disabled = True
 
-        # ----------------------------------------------------
-        # Garante que o agente em uso corresponde à seleção
-        # atual da interface.
-        # ----------------------------------------------------
+        botao_relatorio.disabled = True
 
-        agente_selecionado = agente_selector.value
+        agente_selecionado = (
+            agente_selector.value
+        )
 
         nonlocal agent
 
@@ -674,7 +1382,13 @@ def iniciar_planapp():
 
         else:
 
-            agente_atual = agente_selecionado
+            agente_atual = (
+                agente_selecionado
+            )
+
+        # ----------------------------------------------------
+        # LIMPAR INTERFACE
+        # ----------------------------------------------------
 
         resposta.value = ""
 
@@ -686,24 +1400,40 @@ def iniciar_planapp():
             wait=True
         )
 
+        relatorio_output.clear_output(
+            wait=True
+        )
+
+        relatorio_download.clear_output(
+            wait=True
+        )
+
         historico_status.clear_output(
             wait=True
         )
 
+        estado[
+            "ultimo_resultado"
+        ] = None
+
+        estado[
+            "analise_concluida"
+        ] = False
+
+        estado[
+            "relatorio_gerado"
+        ] = False
+
         try:
 
             atualizar_status(
-                f"🤖 Agente selecionado: {agente_atual}"
+                f"🤖 Agente selecionado: "
+                f"{agente_atual}"
             )
 
             atualizar_status(
                 "🟡 Iniciando análise..."
             )
-
-            # ------------------------------------------------
-            # Se o usuário mudou o agente desde a última
-            # análise, cria um novo agente do tipo escolhido.
-            # ------------------------------------------------
 
             tipo_atual = getattr(
                 agent,
@@ -711,7 +1441,10 @@ def iniciar_planapp():
                 None,
             )
 
-            if tipo_atual != agente_selecionado:
+            if (
+                tipo_atual
+                != agente_selecionado
+            ):
 
                 try:
 
@@ -732,8 +1465,24 @@ def iniciar_planapp():
                     agente_selecionado
                 )
 
+            # ------------------------------------------------
+            # CHAMADA DO AGENTE
+            # ------------------------------------------------
+
             resultado = await agent.ask(
                 texto
+            )
+
+            # ------------------------------------------------
+            # RESULTADO FINAL
+            #
+            # IMPORTANTE:
+            # Não usamos Output/Markdown aqui.
+            # Renderizamos diretamente no widgets.HTML.
+            # ------------------------------------------------
+
+            renderizar_resposta(
+                resultado
             )
 
             atualizar_status(
@@ -741,32 +1490,45 @@ def iniciar_planapp():
             )
 
             # ------------------------------------------------
-            # Resposta final
+            # HABILITAR RELATÓRIO
+            #
+            # O callback normalmente já habilita o botão.
+            # Aqui fazemos uma verificação adicional.
             # ------------------------------------------------
 
-            resposta.value = (
-                "<div style='"
-                "border:1px solid #ddd;"
-                "padding:12px;"
-                "margin-top:10px;"
-                "border-radius:6px;"
-                "'>"
-                "<b>💬 Resposta do PlanApp AI</b>"
-                "<div style='margin-top:10px;'>"
-                + html.escape(
-                    str(resultado)
-                ).replace(
-                    "\n",
-                    "<br>"
-                )
-                + "</div>"
-                "</div>"
-            )
+            if (
+                estado[
+                    "ultimo_resultado"
+                ] is not None
+            ):
+
+                botao_relatorio.disabled = False
 
         except Exception as exc:
 
             atualizar_status(
                 f"❌ Erro na execução: {exc}"
+            )
+
+            resposta.value = (
+                "<div style='"
+                "font-family:Arial,sans-serif;"
+                "border:1px solid #d00;"
+                "padding:12px;"
+                "margin-top:10px;"
+                "border-radius:6px;"
+                "color:#900;"
+                "'>"
+                "<b>❌ Erro na execução</b>"
+                "<pre style='"
+                "white-space:pre-wrap;"
+                "margin-top:10px;"
+                "'>"
+                + html.escape(
+                    repr(exc)
+                )
+                + "</pre>"
+                "</div>"
             )
 
             traceback.print_exc()
@@ -779,7 +1541,9 @@ def iniciar_planapp():
     # BOTÃO ANALISAR
     # ========================================================
 
-    def ao_clicar_analisar(_):
+    def ao_clicar_analisar(
+        _
+    ):
 
         try:
 
@@ -790,7 +1554,8 @@ def iniciar_planapp():
         except Exception as exc:
 
             atualizar_status(
-                f"❌ Não foi possível iniciar: {exc}"
+                f"❌ Não foi possível iniciar: "
+                f"{exc}"
             )
 
             traceback.print_exc()
@@ -800,10 +1565,38 @@ def iniciar_planapp():
     )
 
     # ========================================================
+    # BOTÃO RELATÓRIO
+    # ========================================================
+
+    def ao_clicar_relatorio(
+        _
+    ):
+
+        botao_relatorio.disabled = True
+
+        try:
+
+            gerar_relatorio()
+
+        finally:
+
+            botao_relatorio.disabled = (
+                estado[
+                    "ultimo_resultado"
+                ] is None
+            )
+
+    botao_relatorio.on_click(
+        ao_clicar_relatorio
+    )
+
+    # ========================================================
     # NOVA ANÁLISE
     # ========================================================
 
-    def nova_analise(_):
+    def nova_analise(
+        _
+    ):
 
         nonlocal agent
 
@@ -812,7 +1605,8 @@ def iniciar_planapp():
         resposta.value = ""
 
         status.value = (
-            "<b>Status:</b> Aguardando solicitação."
+            "<b>Status:</b> "
+            "Aguardando solicitação."
         )
 
         historico_status.clear_output(
@@ -823,13 +1617,31 @@ def iniciar_planapp():
             wait=True
         )
 
+        relatorio_output.clear_output(
+            wait=True
+        )
+
+        relatorio_download.clear_output(
+            wait=True
+        )
+
         mapa_output.children = ()
 
         visualizacoes_output.children = ()
 
-        # ----------------------------------------------------
-        # Fecha agente anterior
-        # ----------------------------------------------------
+        estado[
+            "ultimo_resultado"
+        ] = None
+
+        estado[
+            "analise_concluida"
+        ] = False
+
+        estado[
+            "relatorio_gerado"
+        ] = False
+
+        botao_relatorio.disabled = True
 
         try:
 
@@ -844,10 +1656,6 @@ def iniciar_planapp():
                 repr(exc),
             )
 
-        # ----------------------------------------------------
-        # Novo agente conforme seleção atual
-        # ----------------------------------------------------
-
         try:
 
             agent = criar_agente(
@@ -861,26 +1669,36 @@ def iniciar_planapp():
         except Exception as exc:
 
             atualizar_status(
-                f"❌ Erro criando agente: {exc}"
+                f"❌ Erro criando agente: "
+                f"{exc}"
             )
 
             traceback.print_exc()
 
             return
 
-        if agente_selector.value == "openai":
+        if (
+            agente_selector.value
+            == "openai"
+        ):
 
             agente_atual = (
                 "OpenAI (GPT-5.6 Luna)"
             )
 
-        elif agente_selector.value == "ollama":
+        elif (
+            agente_selector.value
+            == "ollama"
+        ):
 
             agente_atual = (
                 "Ollama (Qwen 3 8B)"
             )
 
-        elif agente_selector.value == "openrouter":
+        elif (
+            agente_selector.value
+            == "openrouter"
+        ):
 
             agente_atual = (
                 "OpenRouter"
@@ -888,10 +1706,13 @@ def iniciar_planapp():
 
         else:
 
-            agente_atual = agente_selector.value
+            agente_atual = (
+                agente_selector.value
+            )
 
         atualizar_status(
-            f"🔄 Nova análise pronta — {agente_atual}."
+            f"🔄 Nova análise pronta — "
+            f"{agente_atual}."
         )
 
     botao_nova.on_click(
@@ -911,7 +1732,7 @@ def iniciar_planapp():
             historico_status,
         ],
         layout=widgets.Layout(
-            width="100%",
+            width="100%"
         ),
     )
 
@@ -927,7 +1748,24 @@ def iniciar_planapp():
             resultado_tecnico_output,
         ],
         layout=widgets.Layout(
-            width="100%",
+            width="100%"
+        ),
+    )
+
+    # ========================================================
+    # PAINEL RELATÓRIO
+    # ========================================================
+
+    painel_relatorio = widgets.VBox(
+        [
+            widgets.HTML(
+                value="<h4>📄 Relatório técnico</h4>"
+            ),
+            relatorio_download,
+            relatorio_output,
+        ],
+        layout=widgets.Layout(
+            width="100%"
         ),
     )
 
@@ -943,7 +1781,7 @@ def iniciar_planapp():
             mapa_output,
         ],
         layout=widgets.Layout(
-            width="100%",
+            width="100%"
         ),
     )
 
@@ -959,7 +1797,7 @@ def iniciar_planapp():
             visualizacoes_output,
         ],
         layout=widgets.Layout(
-            width="100%",
+            width="100%"
         ),
     )
 
@@ -969,10 +1807,13 @@ def iniciar_planapp():
 
     painel_resposta = widgets.VBox(
         [
+            widgets.HTML(
+                value="<h4>💬 Análise do PlanApp AI</h4>"
+            ),
             resposta,
         ],
         layout=widgets.Layout(
-            width="100%",
+            width="100%"
         ),
     )
 
@@ -1008,37 +1849,42 @@ def iniciar_planapp():
     )
 
     # ========================================================
-    # INTERFACE COMPLETA
+    # INTERFACE
     # ========================================================
 
     interface = widgets.VBox(
         [
             titulo,
 
-            # ------------------------------------------------
-            # Seletor do agente
-            # ------------------------------------------------
-
             widgets.HBox(
                 [
-                    agente_selector,
+                    agente_selector
                 ],
                 layout=widgets.Layout(
-                    margin="0 0 8px 0",
+                    margin="0 0 8px 0"
                 ),
             ),
 
             entrada,
+
             botoes,
+
             painel_status,
+
             painel_resultado,
+
+            painel_relatorio,
+
             painel_mapa,
+
             painel_visualizacoes,
+
             painel_resposta,
+
             exemplos,
         ],
         layout=widgets.Layout(
-            width="100%",
+            width="100%"
         ),
     )
 
@@ -1046,14 +1892,11 @@ def iniciar_planapp():
     # DISPLAY
     # ========================================================
 
-    display(interface)
-
-    # --------------------------------------------------------
-    # Marca o tipo do agente inicial.
-    # --------------------------------------------------------
-
-    agent._planapp_agent_type = (
-        agente_selector.value
+    display(
+        interface
     )
 
-    return interface, agent
+    return (
+        interface,
+        agent,
+    )
