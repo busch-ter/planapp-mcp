@@ -782,6 +782,7 @@ REGRAS:
     def build_report(
         self,
         technical_result,
+        analysis_text=None,
     ):
 
         requested_parameters = {
@@ -891,6 +892,13 @@ REGRAS:
         # GERADOR
         # --------------------------------------------------------------------
 
+        # Quando a análise final já foi produzida, ela passa a ser o
+        # conteúdo oficial do relatório. Se não for fornecida, preservamos
+        # o comportamento anterior e o ReportGenerator usa o relatório
+        # estruturado de dados como fallback.
+        if analysis_text is None:
+            analysis_text = self.technical_report or None
+
         generator = ReportGenerator(
             requested_params=requested_parameters,
             effective_params=effective_parameters,
@@ -899,6 +907,7 @@ REGRAS:
             map_image=self.map_image_bytes,
             visualization_images=self.visualization_images,
             user_request=self.user_request,
+            analysis_text=analysis_text,
         )
 
         report = generator.generate_report(
@@ -1220,40 +1229,46 @@ Use exclusivamente os dados retornados pelo PlanApp e, quando disponível, o rel
 
 A resposta deve ser organizada e informativa, e não apenas uma reprodução do JSON.
 
-Estruture a resposta, quando houver dados suficientes, contemplando:
+Use Markdown simples para a formatação:
+- títulos de seção com `##`;
+- subtítulos com `###`;
+- listas com `-`;
+- destaque pontual com `**negrito**`.
 
-1. Identificação do enlace
-   - localidades TX e RX;
-   - coordenadas;
-   - distância, se retornada.
+Quando houver dados suficientes, estruture a resposta com as seguintes seções:
 
-2. Parâmetros
-   - frequência solicitada;
-   - altura TX solicitada;
-   - altura RX solicitada;
-   - rooftop solicitado;
-   - parâmetros efetivamente utilizados pelo PlanApp.
+## 1. IDENTIFICAÇÃO DO ENLACE
+- localidades TX e RX;
+- coordenadas;
+- distância, se retornada.
 
-3. Resultados principais
-   - FSPL;
-   - delta_diffra;
-   - outros resultados principais efetivamente retornados.
+## 2. PARÂMETROS
+- frequência solicitada;
+- altura TX solicitada;
+- altura RX solicitada;
+- rooftop solicitado;
+- parâmetros efetivamente utilizados pelo PlanApp.
 
-4. Resultados dos dados geoespaciais
-   - terreno;
-   - vegetação/COVER;
-   - edificações;
-   - outros conjuntos retornados.
+## 3. RESULTADOS PRINCIPAIS
+- FSPL;
+- delta_diffra;
+- outros resultados principais efetivamente retornados.
 
-5. Resultados geométricos
-   - apresente os valores retornados pelo PlanApp;
-   - não atribua significado físico a campos cuja definição não esteja explicitamente documentada.
+## 4. RESULTADOS DOS DADOS GEOESPACIAIS
+- terreno;
+- vegetação/COVER;
+- edificações;
+- outros conjuntos retornados.
 
-6. Execução
-   - indique objetivamente quais etapas foram executadas quando essa informação estiver disponível.
+## 5. RESULTADOS GEOMÉTRICOS
+- apresente os valores retornados pelo PlanApp;
+- não atribua significado físico a campos cuja definição não esteja explicitamente documentada.
 
-7. Observações e limitações
-   - diferencie dados efetivamente calculados pelo PlanApp de interpretações que exigiriam critérios técnicos adicionais.
+## 6. EXECUÇÃO
+- indique objetivamente quais etapas foram executadas quando essa informação estiver disponível.
+
+## 7. OBSERVAÇÕES E LIMITAÇÕES
+- diferencie dados efetivamente calculados pelo PlanApp de interpretações que exigiriam critérios técnicos adicionais.
 
 IMPORTANTE:
 
@@ -1399,6 +1414,16 @@ IMPORTANTE:
                     self.last_evaluate_result,
                     technical_report=None,
                 )
+            )
+
+            # O texto final produzido pelo OpenAI é o texto oficial do
+            # relatório. O PDF é gerado somente depois da análise final,
+            # preservando mapa e visualizações já preparados.
+            self.technical_report = answer
+
+            self.build_report(
+                self.last_evaluate_result,
+                analysis_text=answer,
             )
 
         else:

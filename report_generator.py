@@ -1,21 +1,15 @@
 # ============================================================================
 # PLANAPP AI — REPORT GENERATOR
 #
-# Geração de relatório técnico a partir dos dados reais do PlanApp.
+# Geração de relatório técnico a partir da análise final do agente.
 #
 # Responsabilidades:
-#   - organizar os dados técnicos do evaluate_link;
-#   - preservar parâmetros solicitados e efetivos;
-#   - preservar os dados retornados pelo PlanApp;
-#   - registrar a solicitação original do usuário;
-#   - identificar explicitamente TX e RX;
-#   - não inventar valores;
-#   - não recalcular FSPL;
-#   - não classificar automaticamente a viabilidade do enlace;
-#   - gerar relatório textual;
-#   - gerar relatório PDF;
+#   - receber a análise técnica produzida pelo agente;
+#   - preservar o texto da análise como conteúdo principal do relatório;
+#   - converter Markdown simples para PDF;
 #   - incluir mapa OSM estático;
 #   - incluir visualizações geradas pelo PlanApp;
+#   - manter compatibilidade com o relatório técnico anterior;
 #   - salvar PDFs em:
 #
 #       <planapp-mcp>/reports/
@@ -58,6 +52,7 @@ REPORT_DIR = PROJECT_DIR / "reports"
 # ============================================================================
 
 def _is_number(value: Any) -> bool:
+
     if isinstance(value, bool):
         return False
 
@@ -72,6 +67,7 @@ def _fmt_number(
     decimals: int = 2,
     suffix: str = "",
 ) -> str:
+
     if not _is_number(value):
         return "Não informado"
 
@@ -79,6 +75,7 @@ def _fmt_number(
 
 
 def _fmt_bool(value: Any) -> str:
+
     if value is True:
         return "Sim"
 
@@ -89,6 +86,7 @@ def _fmt_bool(value: Any) -> str:
 
 
 def _safe_json_loads(value: Any) -> Any:
+
     if not isinstance(value, str):
         return value
 
@@ -99,11 +97,13 @@ def _safe_json_loads(value: Any) -> Any:
 
     try:
         return json.loads(text)
+
     except Exception:
         return value
 
 
 def _clean_text(value: Any) -> str:
+
     if value is None:
         return ""
 
@@ -114,6 +114,7 @@ def _clean_text(value: Any) -> str:
 
 
 def _escape_pdf_text(value: Any) -> str:
+
     text = _clean_text(value)
 
     if not text:
@@ -125,12 +126,23 @@ def _escape_pdf_text(value: Any) -> str:
     )
 
 
-def _format_inline_markup(text: str) -> str:
+def _format_inline_markup(
+    text: str,
+) -> str:
+
     escaped = _escape_pdf_text(text)
 
+    # Negrito Markdown
     escaped = re.sub(
         r"\*\*(.+?)\*\*",
         r"<b>\1</b>",
+        escaped,
+    )
+
+    # Itálico Markdown simples
+    escaped = re.sub(
+        r"(?<!\*)\*([^*]+)\*(?!\*)",
+        r"<i>\1</i>",
         escaped,
     )
 
@@ -283,6 +295,10 @@ class ReportGenerator:
             List[Dict[str, Any]]
         ] = None,
         user_request: Optional[str] = None,
+
+        # NOVO:
+        # Texto final produzido pelo agente
+        analysis_text: Optional[str] = None,
     ):
 
         self.requested_params = (
@@ -313,6 +329,21 @@ class ReportGenerator:
             user_request or ""
         )
 
+        # --------------------------------------------------------------------
+        # NOVO
+        #
+        # Quando preenchido, este texto passa a ser o conteúdo principal
+        # do relatório.
+        #
+        # O ReportGenerator NÃO gera uma segunda análise.
+        # --------------------------------------------------------------------
+
+        self.analysis_text = (
+            analysis_text.strip()
+            if isinstance(analysis_text, str)
+            else ""
+        )
+
         self.styles = None
 
     # ========================================================================
@@ -328,6 +359,7 @@ class ReportGenerator:
         for key in keys:
 
             if key in self.result:
+
                 value = self.result[key]
 
                 if value is not None:
@@ -348,6 +380,7 @@ class ReportGenerator:
         for key in keys:
 
             if key in data:
+
                 value = data[key]
 
                 if value is not None:
@@ -396,6 +429,7 @@ class ReportGenerator:
                     )
                     < 1e-9
                 ):
+
                     duplicate = True
                     break
 
@@ -403,6 +437,98 @@ class ReportGenerator:
                 points.append(point)
 
         return points
+
+    # ========================================================================
+    # RELATÓRIO LEGADO
+    #
+    # Mantido para compatibilidade.
+    #
+    # Só será utilizado quando analysis_text não estiver disponível.
+    # ========================================================================
+
+    def _legacy_report(
+        self,
+        include_raw_result: bool = False,
+    ) -> str:
+
+        sections = []
+
+        sections.append(
+            "# Relatório Técnico — PlanApp AI"
+        )
+
+        sections.append(
+            "Data/hora de geração: "
+            + datetime.now().strftime(
+                "%d/%m/%Y %H:%M:%S"
+            )
+        )
+
+        sections.append("")
+
+        sections.extend(
+            self._section_user_request()
+        )
+
+        sections.append("")
+
+        sections.extend(
+            self._section_link_endpoints()
+        )
+
+        sections.append("")
+
+        sections.extend(
+            self._section_parameters()
+        )
+
+        sections.append("")
+
+        sections.extend(
+            self._section_link_characteristics()
+        )
+
+        sections.append("")
+
+        sections.extend(
+            self._section_terrain()
+        )
+
+        sections.append("")
+
+        sections.extend(
+            self._section_vegetation()
+        )
+
+        sections.append("")
+
+        sections.extend(
+            self._section_buildings()
+        )
+
+        sections.append("")
+
+        sections.extend(
+            self._section_geometry()
+        )
+
+        sections.append("")
+
+        sections.extend(
+            self._section_interpretation()
+        )
+
+        if include_raw_result:
+
+            sections.append("")
+
+            sections.extend(
+                self._section_raw_result()
+            )
+
+        return "\n".join(
+            sections
+        )
 
     # ========================================================================
     # SOLICITAÇÃO DO USUÁRIO
@@ -630,7 +756,7 @@ class ReportGenerator:
         return lines
 
     # ========================================================================
-    # CARACTERÍSTICAS DO ENLACE
+    # CARACTERÍSTICAS
     # ========================================================================
 
     def _section_link_characteristics(
@@ -886,7 +1012,7 @@ class ReportGenerator:
         return lines
 
     # ========================================================================
-    # INTERPRETAÇÃO
+    # INTERPRETAÇÃO LEGADA
     # ========================================================================
 
     def _section_interpretation(
@@ -967,83 +1093,26 @@ class ReportGenerator:
         include_raw_result: bool = False,
     ) -> str:
 
-        sections = []
+        # --------------------------------------------------------------------
+        # NOVO COMPORTAMENTO
+        #
+        # Se o agente produziu uma análise final, ela é o relatório.
+        #
+        # NÃO acrescentamos uma segunda análise.
+        # NÃO reescrevemos o texto.
+        # NÃO misturamos o JSON técnico ao corpo.
+        # --------------------------------------------------------------------
 
-        sections.append(
-            "# Relatório Técnico — PlanApp AI"
-        )
+        if self.analysis_text:
 
-        sections.append(
-            "Data/hora de geração: "
-            + datetime.now().strftime(
-                "%d/%m/%Y %H:%M:%S"
-            )
-        )
+            return self.analysis_text.strip()
 
-        sections.append("")
+        # --------------------------------------------------------------------
+        # COMPATIBILIDADE COM O COMPORTAMENTO ANTERIOR
+        # --------------------------------------------------------------------
 
-        sections.extend(
-            self._section_user_request()
-        )
-
-        sections.append("")
-
-        sections.extend(
-            self._section_link_endpoints()
-        )
-
-        sections.append("")
-
-        sections.extend(
-            self._section_parameters()
-        )
-
-        sections.append("")
-
-        sections.extend(
-            self._section_link_characteristics()
-        )
-
-        sections.append("")
-
-        sections.extend(
-            self._section_terrain()
-        )
-
-        sections.append("")
-
-        sections.extend(
-            self._section_vegetation()
-        )
-
-        sections.append("")
-
-        sections.extend(
-            self._section_buildings()
-        )
-
-        sections.append("")
-
-        sections.extend(
-            self._section_geometry()
-        )
-
-        sections.append("")
-
-        sections.extend(
-            self._section_interpretation()
-        )
-
-        if include_raw_result:
-
-            sections.append("")
-
-            sections.extend(
-                self._section_raw_result()
-            )
-
-        return "\n".join(
-            sections
+        return self._legacy_report(
+            include_raw_result=include_raw_result
         )
 
     # ========================================================================
@@ -1064,12 +1133,14 @@ class ReportGenerator:
             image_data,
             memoryview,
         ):
+
             image_data = image_data.tobytes()
 
         elif isinstance(
             image_data,
             bytearray,
         ):
+
             image_data = bytes(
                 image_data
             )
@@ -1240,7 +1311,7 @@ class ReportGenerator:
         return story
 
     # ========================================================================
-    # PDF — MARKDOWN SIMPLES
+    # PDF — MARKDOWN
     # ========================================================================
 
     def _markdown_to_pdf_story(
@@ -1297,6 +1368,10 @@ class ReportGenerator:
 
                 continue
 
+            # ------------------------------------------------------------
+            # BLOCO DE CÓDIGO
+            # ------------------------------------------------------------
+
             if stripped.startswith(
                 "```"
             ):
@@ -1304,6 +1379,10 @@ class ReportGenerator:
                 flush_paragraph()
 
                 continue
+
+            # ------------------------------------------------------------
+            # MARKDOWN H1
+            # ------------------------------------------------------------
 
             if stripped.startswith(
                 "# "
@@ -1331,6 +1410,10 @@ class ReportGenerator:
 
                 continue
 
+            # ------------------------------------------------------------
+            # MARKDOWN H2
+            # ------------------------------------------------------------
+
             if stripped.startswith(
                 "## "
             ):
@@ -1357,6 +1440,10 @@ class ReportGenerator:
 
                 continue
 
+            # ------------------------------------------------------------
+            # MARKDOWN H3
+            # ------------------------------------------------------------
+
             if stripped.startswith(
                 "### "
             ):
@@ -1382,6 +1469,59 @@ class ReportGenerator:
                 )
 
                 continue
+
+            # ------------------------------------------------------------
+            # TÍTULOS NUMERADOS
+            #
+            # Exemplo:
+            #
+            # 1. RESUMO EXECUTIVO
+            # 2. IDENTIFICAÇÃO DO ENLACE
+            #
+            # O prompt atual do agente usa exatamente esse formato.
+            # ------------------------------------------------------------
+
+            numbered_heading = re.match(
+                r"^(\d+)\.\s+(.+)$",
+                stripped,
+            )
+
+            if numbered_heading:
+
+                flush_paragraph()
+
+                heading_number = (
+                    numbered_heading.group(1)
+                )
+
+                heading_text = (
+                    numbered_heading.group(2)
+                )
+
+                story.append(
+                    Paragraph(
+                        _format_inline_markup(
+                            f"{heading_number}. "
+                            f"{heading_text}"
+                        ),
+                        self.styles[
+                            "PlanAppHeading2"
+                        ],
+                    )
+                )
+
+                story.append(
+                    Spacer(
+                        1,
+                        2 * mm,
+                    )
+                )
+
+                continue
+
+            # ------------------------------------------------------------
+            # LISTA
+            # ------------------------------------------------------------
 
             if stripped.startswith(
                 "- "
@@ -1410,6 +1550,42 @@ class ReportGenerator:
                 )
 
                 continue
+
+            # ------------------------------------------------------------
+            # LISTA COM *
+            # ------------------------------------------------------------
+
+            if stripped.startswith(
+                "* "
+            ):
+
+                flush_paragraph()
+
+                bullet = _format_inline_markup(
+                    stripped[2:]
+                )
+
+                story.append(
+                    Paragraph(
+                        "• " + bullet,
+                        self.styles[
+                            "PlanAppBodyText"
+                        ],
+                    )
+                )
+
+                story.append(
+                    Spacer(
+                        1,
+                        1.2 * mm,
+                    )
+                )
+
+                continue
+
+            # ------------------------------------------------------------
+            # TEXTO NORMAL
+            # ------------------------------------------------------------
 
             paragraph_buffer.append(
                 stripped
@@ -1457,16 +1633,6 @@ class ReportGenerator:
 
         # --------------------------------------------------------------------
         # ESTILOS
-        #
-        # IMPORTANTE:
-        # getSampleStyleSheet() já contém:
-        #   BodyText
-        #   Title
-        #   Heading2
-        #   Heading3
-        #
-        # Portanto não podemos usar styles.add() com esses mesmos nomes.
-        # Criamos estilos próprios do PlanApp.
         # --------------------------------------------------------------------
 
         styles = getSampleStyleSheet()
@@ -1532,12 +1698,18 @@ class ReportGenerator:
             author="PlanApp AI",
         )
 
+        # --------------------------------------------------------------------
+        # O TEXTO DO AGENTE É O CORPO PRINCIPAL DO PDF
+        # --------------------------------------------------------------------
+
         story = self._markdown_to_pdf_story(
             report_text
         )
 
         # --------------------------------------------------------------------
         # MAPA
+        #
+        # O mapa é anexado depois da análise.
         # --------------------------------------------------------------------
 
         map_story = self._map_story()
@@ -1617,6 +1789,9 @@ def generate_report(
     ] = None,
     user_request: Optional[str] = None,
     include_raw_result: bool = False,
+
+    # NOVO
+    analysis_text: Optional[str] = None,
 ) -> str:
 
     generator = ReportGenerator(
@@ -1627,6 +1802,7 @@ def generate_report(
         map_image=map_image,
         visualization_images=visualization_images,
         user_request=user_request,
+        analysis_text=analysis_text,
     )
 
     return generator.generate_report(
@@ -1647,10 +1823,13 @@ def generate_report_pdf(
     ]] = None,
     map_image: Optional[Any] = None,
     visualization_images: Optional[
-        List[Dict[str, Any]]
-    ] = None,
+        List[Dict[str, Any]
+    ]] = None,
     user_request: Optional[str] = None,
     include_raw_result: bool = False,
+
+    # NOVO
+    analysis_text: Optional[str] = None,
 ) -> str:
 
     generator = ReportGenerator(
@@ -1661,6 +1840,7 @@ def generate_report_pdf(
         map_image=map_image,
         visualization_images=visualization_images,
         user_request=user_request,
+        analysis_text=analysis_text,
     )
 
     report = generator.generate_report(
