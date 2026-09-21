@@ -1,7 +1,7 @@
 # ============================================================
 # PLANAPP AI — OPENAI
 #
-# ETAPA 1 — REFATORAÇÃO
+# ETAPA 2 — MULTI-HOP
 #
 # Jupyter
 #    |
@@ -12,23 +12,41 @@
 # geocode_place
 #    |
 #    v
-# aplicação -> evaluate_link
+# aplicação
+#    |
+#    +--> enlace único:
+#    |       evaluate_link
+#    |
+#    +--> multi-hop:
+#            ensure_multi_hop_evaluation
+#                 |
+#                 +--> evaluate_link A -> B
+#                 +--> evaluate_link B -> C
+#                 +--> evaluate_link C -> D
 #    |
 #    +--> mapa interativo
-#    +--> visualizações
-#    |
+#    +--> visualizações por hop
 #    +--> relatório técnico / PDF
 #    |
 #    v
 # análise técnica final
 #
-# NÃO implementa multi-hop.
+# IMPORTANTE:
+#
+# evaluate_link continua sendo uma operação de UM único enlace.
+#
+# O multi-hop é orquestrado pela aplicação através de
+# ensure_multi_hop_evaluation(), implementada em agent_common.py.
+#
+# As visualizações são geradas uma única vez para cada hop.
+# O mapa, por sua vez, representa toda a rota multi-hop.
 # ============================================================
 
 import asyncio
 import base64
 import json
 import os
+import re
 
 from openai import AsyncOpenAI
 
@@ -103,28 +121,333 @@ class PlanAppAgent(PlanAppAgentCommon):
 
         self.technical_report = ""
 
+        # ================================================================
         # SOLICITAÇÃO ORIGINAL DO USUÁRIO
+        # ================================================================
+
         self.user_request = ""
 
         self.report_pdf_path = None
 
+        # ================================================================
+        # ETAPA 2 — CONTROLE DO TIPO DE ANÁLISE
+        # ================================================================
+
+        self.multi_hop_requested = False
+
+        # ================================================================
+        # CONTROLE DO ESTADO DE GEOCODIFICAÇÃO
+        #
+        # IMPORTANTE:
+        #
+        # A aplicação não deve executar evaluate_link apenas porque
+        # apareceram dois pontos.
+        #
+        # Primeiro deixamos o GPT continuar o processo de geocodificação.
+        #
+        # Quando existirem 3 ou mais pontos, a aplicação promove
+        # automaticamente a solicitação para multi-hop.
+        # ================================================================
+
+        self.geocoding_followup_sent = False
+
+        # ================================================================
         # MAPA
+        # ================================================================
+
         self.map = None
+
         self.map_image_bytes = None
 
+        # ================================================================
         # VISUALIZAÇÕES
+        # ================================================================
+
         self.visualizations = []
+
         self.visualization_images = []
 
+        self.visualizations_generated_hops = set()
+
+        # ================================================================
         # USAGE / CUSTOS
+        # ================================================================
+
         self.input_tokens = 0
+
         self.cached_input_tokens = 0
+
         self.output_tokens = 0
 
         self.input_cost = 0.0
+
         self.cached_input_cost = 0.0
+
         self.output_cost = 0.0
+
         self.total_cost = 0.0
+
+    # ========================================================================
+    # ETAPA 2 — DETECÇÃO DE SOLICITAÇÃO MULTI-HOP
+    # ========================================================================
+
+    def detect_multi_hop_request(
+        self,
+        text,
+    ):
+        """
+        Detecta se a solicitação do usuário aparenta descrever
+        uma rota com três ou mais pontos.
+
+        Esta função NÃO identifica as localidades.
+
+        A identificação das localidades continua sendo responsabilidade
+        do LLM através de geocode_place.
+
+        O objetivo aqui é somente impedir que o fluxo da ETAPA 1
+        execute A -> B antes de o agente terminar de obter os demais
+        pontos da rota.
+        """
+
+        if not text:
+            return False
+
+        normalized = (
+            str(text)
+            .strip()
+            .lower()
+        )
+
+        # ------------------------------------------------------------
+        # Indicadores explícitos de multi-hop
+        # ------------------------------------------------------------
+
+        explicit_patterns = [
+            r"\bmulti[\s-]?hop\b",
+            r"\bmulti[\s-]?enlace\b",
+            r"\bmulti[\s-]?link\b",
+            r"\bpor\s+.+\s+passando\s+por\b",
+            r"\bpassando\s+por\b",
+            r"\batrav[eé]s\s+de\b",
+            r"\bvia\b",
+            r"\brota\b",
+            r"\btrajeto\b",
+            r"\bsequ[eê]ncia\s+de\s+enlaces\b",
+            r"\bv[aá]rios\s+enlaces\b",
+            r"\bv[aá]rios\s+saltos\b",
+            r"\bsaltos\b",
+            r"\bhops?\b",
+        ]
+
+        for pattern in explicit_patterns:
+
+            if re.search(
+                pattern,
+                normalized,
+            ):
+                return True
+
+        # ------------------------------------------------------------
+        # Notação explícita:
+        #
+        # A -> B -> C
+        # A → B → C
+        # ------------------------------------------------------------
+
+        arrow_count = len(
+            re.findall(
+                r"(?:->|→|⇒|⟶)",
+                normalized,
+            )
+        )
+
+        if arrow_count >= 2:
+            return True
+
+        # ------------------------------------------------------------
+        # Listas com três ou mais localidades
+        # ------------------------------------------------------------
+
+        multi_point_patterns = [
+
+            r"\bentre\s+.+,\s*.+\s+e\s+.+",
+
+            r"\bentre\s+.+,\s*.+,\s*.+",
+
+            r"\bde\s+.+\s+até\s+.+\s+passando\s+por\s+.+",
+
+            r"\banalise\s+.+,\s*.+\s+e\s+.+",
+
+            r"\banalisar\s+.+,\s*.+\s+e\s+.+",
+
+            r"\bavalie\s+.+,\s*.+\s+e\s+.+",
+
+            r"\bavaliar\s+.+,\s*.+\s+e\s+.+",
+
+            # Exemplos adicionais:
+            #
+            # "faça uma análise entre A, B e C"
+            # "faca uma analise entre A, B e C"
+            # "faça uma análise de A, B e C"
+            # "analise os enlaces entre A, B e C"
+            #
+
+            r"\bfa[cç]a\s+(?:uma\s+)?an[aá]lise\b.+,\s*.+\s+e\s+.+",
+
+            r"\ban[aá]lise\s+(?:dos\s+enlaces\s+)?entre\s+.+,\s*.+\s+e\s+.+",
+
+            r"\banalis[ea]\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
+
+            r"\bavalie\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
+        ]
+
+        for pattern in multi_point_patterns:
+
+            if re.search(
+                pattern,
+                normalized,
+            ):
+                return True
+
+        # ------------------------------------------------------------
+        # Indicador adicional:
+        #
+        # uma solicitação contendo duas vírgulas ou mais junto com
+        # uma conjunção "e" normalmente representa uma sequência
+        # de três elementos.
+        #
+        # Não usamos isso isoladamente: exigimos também um verbo/
+        # contexto de análise ou de rota.
+        # ------------------------------------------------------------
+
+        comma_count = normalized.count(",")
+
+        route_context = re.search(
+            r"\b("
+            r"analise|analisar|análise|analise|"
+            r"avalie|avaliar|enlace|enlaces|"
+            r"link|links|rota|trajeto|"
+            r"pontos?|localidades?"
+            r")\b",
+            normalized,
+        )
+
+        if (
+            comma_count >= 2
+            and re.search(
+                r"\be\b",
+                normalized,
+            )
+            and route_context
+        ):
+            return True
+
+        return False
+
+    # ========================================================================
+    # ETAPA 2 — DECISÃO DO TIPO DE AVALIAÇÃO
+    # ========================================================================
+
+    async def ensure_application_evaluation(
+        self,
+    ):
+        """
+        Decide qual orquestrador deve ser utilizado.
+
+        2 pontos:
+            ensure_evaluate_link()
+
+        3+ pontos:
+            ensure_multi_hop_evaluation()
+
+        A função nunca transforma evaluate_link em super-tool.
+
+        IMPORTANTE:
+        Se 3 ou mais pontos já foram geocodificados, a aplicação
+        promove automaticamente a solicitação para multi-hop.
+
+        Isso funciona como uma proteção adicional caso a detecção
+        textual inicial não tenha identificado corretamente a intenção.
+        """
+
+        point_count = len(
+            self.geocoded_points
+        )
+
+        # ------------------------------------------------------------
+        # PROTEÇÃO MULTI-HOP
+        #
+        # Se a aplicação já possui 3 ou mais pontos, não existe
+        # justificativa para executar somente o primeiro enlace.
+        #
+        # A rota é formada pelos pontos consecutivos:
+        #
+        # A -> B
+        # B -> C
+        # C -> D
+        #
+        # etc.
+        # ------------------------------------------------------------
+
+        if (
+            point_count >= 3
+            and not self.multi_hop_requested
+        ):
+
+            self.multi_hop_requested = True
+
+            self.log_detail(
+                "🔗 Três ou mais pontos geocodificados; "
+                "solicitação promovida automaticamente "
+                "para multi-hop."
+            )
+
+        # ------------------------------------------------------------
+        # MULTI-HOP
+        # ------------------------------------------------------------
+
+        if self.multi_hop_requested:
+
+            if point_count < 3:
+
+                self.log_detail(
+                    "⏳ Solicitação multi-hop detectada. "
+                    f"Aguardando pontos adicionais "
+                    f"(atualmente {point_count})."
+                )
+
+                return None
+
+            if getattr(
+                self,
+                "multi_hop_executed",
+                False,
+            ):
+
+                return self.global_result
+
+            return await (
+                self.ensure_multi_hop_evaluation(
+                    route_points=self.geocoded_points,
+                    parameters=self.link_parameters,
+                )
+            )
+
+        # ------------------------------------------------------------
+        # ETAPA 1 — ENLACE ÚNICO
+        # ------------------------------------------------------------
+
+        if point_count >= 2:
+
+            if self.evaluate_executed:
+
+                return self.last_evaluate_result
+
+            return await (
+                self.ensure_evaluate_link()
+            )
+
+        return None
 
     # ========================================================================
     # SYSTEM PROMPT
@@ -142,55 +465,137 @@ REGRAS:
 2. Nunca invente unidades.
 3. Nunca altere resultados retornados pelo PlanApp.
 4. Não recalcule valores técnicos quando o PlanApp já os forneceu.
-5. Quando o usuário fornecer duas localidades, utilize geocode_place para obter suas coordenadas.
-6. Depois de obtidos os dois pontos, a aplicação executará automaticamente evaluate_link.
-7. NÃO execute evaluate_link diretamente.
-8. evaluate_link é controlado pela aplicação.
-9. Mapa e visualizações também são controlados pela aplicação.
-10. Não peça ao usuário para executar ferramentas.
-11. Preserve frequência, TX, RX e rooftop solicitados.
-12. Frequências podem ser informadas em GHz, MHz, kHz ou Hz.
-13. Padrões:
+
+5. Quando o usuário fornecer duas localidades, utilize geocode_place para obter as coordenadas das duas localidades.
+
+6. Quando o usuário fornecer uma rota com três ou mais localidades, utilize geocode_place para obter as coordenadas de TODAS as localidades da rota, na ordem informada pelo usuário.
+
+7. Em uma rota multi-hop, preserve rigorosamente a ordem dos pontos fornecida pelo usuário.
+
+8. Exemplos de rota multi-hop:
+
+       A -> B -> C
+
+   deve representar:
+
+       Hop 1: A -> B
+       Hop 2: B -> C
+
+9. Outro exemplo:
+
+       A -> B -> C -> D
+
+   deve representar:
+
+       Hop 1: A -> B
+       Hop 2: B -> C
+       Hop 3: C -> D
+
+10. Não pare a geocodificação depois dos dois primeiros pontos quando o usuário tiver solicitado uma rota com três ou mais pontos.
+
+11. Antes de qualquer avaliação técnica, certifique-se de que todas as localidades necessárias para a solicitação tenham sido geocodificadas.
+
+12. NÃO execute evaluate_link diretamente.
+
+13. evaluate_link é controlado pela aplicação.
+
+14. Em uma análise multi-hop, evaluate_link continua representando apenas UM enlace.
+
+15. A aplicação é responsável por executar os enlaces consecutivos da rota.
+
+16. Não peça ao usuário para executar ferramentas.
+
+17. Preserve frequência, TX, RX e rooftop solicitados.
+
+18. Frequências podem ser informadas em GHz, MHz, kHz ou Hz.
+
+19. Padrões:
        900 MHz
        TX 7 m
        RX 7 m
        rooftop=false
-14. FSPL significa perda de percurso em espaço livre.
-15. FSPL não significa interferência.
-16. Não conclua viabilidade do enlace sem um critério técnico explícito.
-17. Não invente potência TX.
-18. Não invente ganho de antena.
-19. Não invente sensibilidade do receptor.
-20. Não invente margem de enlace.
-21. Não atribua significado físico a campos cuja definição não esteja explicitamente documentada pelo PlanApp.
-22. Não atribua significado próprio a core, fresnel, boundary, delta_diffra, VV, v_v ou d_norm.
-23. Não converta radianos para graus.
-24. status OK significa somente que a execução foi realizada com sucesso.
-25. O resultado fornecido pela aplicação é a fonte de verdade.
-26. O relatório técnico fornecido pela aplicação é apenas uma apresentação estruturada dos dados reais do PlanApp.
-27. Não altere, recalcule ou contradiga os valores presentes no relatório técnico.
-28. Diferencie claramente parâmetros solicitados pelo usuário de parâmetros efetivamente enviados ao PlanApp.
-29. Se um campo técnico não tiver definição explícita, apresente o valor somente como resultado retornado pelo PlanApp, sem atribuir significado adicional.
 
-30. A resposta técnica NÃO deve ser apenas uma reprodução do JSON.
-31. Organize os resultados em seções claras.
-32. Faça uma síntese objetiva dos resultados efetivamente retornados.
-33. Pode comparar numericamente valores que já foram retornados pelo PlanApp.
-34. Pode destacar diferenças entre parâmetros solicitados e parâmetros efetivamente utilizados.
-35. Pode destacar distância, FSPL, delta_diffra, resultados de terreno, vegetação, edificações e resultados geométricos quando esses valores estiverem presentes.
-36. Ao apresentar conjuntos como terreno, vegetação ou edificações, deixe claro que são resultados retornados pelo PlanApp.
-37. Não atribua interpretação física adicional aos nomes dos campos quando sua definição não estiver documentada.
-38. Informe quais etapas foram efetivamente executadas quando essa informação estiver disponível.
-39. Diferencie claramente:
+20. FSPL significa perda de percurso em espaço livre.
+
+21. FSPL não significa interferência.
+
+22. Não conclua viabilidade do enlace sem um critério técnico explícito.
+
+23. Não invente potência TX.
+
+24. Não invente ganho de antena.
+
+25. Não invente sensibilidade do receptor.
+
+26. Não invente margem de enlace.
+
+27. Não atribua significado físico a campos cuja definição não esteja explicitamente documentada pelo PlanApp.
+
+28. Não atribua significado próprio a core, fresnel, boundary, delta_diffra, VV, v_v ou d_norm.
+
+29. Não converta radianos para graus.
+
+30. status OK significa somente que a execução foi realizada com sucesso.
+
+31. O resultado fornecido pela aplicação é a fonte de verdade.
+
+32. O relatório técnico fornecido pela aplicação é apenas uma apresentação estruturada dos dados reais do PlanApp.
+
+33. Não altere, recalcule ou contradiga os valores presentes no relatório técnico.
+
+34. Diferencie claramente parâmetros solicitados pelo usuário de parâmetros efetivamente enviados ao PlanApp.
+
+35. Se um campo técnico não tiver definição explícita, apresente o valor somente como resultado retornado pelo PlanApp, sem atribuir significado adicional.
+
+36. A resposta técnica NÃO deve ser apenas uma reprodução do JSON.
+
+37. Organize os resultados em seções claras.
+
+38. Faça uma síntese objetiva dos resultados efetivamente retornados.
+
+39. Pode comparar numericamente valores que já foram retornados pelo PlanApp.
+
+40. Pode destacar diferenças entre parâmetros solicitados e parâmetros efetivamente utilizados.
+
+41. Pode destacar distância, FSPL, delta_diffra, resultados de terreno, vegetação, edificações e resultados geométricos quando esses valores estiverem presentes.
+
+42. Ao apresentar conjuntos como terreno, vegetação ou edificações, deixe claro que são resultados retornados pelo PlanApp.
+
+43. Não atribua interpretação física adicional aos nomes dos campos quando sua definição não estiver documentada.
+
+44. Informe quais etapas foram efetivamente executadas quando essa informação estiver disponível.
+
+45. Diferencie claramente:
        - dados fornecidos pelo usuário;
        - parâmetros efetivamente utilizados;
        - resultados retornados pelo PlanApp;
        - limitações da interpretação.
-40. Não declare o enlace como viável ou inviável sem um critério técnico explícito.
-41. Não invente uma margem, limiar, classificação ou conclusão de engenharia que não esteja presente nos dados.
-42. A resposta final deve ser em português do Brasil.
-43. Seja técnico, claro, objetivo e informativo.
-44. Prefira uma análise estruturada a uma simples listagem de campos.
+
+46. Não declare o enlace como viável ou inviável sem um critério técnico explícito.
+
+47. Não invente uma margem, limiar, classificação ou conclusão de engenharia que não esteja presente nos dados.
+
+48. Em análises multi-hop, apresente os resultados de cada hop separadamente quando esses resultados estiverem disponíveis.
+
+49. Em análises multi-hop, deixe explícita a sequência dos enlaces:
+       Hop 1
+       Hop 2
+       Hop 3
+       etc.
+
+50. Não combine resultados de hops diferentes em um único valor técnico que não tenha sido fornecido pelo PlanApp.
+
+51. Não calcule uma conclusão global de viabilidade da rota sem um critério técnico explícito fornecido pelo PlanApp ou pelo usuário.
+
+52. Mapa e visualizações são controlados pela aplicação.
+
+53. A aplicação é responsável pela execução técnica dos enlaces.
+
+54. A resposta final deve ser em português do Brasil.
+
+55. Seja técnico, claro, objetivo e informativo.
+
+56. Prefira uma análise estruturada a uma simples listagem de campos.
 """
 
     # ========================================================================
@@ -611,6 +1016,74 @@ REGRAS:
             )
 
     # ========================================================================
+    # AUXILIAR — IDENTIFICAÇÃO DO HOP ATUAL
+    # ========================================================================
+
+    def _get_current_hop_info(
+        self,
+    ):
+        """
+        Retorna informações do hop atualmente em processamento.
+        """
+
+        if not self.multi_hop_requested:
+
+            return {
+                "key": "single",
+                "index": None,
+                "name": None,
+            }
+
+        current_hop = getattr(
+            self,
+            "current_hop",
+            None,
+        )
+
+        if isinstance(
+            current_hop,
+            dict,
+        ):
+
+            index = current_hop.get(
+                "index"
+            )
+
+            hop_id = current_hop.get(
+                "id"
+            )
+
+            name = current_hop.get(
+                "name"
+            )
+
+            if index is not None:
+
+                key = (
+                    f"hop_{index}"
+                )
+
+            elif hop_id:
+
+                key = str(
+                    hop_id
+                )
+
+            else:
+
+                key = (
+                    f"hop_{id(current_hop)}"
+                )
+
+            return {
+                "key": key,
+                "index": index,
+                "name": name,
+            }
+
+        return None
+
+    # ========================================================================
     # VISUALIZAÇÕES
     # ========================================================================
 
@@ -618,11 +1091,93 @@ REGRAS:
         self,
     ):
 
-        if not self.evaluate_executed:
+        if not self.multi_hop_requested:
+
+            if not self.evaluate_executed:
+                return
+
+            if self.evaluate_error:
+                return
+
+            hop_info = {
+                "key": "single",
+                "index": None,
+                "name": None,
+            }
+
+        else:
+
+            if self.multi_hop_error:
+                return
+
+            hop_info = (
+                self._get_current_hop_info()
+            )
+
+            if hop_info is None:
+
+                self.log_detail(
+                    "⚠️ Não foi possível identificar "
+                    "o hop atual para gerar "
+                    "as visualizações."
+                )
+
+                return
+
+        hop_key = hop_info["key"]
+
+        if hop_key in (
+            self.visualizations_generated_hops
+        ):
+
+            self.log_detail(
+                "Visualizações já preparadas "
+                f"para {hop_key}; "
+                "nova geração ignorada."
+            )
+
             return
 
-        if self.evaluate_error:
-            return
+        if self.multi_hop_requested:
+
+            hop_index = (
+                hop_info.get("index")
+            )
+
+            hop_name = (
+                hop_info.get("name")
+            )
+
+            if hop_name:
+
+                if hop_index is not None:
+
+                    hop_title = (
+                        f"Hop {hop_index} — "
+                        f"{hop_name}"
+                    )
+
+                else:
+
+                    hop_title = (
+                        str(hop_name)
+                    )
+
+            else:
+
+                if hop_index is not None:
+
+                    hop_title = (
+                        f"Hop {hop_index}"
+                    )
+
+                else:
+
+                    hop_title = "Hop"
+
+        else:
+
+            hop_title = None
 
         tools = [
             (
@@ -667,14 +1222,12 @@ REGRAS:
             ),
         ]
 
-        self.visualizations = []
-
-        self.visualization_images = []
+        generated_count = 0
 
         for (
             tool_name,
             arguments,
-            title,
+            image_type,
         ) in tools:
 
             try:
@@ -696,9 +1249,12 @@ REGRAS:
                     parsed,
                     dict,
                 ):
+
                     self.log_detail(
-                        f"⚠️ {title}: resultado não é um objeto."
+                        f"⚠️ {image_type}: "
+                        "resultado não é um objeto."
                     )
+
                     continue
 
                 if parsed.get(
@@ -706,8 +1262,10 @@ REGRAS:
                 ) != "image":
 
                     self.log_detail(
-                        f"⚠️ {title}: resultado não contém imagem."
+                        f"⚠️ {image_type}: "
+                        "resultado não contém imagem."
                     )
+
                     continue
 
                 data = parsed.get(
@@ -715,9 +1273,12 @@ REGRAS:
                 )
 
                 if not data:
+
                     self.log_detail(
-                        f"⚠️ {title}: imagem sem dados."
+                        f"⚠️ {image_type}: "
+                        "imagem sem dados."
                     )
+
                     continue
 
                 image_bytes = (
@@ -735,6 +1296,17 @@ REGRAS:
                     ),
                 )
 
+                if hop_title:
+
+                    title = (
+                        f"{hop_title} — "
+                        f"{image_type}"
+                    )
+
+                else:
+
+                    title = image_type
+
                 self.visualizations.append(
                     image
                 )
@@ -747,10 +1319,8 @@ REGRAS:
                     }
                 )
 
-                # IMPORTANTE:
-                # O callback recebe UMA imagem e o título.
-                # O notebook_ui.py adiciona essa imagem
-                # incrementalmente ao VBox.
+                generated_count += 1
+
                 if self.visualization_callback:
 
                     self.visualization_callback(
@@ -759,19 +1329,29 @@ REGRAS:
                     )
 
                 self.log_detail(
-                    f"Visualização preparada: {title}"
+                    f"Visualização preparada: "
+                    f"{title}"
                 )
 
             except Exception as exc:
 
                 self.log_detail(
                     f"⚠️ Visualização "
-                    f"{title}: {exc}"
+                    f"{image_type}: {exc}"
                 )
 
+        self.visualizations_generated_hops.add(
+            hop_key
+        )
+
         self.log_detail(
-            "Total de visualizações "
-            f"preparadas: "
+            "Visualizações do "
+            f"{hop_title or 'enlace único'} "
+            f"preparadas: {generated_count}"
+        )
+
+        self.log_detail(
+            "Total acumulado de visualizações: "
             f"{len(self.visualization_images)}"
         )
 
@@ -845,10 +1425,6 @@ REGRAS:
             ),
         }
 
-        # --------------------------------------------------------------------
-        # GARANTIR IMAGEM DO MAPA
-        # --------------------------------------------------------------------
-
         if (
             self.map_image_bytes is None
             and len(
@@ -858,26 +1434,47 @@ REGRAS:
 
             try:
 
-                from map_utils import (
-                    gerar_imagem_mapa_enlace
-                )
-
-                p1 = (
-                    self.geocoded_points[0]
-                )
-
-                p2 = (
-                    self.geocoded_points[1]
-                )
-
-                self.map_image_bytes = (
-                    gerar_imagem_mapa_enlace(
-                        p1["lat"],
-                        p1["lon"],
-                        p2["lat"],
-                        p2["lon"],
+                if (
+                    self.multi_hop_requested
+                    and getattr(
+                        self,
+                        "hops",
+                        None,
                     )
-                )
+                ):
+
+                    from map_utils import (
+                        gerar_imagem_mapa_multihop,
+                    )
+
+                    self.map_image_bytes = (
+                        gerar_imagem_mapa_multihop(
+                            self.hops
+                        )
+                    )
+
+                else:
+
+                    from map_utils import (
+                        gerar_imagem_mapa_enlace,
+                    )
+
+                    p1 = (
+                        self.geocoded_points[0]
+                    )
+
+                    p2 = (
+                        self.geocoded_points[1]
+                    )
+
+                    self.map_image_bytes = (
+                        gerar_imagem_mapa_enlace(
+                            p1["lat"],
+                            p1["lon"],
+                            p2["lat"],
+                            p2["lon"],
+                        )
+                    )
 
             except Exception as exc:
 
@@ -888,14 +1485,6 @@ REGRAS:
                     f"{exc}"
                 )
 
-        # --------------------------------------------------------------------
-        # GERADOR
-        # --------------------------------------------------------------------
-
-        # Quando a análise final já foi produzida, ela passa a ser o
-        # conteúdo oficial do relatório. Se não for fornecida, preservamos
-        # o comportamento anterior e o ReportGenerator usa o relatório
-        # estruturado de dados como fallback.
         if analysis_text is None:
             analysis_text = self.technical_report or None
 
@@ -915,10 +1504,6 @@ REGRAS:
         )
 
         self.technical_report = report
-
-        # --------------------------------------------------------------------
-        # PDF
-        # --------------------------------------------------------------------
 
         pdf_path = generator.generate_pdf(
             report_text=report,
@@ -979,23 +1564,70 @@ REGRAS:
             if text:
                 self.last_agent_text = text
 
+            # ================================================================
+            # SEM TOOL CALLS
+            # ================================================================
+
             if not tool_calls:
 
-                if (
-                    len(
-                        self.geocoded_points
-                    ) >= 2
-                    and not self.evaluate_executed
-                ):
+                result = (
+                    await self.ensure_application_evaluation()
+                )
 
-                    result = (
-                        await self.ensure_evaluate_link()
+                if result is not None:
+
+                    self.append_technical_context(
+                        result
                     )
 
-                    if result is not None:
+                    response = (
+                        await self.openai_chat(
+                            self.messages,
+                            self.build_openai_tools(),
+                            previous_response_id=None,
+                        )
+                    )
 
-                        self.append_technical_context(
-                            result
+                    continue
+
+                # ------------------------------------------------------------
+                # Se uma solicitação foi identificada como multi-hop mas
+                # ainda temos menos de 3 pontos, não devemos simplesmente
+                # encerrar o turno.
+                #
+                # Pedimos explicitamente ao GPT para continuar a
+                # geocodificação da rota.
+                # ------------------------------------------------------------
+
+                if (
+                    self.multi_hop_requested
+                    and len(
+                        self.geocoded_points
+                    ) < 3
+                ):
+
+                    if not self.geocoding_followup_sent:
+
+                        self.geocoding_followup_sent = True
+
+                        followup = {
+                            "role": "user",
+                            "content": (
+                                "A solicitação atual descreve "
+                                "uma rota multi-hop. "
+                                "Ainda existem menos de três "
+                                "pontos geocodificados. "
+                                "Continue identificando e "
+                                "geocodificando, na ordem "
+                                "solicitada pelo usuário, todas "
+                                "as localidades restantes da rota "
+                                "antes de concluir a resposta. "
+                                "Não execute avaliação técnica."
+                            ),
+                        }
+
+                        self.messages.append(
+                            followup
                         )
 
                         response = (
@@ -1009,6 +1641,10 @@ REGRAS:
                         continue
 
                 return text
+
+            # ================================================================
+            # EXECUÇÃO DAS FERRAMENTAS SOLICITADAS PELO GPT
+            # ================================================================
 
             tool_outputs = []
 
@@ -1081,6 +1717,34 @@ REGRAS:
                     }
                 )
 
+            # ================================================================
+            # DEVOLVER RESULTADO DAS TOOLS AO GPT
+            #
+            # CORREÇÃO PRINCIPAL DA ETAPA 2:
+            #
+            # NÃO chamar ensure_application_evaluation() imediatamente
+            # depois de retornar os resultados das ferramentas.
+            #
+            # Antes:
+            #
+            #   geocode A
+            #   geocode B
+            #   evaluate A -> B
+            #   geocode C
+            #
+            # Agora:
+            #
+            #   geocode A
+            #   geocode B
+            #   GPT continua
+            #   geocode C
+            #   3 pontos
+            #   multi-hop
+            #   evaluate A -> B
+            #   evaluate B -> C
+            #
+            # ================================================================
+
             if tool_outputs:
 
                 response_id = getattr(
@@ -1105,59 +1769,76 @@ REGRAS:
                     )
                 )
 
-                if (
-                    len(
-                        self.geocoded_points
-                    ) >= 2
-                    and not self.evaluate_executed
-                ):
+                # ------------------------------------------------------------
+                # NÃO executar avaliação aqui.
+                #
+                # Esta é a correção crítica.
+                #
+                # O próximo response da OpenAI terá a oportunidade
+                # de solicitar outras geocodificações.
+                # ------------------------------------------------------------
 
-                    result = (
-                        await self.ensure_evaluate_link()
+                continue
+
+            # ================================================================
+            # PROTEÇÃO PARA O CASO DE NÃO HAVER SAÍDA DE TOOL
+            # ================================================================
+
+            result = (
+                await self.ensure_application_evaluation()
+            )
+
+            if result is not None:
+
+                self.append_technical_context(
+                    result
+                )
+
+                response = (
+                    await self.openai_chat(
+                        self.messages,
+                        self.build_openai_tools(),
+                        previous_response_id=None,
                     )
-
-                    if result is not None:
-
-                        self.append_technical_context(
-                            result
-                        )
-
-                        response = (
-                            await self.openai_chat(
-                                self.messages,
-                                self.build_openai_tools(),
-                                previous_response_id=None,
-                            )
-                        )
+                )
 
                 continue
 
             if (
-                len(
+                self.multi_hop_requested
+                and len(
                     self.geocoded_points
-                ) >= 2
-                and not self.evaluate_executed
+                ) < 3
+                and not self.geocoding_followup_sent
             ):
 
-                result = (
-                    await self.ensure_evaluate_link()
+                self.geocoding_followup_sent = True
+
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Continue a geocodificação da "
+                            "rota multi-hop solicitada. "
+                            "Ainda não foram obtidas todas "
+                            "as localidades necessárias. "
+                            "Use geocode_place para obter "
+                            "os pontos restantes na ordem "
+                            "da solicitação original. "
+                            "Não execute avaliação técnica."
+                        ),
+                    }
                 )
 
-                if result is not None:
-
-                    self.append_technical_context(
-                        result
+                response = (
+                    await self.openai_chat(
+                        self.messages,
+                        self.build_openai_tools(),
+                        previous_response_id=None,
                     )
+                )
 
-                    response = (
-                        await self.openai_chat(
-                            self.messages,
-                            self.build_openai_tools(),
-                            previous_response_id=None,
-                        )
-                    )
-
-                    continue
+                continue
 
             return text
 
@@ -1233,9 +1914,9 @@ Use Markdown simples para a formatação:
 - títulos de seção com `##`;
 - subtítulos com `###`;
 - listas com `-`;
-- destaque pontual com `**negrito**`.
+- destaque pontual com `**negrito**.
 
-Quando houver dados suficientes, estruture a resposta com as seguintes seções:
+Para um enlace único, mantenha a estrutura tradicional:
 
 ## 1. IDENTIFICAÇÃO DO ENLACE
 - localidades TX e RX;
@@ -1270,6 +1951,40 @@ Quando houver dados suficientes, estruture a resposta com as seguintes seções:
 ## 7. OBSERVAÇÕES E LIMITAÇÕES
 - diferencie dados efetivamente calculados pelo PlanApp de interpretações que exigiriam critérios técnicos adicionais.
 
+Para uma rota multi-hop:
+
+## 1. IDENTIFICAÇÃO DA ROTA
+- apresente os pontos na ordem recebida;
+- apresente a sequência dos hops.
+
+## 2. PARÂMETROS
+- parâmetros solicitados;
+- parâmetros efetivamente utilizados.
+
+## 3. RESULTADOS POR HOP
+
+Para cada hop, apresente separadamente:
+- TX;
+- RX;
+- distância;
+- FSPL;
+- delta_diffra;
+- resultados geoespaciais disponíveis;
+- resultados geométricos disponíveis;
+- status.
+
+Não misture os resultados técnicos de hops diferentes.
+
+## 4. EXECUÇÃO DA ROTA
+- quantidade total de hops;
+- quantidade de hops concluídos;
+- status global retornado pela aplicação.
+
+## 5. OBSERVAÇÕES E LIMITAÇÕES
+- destaque eventuais hops com erro;
+- não declare viabilidade global da rota sem critério técnico explícito;
+- não crie uma métrica global que não tenha sido retornada pelo PlanApp.
+
 IMPORTANTE:
 
 - Não invente valores.
@@ -1279,7 +1994,7 @@ IMPORTANTE:
 - Não transforme radianos em graus.
 - Não invente potência, ganho, sensibilidade, margem ou limiares.
 - Não atribua significado próprio a core, fresnel, boundary, delta_diffra, VV, v_v ou d_norm.
-- Não declare o enlace como viável ou inviável sem um critério técnico explícito.
+- Não declare um enlace ou rota como viável ou inviável sem um critério técnico explícito.
 - Não diga que um enlace está "bom", "ruim", "aprovado" ou "reprovado" sem um critério documentado.
 - Quando um valor não tiver definição explícita, apresente-o simplesmente como resultado retornado pelo PlanApp.
 - Faça uma síntese técnica clara dos dados disponíveis.
@@ -1326,10 +2041,35 @@ IMPORTANTE:
 
         self.report_pdf_path = None
 
-        # IMPORTANTE:
-        # guardar exatamente a solicitação recebida
-        # para utilização posterior no relatório.
         self.user_request = text
+
+        # ================================================================
+        # ETAPA 2
+        # ================================================================
+
+        self.multi_hop_requested = (
+            self.detect_multi_hop_request(
+                text
+            )
+        )
+
+        self.geocoding_followup_sent = False
+
+        if self.multi_hop_requested:
+
+            self.log_detail(
+                "🔗 Solicitação multi-hop detectada."
+            )
+
+        else:
+
+            self.log_detail(
+                "🔗 Solicitação de enlace único."
+            )
+
+        # ================================================================
+        # RESET LOCAL
+        # ================================================================
 
         self.map = None
 
@@ -1338,6 +2078,8 @@ IMPORTANTE:
         self.visualizations = []
 
         self.visualization_images = []
+
+        self.visualizations_generated_hops = set()
 
         self.input_tokens = 0
 
@@ -1376,53 +2118,138 @@ IMPORTANTE:
 
         await self.agent_turn()
 
-        if (
-            len(
-                self.geocoded_points
-            ) >= 2
-            and not self.evaluate_executed
-        ):
+        # ================================================================
+        # APLICAÇÃO — AVALIAÇÃO FINAL
+        # ================================================================
 
-            result = (
-                await self.ensure_evaluate_link()
-            )
+        result = (
+            await self.ensure_application_evaluation()
+        )
 
-            if result is not None:
+        if result is not None:
+
+            if not self.technical_context_added:
 
                 self.append_technical_context(
                     result
                 )
 
-        if len(
-            self.geocoded_points
-        ) >= 2:
+            if self.multi_hop_requested:
 
-            await self.mostrar_mapa_apos_geocodificacao()
+                final_result = (
+                    getattr(
+                        self,
+                        "global_result",
+                        result,
+                    )
+                )
 
-        if (
-            self.evaluate_executed
-            and not self.evaluate_error
-        ):
+            else:
 
-            await self.gerar_visualizacoes()
+                final_result = (
+                    self.last_evaluate_result
+                )
 
-        if self.evaluate_executed:
+        else:
+
+            final_result = None
+
+        # ================================================================
+        # MAPA
+        # ================================================================
+
+        if self.multi_hop_requested:
+
+            if (
+                getattr(
+                    self,
+                    "multi_hop_executed",
+                    False,
+                )
+                and getattr(
+                    self,
+                    "hops",
+                    None,
+                )
+            ):
+
+                try:
+
+                    from map_utils import (
+                        mostrar_mapa_multihop,
+                        gerar_imagem_mapa_multihop,
+                    )
+
+                    self.map = (
+                        mostrar_mapa_multihop(
+                            self.hops
+                        )
+                    )
+
+                    if self.map_callback:
+
+                        self.map_callback(
+                            self.map
+                        )
+
+                    self.map_image_bytes = (
+                        gerar_imagem_mapa_multihop(
+                            self.hops
+                        )
+                    )
+
+                    self.log_detail(
+                        "Mapa multi-hop preparado "
+                        f"com {len(self.hops)} hops."
+                    )
+
+                    self.log_detail(
+                        "Imagem estática do mapa "
+                        "multi-hop preparada para "
+                        "o relatório."
+                    )
+
+                except Exception as exc:
+
+                    self.log_detail(
+                        f"⚠️ Erro no mapa multi-hop: "
+                        f"{exc}"
+                    )
+
+        else:
+
+            if len(
+                self.geocoded_points
+            ) >= 2:
+
+                await (
+                    self.mostrar_mapa_apos_geocodificacao()
+                )
+
+        # ================================================================
+        # VISUALIZAÇÕES
+        #
+        # Não chamar gerar_visualizacoes() novamente.
+        # ================================================================
+
+        # ================================================================
+        # RESPOSTA FINAL
+        # ================================================================
+
+        if final_result is not None:
 
             answer = (
                 await self.generate_final_response(
                     text,
-                    self.last_evaluate_result,
+                    final_result,
                     technical_report=None,
                 )
             )
 
-            # O texto final produzido pelo OpenAI é o texto oficial do
-            # relatório. O PDF é gerado somente depois da análise final,
-            # preservando mapa e visualizações já preparados.
             self.technical_report = answer
 
             self.build_report(
-                self.last_evaluate_result,
+                final_result,
                 analysis_text=answer,
             )
 

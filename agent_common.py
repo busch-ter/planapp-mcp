@@ -1,39 +1,48 @@
 # ============================================================
 # PLANAPP AI — COMMON
 #
-# ETAPA 1 — REFATORAÇÃO SEM MUDANÇA DE COMPORTAMENTO
+# ETAPA 2 — MULTI-HOP
 #
-# Este módulo contém somente a lógica compartilhada pelos:
+# Este módulo contém a lógica compartilhada pelos:
 #
 #   agent_ollama.py
 #   agent_openai.py
-#   agent_openroute.py
+#   agent_openrouter.py
+#
+# Arquitetura:
+#
+#   LLM
+#      |
+#      +--> geocode_place
+#      |
+#      v
+#   aplicação
+#      |
+#      +--> evaluate_link
+#      |
+#      +--> multi-hop
+#      |
+#      +--> mapa
+#      |
+#      +--> visualizações
 #
 # IMPORTANTE:
 #
-# Esta versão NÃO implementa multi-hop.
+# evaluate_link continua representando UM enlace.
 #
-# O comportamento atual permanece:
+# A lógica multi-hop somente orquestra várias chamadas
+# independentes de evaluate_link:
 #
-#   geocode P1
-#   geocode P2
-#        |
-#        v
-#   aplicação executa UM evaluate_link
-#        |
-#        +--> mapa
-#        |
-#        +--> visualizações
-#        |
-#        v
-#   modelo produz resposta final
+#   A -> B
+#   B -> C
+#   C -> D
 #
 # A lógica específica de cada LLM permanece nos respectivos
 # arquivos:
 #
 #   Ollama       -> agent_ollama.py
 #   OpenAI       -> agent_openai.py
-#   OpenRouter   -> agent_openroute.py
+#   OpenRouter   -> agent_openrouter.py
 #
 # ============================================================
 
@@ -177,11 +186,6 @@ class PlanAppAgentCommon:
 
         # --------------------------------------------------------
         # Conversação
-        #
-        # Cada agente pode usar sua própria representação de
-        # mensagens.
-        #
-        # O common somente mantém o estado.
         # --------------------------------------------------------
 
         self.messages = []
@@ -189,20 +193,30 @@ class PlanAppAgentCommon:
 
         # --------------------------------------------------------
         # Pontos geocodificados
-        #
-        # ETAPA 1:
-        #
-        # O fluxo continua usando os dois primeiros pontos.
         # --------------------------------------------------------
 
         self.geocoded_points = []
 
 
         # --------------------------------------------------------
+        # ETAPA 2 — ESTADO MULTI-HOP
+        # --------------------------------------------------------
+
+        self.route_points = []
+
+        self.hops = []
+
+        self.current_hop = None
+
+        self.global_result = None
+
+        self.multi_hop_executed = False
+
+        self.multi_hop_error = None
+
+
+        # --------------------------------------------------------
         # Estado da avaliação
-        #
-        # Mantemos exatamente o modelo de estado usado nos
-        # agentes atuais.
         # --------------------------------------------------------
 
         self.evaluate_executed = False
@@ -221,9 +235,6 @@ class PlanAppAgentCommon:
 
         # --------------------------------------------------------
         # Mapa
-        #
-        # A implementação concreta do mapa pode permanecer
-        # específica do agente.
         # --------------------------------------------------------
 
         self.map = None
@@ -271,9 +282,6 @@ class PlanAppAgentCommon:
         # Data + hora:
         #
         # planapp_agent_common_YYYYMMDD_HHMMSS.log
-        #
-        # O agente filho pode substituir o nome do arquivo
-        # quando necessário para manter os nomes atuais.
         # --------------------------------------------------------
 
         os.makedirs(
@@ -332,12 +340,6 @@ class PlanAppAgentCommon:
         self,
         message,
     ):
-        """
-        Log amigável + log técnico.
-
-        Os agentes atuais usam callbacks diferentes para
-        progresso e log detalhado. Mantemos os dois níveis.
-        """
 
         text = str(message)
 
@@ -367,9 +369,6 @@ class PlanAppAgentCommon:
         self,
         message,
     ):
-        """
-        Log técnico detalhado.
-        """
 
         text = str(message)
 
@@ -399,9 +398,6 @@ class PlanAppAgentCommon:
         self,
         result,
     ):
-        """
-        Publica o resultado técnico real do PlanApp.
-        """
 
         if self.result_callback:
 
@@ -423,16 +419,6 @@ class PlanAppAgentCommon:
         self,
         text,
     ):
-        """
-        Extrai:
-
-            frequência
-            altura TX
-            altura RX
-            rooftop
-
-        Mantém o comportamento atual dos agentes.
-        """
 
         text = text or ""
 
@@ -708,13 +694,6 @@ class PlanAppAgentCommon:
     async def connect(
         self,
     ):
-        """
-        Conecta ao PlanApp MCP.
-
-        O agente filho pode sobrescrever este método se precisar
-        de comportamento específico, mas esta é a implementação
-        comum.
-        """
 
         if self.connected:
 
@@ -735,18 +714,6 @@ class PlanAppAgentCommon:
             )
         )
 
-
-        # --------------------------------------------------------
-        # O streamable_http_client pode retornar:
-        #
-        #   (read_stream, write_stream)
-        #
-        # ou
-        #
-        #   (read_stream, write_stream, session_id_callback)
-        #
-        # dependendo da versão do MCP.
-        # --------------------------------------------------------
 
         if len(transport) == 2:
 
@@ -828,18 +795,11 @@ class PlanAppAgentCommon:
         self,
         result,
     ):
-        """
-        Normaliza os formatos utilizados pelo MCP.
-        """
 
         if result is None:
 
             return None
 
-
-        # --------------------------------------------------------
-        # Conteúdo estruturado
-        # --------------------------------------------------------
 
         structured = getattr(
             result,
@@ -861,10 +821,6 @@ class PlanAppAgentCommon:
 
             return structured
 
-
-        # --------------------------------------------------------
-        # Conteúdo textual
-        # --------------------------------------------------------
 
         content = getattr(
             result,
@@ -940,9 +896,6 @@ class PlanAppAgentCommon:
         self,
         value,
     ):
-        """
-        Procura recursivamente indicadores de erro.
-        """
 
         if isinstance(
             value,
@@ -1004,9 +957,6 @@ class PlanAppAgentCommon:
         result,
         parsed,
     ):
-        """
-        Detecta erro no objeto MCP ou no payload.
-        """
 
         is_error = getattr(
             result,
@@ -1044,9 +994,6 @@ class PlanAppAgentCommon:
         self,
         value,
     ):
-        """
-        Evita escrever imagens base64 completas nos logs.
-        """
 
         if isinstance(
             value,
@@ -1110,9 +1057,6 @@ class PlanAppAgentCommon:
         self,
         parsed,
     ):
-        """
-        Extrai o primeiro resultado da geocodificação.
-        """
 
         if not isinstance(
             parsed,
@@ -1189,13 +1133,6 @@ class PlanAppAgentCommon:
         self,
         parsed,
     ):
-        """
-        Adiciona o ponto geocodificado ao estado.
-
-        ETAPA 1:
-        Mantemos o comportamento atual e não fazemos
-        deduplicação ou lógica multi-hop aqui.
-        """
 
         point = (
             self.summarize_geocode(
@@ -1239,10 +1176,6 @@ class PlanAppAgentCommon:
         self,
         parsed,
     ):
-        """
-        Extrai FSPL do resultado, preservando o comportamento
-        utilizado nos agentes atuais.
-        """
 
         if not isinstance(
             parsed,
@@ -1299,11 +1232,6 @@ class PlanAppAgentCommon:
         tool_name,
         arguments,
     ):
-        """
-        Executa uma ferramenta MCP preservando a resposta RAW.
-
-        Isso é importante principalmente para ImageContent.
-        """
 
         if self.mcp_session is None:
 
@@ -1461,15 +1389,6 @@ class PlanAppAgentCommon:
                 )
 
 
-                # --------------------------------------------
-                # Mantemos somente a regra atual:
-                #
-                # quando chegam os dois primeiros pontos,
-                # o agente filho poderá atualizar o mapa.
-                #
-                # Não implementamos multi-hop.
-                # --------------------------------------------
-
                 if (
                     before < 2
                     and after == 2
@@ -1537,13 +1456,6 @@ class PlanAppAgentCommon:
                 )
 
 
-                # --------------------------------------------
-                # As visualizações continuam sendo automáticas.
-                #
-                # A implementação concreta pode ser
-                # sobrescrita pelo agente.
-                # --------------------------------------------
-
                 try:
 
                     await (
@@ -1600,9 +1512,6 @@ class PlanAppAgentCommon:
         tool_name,
         arguments,
     ):
-        """
-        Executa MCP e devolve o resultado parseado.
-        """
 
         raw = await (
             self.execute_mcp_tool_raw(
@@ -1624,9 +1533,6 @@ class PlanAppAgentCommon:
     async def register(
         self,
     ):
-        """
-        Registra o usuário no PlanApp.
-        """
 
         self.log(
             "👤 Registrando usuário "
@@ -1714,12 +1620,6 @@ class PlanAppAgentCommon:
             )
 
 
-        # --------------------------------------------------------
-        # ETAPA 1:
-        #
-        # exatamente os dois primeiros pontos.
-        # --------------------------------------------------------
-
         tx = self.geocoded_points[0]
 
         rx = self.geocoded_points[1]
@@ -1788,6 +1688,546 @@ class PlanAppAgentCommon:
 
 
     # ============================================================
+    # ETAPA 2 — AVALIAÇÃO MULTI-HOP
+    # ============================================================
+
+    async def ensure_multi_hop_evaluation(
+        self,
+        route_points=None,
+        parameters=None,
+    ):
+        """
+        ETAPA 2 — executa uma rota composta por vários enlaces.
+
+        Exemplo:
+
+            A -> B -> C -> D
+
+        gera:
+
+            Hop 1: A -> B
+            Hop 2: B -> C
+            Hop 3: C -> D
+
+        IMPORTANTE:
+
+        - evaluate_link continua sendo uma operação de UM enlace.
+        - Esta função apenas orquestra várias chamadas independentes.
+        - ensure_evaluate_link() da ETAPA 1 não é alterada.
+        """
+
+        if self.multi_hop_executed:
+            return self.global_result
+
+
+        # --------------------------------------------------------
+        # Pontos da rota
+        # --------------------------------------------------------
+
+        if route_points is None:
+            route_points = self.geocoded_points
+
+        if route_points is None:
+            route_points = []
+
+
+        if len(route_points) < 2:
+
+            self.multi_hop_error = {
+                "status": "error",
+                "kind": "invalid_route",
+                "error": (
+                    "Uma rota multi-hop precisa "
+                    "de pelo menos dois pontos."
+                ),
+            }
+
+            self.log(
+                "❌ Rota multi-hop inválida: "
+                "menos de dois pontos."
+            )
+
+            return self.multi_hop_error
+
+
+        # --------------------------------------------------------
+        # Parâmetros
+        # --------------------------------------------------------
+
+        if parameters is None:
+            parameters = self.link_parameters
+
+
+        # --------------------------------------------------------
+        # Copia da rota
+        # --------------------------------------------------------
+
+        self.route_points = [
+            dict(point)
+            for point in route_points
+        ]
+
+
+        # --------------------------------------------------------
+        # Monta os hops consecutivos
+        # --------------------------------------------------------
+
+        self.hops = []
+
+
+        for index in range(
+            len(self.route_points) - 1
+        ):
+
+            tx = self.route_points[index]
+
+            rx = self.route_points[index + 1]
+
+
+            tx_name = tx.get(
+                "name",
+                f"Ponto {index + 1}",
+            )
+
+            rx_name = rx.get(
+                "name",
+                f"Ponto {index + 2}",
+            )
+
+
+            hop = {
+
+                "id":
+                    f"link_{index + 1:03d}",
+
+                "index":
+                    index + 1,
+
+                "name":
+                    f"{tx_name} → {rx_name}",
+
+                "tx":
+                    dict(tx),
+
+                "rx":
+                    dict(rx),
+
+                "parameters": {
+
+                    "freq_mhz":
+                        parameters.get(
+                            "freq_mhz",
+                            DEFAULT_FREQ_MHZ,
+                        ),
+
+                    "tx_ha":
+                        parameters.get(
+                            "tx_ha",
+                            DEFAULT_TX_HA,
+                        ),
+
+                    "rx_ha":
+                        parameters.get(
+                            "rx_ha",
+                            DEFAULT_RX_HA,
+                        ),
+
+                    "on_rooftop":
+                        parameters.get(
+                            "on_rooftop",
+                            DEFAULT_ON_ROOFTOP,
+                        ),
+                },
+
+                "result":
+                    None,
+
+                "error":
+                    None,
+
+                "visualizations":
+                    [],
+            }
+
+
+            self.hops.append(
+                hop
+            )
+
+
+        # --------------------------------------------------------
+        # Resultado global
+        # --------------------------------------------------------
+
+        self.global_result = {
+
+            "status":
+                "running",
+
+            "route_points": [
+                dict(point)
+                for point in self.route_points
+            ],
+
+            "hops":
+                self.hops,
+
+            "total_hops":
+                len(self.hops),
+
+            "completed_hops":
+                0,
+
+            "parameters": {
+
+                "freq_mhz":
+                    parameters.get(
+                        "freq_mhz",
+                        DEFAULT_FREQ_MHZ,
+                    ),
+
+                "tx_ha":
+                    parameters.get(
+                        "tx_ha",
+                        DEFAULT_TX_HA,
+                    ),
+
+                "rx_ha":
+                    parameters.get(
+                        "rx_ha",
+                        DEFAULT_RX_HA,
+                    ),
+
+                "on_rooftop":
+                    parameters.get(
+                        "on_rooftop",
+                        DEFAULT_ON_ROOFTOP,
+                    ),
+            },
+        }
+
+
+        self.log(
+            "📡 Iniciando avaliação "
+            "multi-hop..."
+        )
+
+
+        self.log(
+            "🗺️ Rota: "
+            + " → ".join(
+                str(
+                    point.get(
+                        "name",
+                        "Ponto",
+                    )
+                )
+                for point in self.route_points
+            )
+        )
+
+
+        self.log(
+            f"🔗 Total de hops: "
+            f"{len(self.hops)}"
+        )
+
+
+        # --------------------------------------------------------
+        # Executa cada hop independentemente
+        # --------------------------------------------------------
+
+        for hop in self.hops:
+
+            # ----------------------------------------------------
+            # CORREÇÃO ETAPA 2:
+            #
+            # current_hop precisa conter o objeto completo do hop,
+            # e não apenas o índice.
+            #
+            # agent_openai.py utiliza:
+            #
+            #   current_hop["index"]
+            #   current_hop["id"]
+            #   current_hop["name"]
+            #
+            # Isso permite que gerar_visualizacoes() identifique
+            # corretamente o hop atual.
+            # ----------------------------------------------------
+
+            self.current_hop = hop
+
+
+            tx = hop["tx"]
+
+            rx = hop["rx"]
+
+            hop_parameters = (
+                hop["parameters"]
+            )
+
+
+            arguments = {
+
+                "tx_lat":
+                    tx["lat"],
+
+                "tx_lon":
+                    tx["lon"],
+
+                "rx_lat":
+                    rx["lat"],
+
+                "rx_lon":
+                    rx["lon"],
+
+                "tx_ha":
+                    hop_parameters.get(
+                        "tx_ha",
+                        DEFAULT_TX_HA,
+                    ),
+
+                "rx_ha":
+                    hop_parameters.get(
+                        "rx_ha",
+                        DEFAULT_RX_HA,
+                    ),
+
+                "freq_mhz":
+                    hop_parameters.get(
+                        "freq_mhz",
+                        DEFAULT_FREQ_MHZ,
+                    ),
+
+                "on_rooftop":
+                    hop_parameters.get(
+                        "on_rooftop",
+                        DEFAULT_ON_ROOFTOP,
+                    ),
+            }
+
+
+            self.log("")
+
+            self.log(
+                "🔗 "
+                f"Hop {hop['index']}/"
+                f"{len(self.hops)}: "
+                f"{hop['name']}"
+            )
+
+
+            self.log_detail(
+                "Parâmetros do hop:"
+            )
+
+
+            self.log_detail(
+                json.dumps(
+                    arguments,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+            )
+
+
+            try:
+
+                result = await (
+                    self.execute_mcp_tool(
+                        "evaluate_link",
+                        arguments,
+                    )
+                )
+
+
+                hop["result"] = result
+
+
+                # ------------------------------------------------
+                # Verifica erro no resultado
+                # ------------------------------------------------
+
+                hop_error = (
+                    self.contains_nested_error(
+                        result
+                    )
+                )
+
+
+                if hop_error:
+
+                    hop["error"] = result
+
+
+                    self.log(
+                        "❌ Erro no "
+                        f"{hop['name']}"
+                    )
+
+
+                    self.global_result[
+                        "status"
+                    ] = "error"
+
+
+                    self.global_result[
+                        "error"
+                    ] = {
+
+                        "hop":
+                            hop["index"],
+
+                        "link":
+                            hop["name"],
+
+                        "result":
+                            result,
+                    }
+
+
+                    self.global_result[
+                        "completed_hops"
+                    ] = (
+                        hop["index"] - 1
+                    )
+
+
+                    break
+
+
+                # ------------------------------------------------
+                # Hop concluído
+                # ------------------------------------------------
+
+                self.global_result[
+                    "completed_hops"
+                ] = hop["index"]
+
+
+                self.log(
+                    "✅ "
+                    f"Hop {hop['index']} "
+                    "concluído."
+                )
+
+
+            except Exception as exc:
+
+                hop["error"] = {
+
+                    "status":
+                        "error",
+
+                    "kind":
+                        "multi_hop_exception",
+
+                    "error":
+                        str(exc),
+                }
+
+
+                self.log(
+                    "❌ Exceção no "
+                    f"{hop['name']}: "
+                    f"{exc}"
+                )
+
+
+                self.global_result[
+                    "status"
+                ] = "error"
+
+
+                self.global_result[
+                    "error"
+                ] = {
+
+                    "hop":
+                        hop["index"],
+
+                    "link":
+                        hop["name"],
+
+                    "error":
+                        str(exc),
+                }
+
+
+                self.global_result[
+                    "completed_hops"
+                ] = (
+                    hop["index"] - 1
+                )
+
+
+                break
+
+
+        # --------------------------------------------------------
+        # Finalização
+        # --------------------------------------------------------
+
+        if (
+            self.global_result.get(
+                "status"
+            )
+            == "running"
+        ):
+
+            self.global_result[
+                "status"
+            ] = "OK"
+
+
+        self.multi_hop_executed = True
+
+        self.multi_hop_error = (
+            self.global_result.get(
+                "error"
+            )
+        )
+
+
+        self.current_hop = None
+
+
+        if (
+            self.global_result[
+                "status"
+            ]
+            == "OK"
+        ):
+
+            self.log(
+                "🟢 Avaliação "
+                "multi-hop concluída: "
+                f"{self.global_result['completed_hops']} "
+                "hops."
+            )
+
+        else:
+
+            self.log(
+                "❌ Avaliação "
+                "multi-hop encerrada com erro."
+            )
+
+
+        # --------------------------------------------------------
+        # Publica resultado global
+        # --------------------------------------------------------
+
+        self.publish_technical_result(
+            self.global_result
+        )
+
+
+        return self.global_result
+
+
+    # ============================================================
     # CONTEXTO TÉCNICO
     # ============================================================
 
@@ -1795,9 +2235,6 @@ class PlanAppAgentCommon:
         self,
         technical_result,
     ):
-        """
-        Monta o contexto técnico comum para o LLM.
-        """
 
         effective = {
 
@@ -1923,48 +2360,22 @@ class PlanAppAgentCommon:
 
     # ============================================================
     # VISUALIZAÇÕES
-    #
-    # IMPLEMENTAÇÃO BASE
-    #
-    # Os agentes podem sobrescrever este método.
-    #
-    # Isso é deliberado porque o OpenRouter atual possui uma
-    # implementação específica para ImageContent.
     # ============================================================
 
     async def gerar_visualizacoes(
         self,
     ):
-        """
-        Gera visualizações automaticamente.
-
-        Na Etapa 1, esta função é apenas um ponto comum de
-        extensão.
-
-        O comportamento específico de cada agente pode
-        permanecer no respectivo arquivo.
-        """
 
         return None
 
 
     # ============================================================
     # MAPA
-    #
-    # IMPLEMENTAÇÃO BASE
-    #
-    # Cada agente pode manter sua implementação atual.
     # ============================================================
 
     async def mostrar_mapa_apos_geocodificacao(
         self,
     ):
-        """
-        Ponto de extensão para o mapa.
-
-        Não introduzimos nenhuma implementação nova aqui
-        justamente para não alterar o comportamento atual.
-        """
 
         return None
 
@@ -1977,15 +2388,41 @@ class PlanAppAgentCommon:
         self,
     ):
         """
-        Reseta somente o estado comum.
+        Reseta todo o estado comum, incluindo o estado
+        multi-hop.
 
-        Os agentes devem preservar aqui qualquer estado
-        específico do respectivo LLM.
+        Isso evita que uma nova chamada ask() reutilize
+        pontos, hops ou resultados de uma execução anterior.
         """
 
         self.messages = []
 
         self.geocoded_points = []
+
+
+        # --------------------------------------------------------
+        # CORREÇÃO ETAPA 2:
+        #
+        # O estado multi-hop também precisa ser limpo entre
+        # duas execuções do mesmo objeto agente.
+        # --------------------------------------------------------
+
+        self.route_points = []
+
+        self.hops = []
+
+        self.current_hop = None
+
+        self.global_result = None
+
+        self.multi_hop_executed = False
+
+        self.multi_hop_error = None
+
+
+        # --------------------------------------------------------
+        # Estado da avaliação
+        # --------------------------------------------------------
 
         self.evaluate_executed = False
 
@@ -1993,13 +2430,33 @@ class PlanAppAgentCommon:
 
         self.evaluate_error = None
 
+
+        # --------------------------------------------------------
+        # Visualizações
+        # --------------------------------------------------------
+
         self.visualizations = []
 
+
+        # --------------------------------------------------------
+        # Mapa
+        # --------------------------------------------------------
+
         self.map = None
+
+
+        # --------------------------------------------------------
+        # Controle
+        # --------------------------------------------------------
 
         self.tool_count = 0
 
         self.current_stage = 0
+
+
+        # --------------------------------------------------------
+        # Parâmetros
+        # --------------------------------------------------------
 
         self.link_parameters = {
 
@@ -2015,6 +2472,7 @@ class PlanAppAgentCommon:
             "on_rooftop":
                 DEFAULT_ON_ROOFTOP,
         }
+
 
         self.requested_frequency = None
 
@@ -2034,9 +2492,6 @@ class PlanAppAgentCommon:
     async def close(
         self,
     ):
-        """
-        Fecha a conexão MCP.
-        """
 
         try:
 
