@@ -38,13 +38,29 @@ agent_openrouter = importlib.reload(
 def iniciar_planapp():
 
     # ========================================================
+    # LOGOTIPO
+    # ========================================================
+
+    logo_path = Path(__file__).parent / "vibeplanner_logo.jpeg"
+
+    logo = widgets.Image(
+        value=logo_path.read_bytes(),
+        format="jpeg",
+        layout=widgets.Layout(
+            width="180px",
+            height="auto",
+            margin="0 auto 8px auto",
+        ),
+    )
+    
+    # ========================================================
     # TÍTULO
     # ========================================================
 
     titulo = widgets.HTML(
         value="""
         <h2 style="margin:0 0 10px 0;">
-            🛰️ PlanApp AI — Planejamento de Enlaces
+            Planejamento de Enlaces
         </h2>
         """
     )
@@ -1725,9 +1741,9 @@ def iniciar_planapp():
 
     painel_status = widgets.VBox(
         [
-            widgets.HTML(
-                value="<h4>📋 Status</h4>"
-            ),
+            #widgets.HTML(
+            #    value="<h4>📋 Status</h4>"
+            #),
             status,
             historico_status,
         ],
@@ -1854,6 +1870,8 @@ def iniciar_planapp():
 
     interface = widgets.VBox(
         [
+            logo,
+
             titulo,
 
             widgets.HBox(

@@ -160,6 +160,11 @@ class PlanAppAgentOpenRouter(PlanAppAgentCommon):
 
         self.user_request = ""
 
+        # ETAPA 2 — MULTI-HOP
+        self.multi_hop_requested = False
+        self.geocoding_followup_sent = False
+        self.visualizations_generated_hops = set()
+
         self.report_pdf_path = None
 
         # --------------------------------------------------------------------
@@ -217,6 +222,229 @@ class PlanAppAgentOpenRouter(PlanAppAgentCommon):
         self.logger.info(
             "============================================================"
         )
+
+    # ========================================================================
+    # ETAPA 2 — DETECÇÃO DE SOLICITAÇÃO MULTI-HOP
+    # ========================================================================
+
+    def detect_multi_hop_request(
+        self,
+        text,
+    ):
+        """
+        Detecta se a solicitação do usuário aparenta descrever
+        uma rota com três ou mais pontos.
+
+        Esta função NÃO identifica as localidades.
+        A identificação das localidades continua sendo responsabilidade
+        do LLM através de geocode_place.
+        """
+
+        if not text:
+            return False
+
+        normalized = (
+            str(text)
+            .strip()
+            .lower()
+        )
+
+        explicit_patterns = [
+            r"\bmulti[\s-]?hop\b",
+            r"\bmulti[\s-]?enlace\b",
+            r"\bmulti[\s-]?link\b",
+            r"\bpor\s+.+\s+passando\s+por\b",
+            r"\bpassando\s+por\b",
+            r"\batrav[eé]s\s+de\b",
+            r"\bvia\b",
+            r"\brota\b",
+            r"\btrajeto\b",
+            r"\bsequ[eê]ncia\s+de\s+enlaces\b",
+            r"\bv[aá]rios\s+enlaces\b",
+            r"\bv[aá]rios\s+saltos\b",
+            r"\bsaltos\b",
+            r"\bhops?\b",
+        ]
+
+        for pattern in explicit_patterns:
+            if re.search(pattern, normalized):
+                return True
+
+        arrow_count = len(
+            re.findall(r"(?:->|→|⇒|⟶)", normalized)
+        )
+
+        if arrow_count >= 2:
+            return True
+
+        multi_point_patterns = [
+            r"\bentre\s+.+,\s*.+\s+e\s+.+",
+            r"\bentre\s+.+,\s*.+,\s*.+",
+            r"\bde\s+.+\s+até\s+.+\s+passando\s+por\s+.+",
+            r"\banalise\s+.+,\s*.+\s+e\s+.+",
+            r"\banalisar\s+.+,\s*.+\s+e\s+.+",
+            r"\bavalie\s+.+,\s*.+\s+e\s+.+",
+            r"\bavaliar\s+.+,\s*.+\s+e\s+.+",
+            r"\bfa[cç]a\s+(?:uma\s+)?an[aá]lise\b.+,\s*.+\s+e\s+.+",
+            r"\ban[aá]lise\s+(?:dos\s+enlaces\s+)?entre\s+.+,\s*.+\s+e\s+.+",
+            r"\banalis[ea]\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
+            r"\bavalie\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
+        ]
+
+        for pattern in multi_point_patterns:
+            if re.search(pattern, normalized):
+                return True
+
+        comma_count = normalized.count(",")
+
+        route_context = re.search(
+            r"\b("
+            r"analise|analisar|análise|avalie|avaliar|enlace|enlaces|"
+            r"link|links|rota|trajeto|pontos?|localidades?"
+            r")\b",
+            normalized,
+        )
+
+        if (
+            comma_count >= 2
+            and re.search(r"\be\b", normalized)
+            and route_context
+        ):
+            return True
+
+        # ------------------------------------------------------------
+        # Rotas descritas como sequência de transições
+        #
+        # Exemplos:
+        # "A e B, desse para C, desse para D e desse de volta para A"
+        # "A para B, de B para C, de C para D"
+        #
+        # Nessas formulações o usuário pode não usar a estrutura
+        # "A, B e C". A repetição de transições "para" / "desse para"
+        # junto com contexto de enlaces caracteriza multi-hop.
+        # ------------------------------------------------------------
+
+        transition_count = len(
+            re.findall(
+                r"\b(?:desse|dessa|deste|desta|de)\s+para\b",
+                normalized,
+            )
+        )
+
+        para_count = len(
+            re.findall(
+                r"\bpara\b",
+                normalized,
+            )
+        )
+
+        if (
+            transition_count >= 2
+            and re.search(
+                r"\b(enlace|enlaces|link|links|rota|trajeto)\b",
+                normalized,
+            )
+        ):
+            return True
+
+        if (
+            para_count >= 3
+            and re.search(
+                r"\b(enlace|enlaces|link|links|rota|trajeto|analise|análise|avaliar|avalie)\b",
+                normalized,
+            )
+        ):
+            return True
+
+        return False
+
+    # ========================================================================
+    # ETAPA 2 — DECISÃO DO TIPO DE AVALIAÇÃO
+    # ========================================================================
+
+    async def ensure_application_evaluation(
+        self,
+    ):
+        """
+        Decide qual avaliação deve ser executada pela aplicação.
+
+        2 pontos:
+            ensure_evaluate_link()
+
+        3+ pontos:
+            ensure_multi_hop_evaluation()
+
+        A função nunca transforma evaluate_link em super-tool.
+        """
+
+        point_count = len(
+            self.geocoded_points
+        )
+
+        # --------------------------------------------------------
+        # Proteção: três ou mais pontos significam multi-hop.
+        # --------------------------------------------------------
+
+        if (
+            point_count >= 3
+            and not self.multi_hop_requested
+        ):
+
+            self.multi_hop_requested = True
+
+            self.log_detail(
+                "🔗 Três ou mais pontos geocodificados; "
+                "solicitação promovida automaticamente "
+                "para multi-hop."
+            )
+
+        # --------------------------------------------------------
+        # MULTI-HOP
+        # --------------------------------------------------------
+
+        if self.multi_hop_requested:
+
+            if point_count < 3:
+
+                self.log_detail(
+                    "⏳ Solicitação multi-hop detectada. "
+                    f"Aguardando pontos adicionais "
+                    f"(atualmente {point_count})."
+                )
+
+                return None
+
+            if getattr(
+                self,
+                "multi_hop_executed",
+                False,
+            ):
+
+                return self.global_result
+
+            return await (
+                self.ensure_multi_hop_evaluation(
+                    route_points=self.geocoded_points,
+                    parameters=self.link_parameters,
+                )
+            )
+
+        # --------------------------------------------------------
+        # ETAPA 1 — SINGLE LINK
+        # --------------------------------------------------------
+
+        if point_count >= 2:
+
+            if self.evaluate_executed:
+
+                return self.last_evaluate_result
+
+            return await (
+                self.ensure_evaluate_link()
+            )
+
+        return None
+
 
     # ========================================================================
     # LOGGER
@@ -1304,265 +1532,176 @@ REGRAS FUNDAMENTAIS:
         self,
     ):
 
-        for iteration in range(
-            MAX_AGENT_ITERATIONS
-        ):
+        for iteration in range(MAX_AGENT_ITERATIONS):
 
             self.log_detail(
-                f"OpenRouter — iteração "
-                f"{iteration + 1}/"
-                f"{MAX_AGENT_ITERATIONS}"
+                f"OpenRouter — iteração {iteration + 1}/{MAX_AGENT_ITERATIONS}"
             )
 
             try:
-
-                response = (
-                    await self.openrouter_chat(
-                        messages=self.messages,
-                        use_tools=True,
-                    )
+                response = await self.openrouter_chat(
+                    messages=self.messages,
+                    use_tools=True,
                 )
-
             except Exception as exc:
-
-                self.log_detail(
-                    f"❌ Erro OpenRouter: {exc}"
-                )
-
+                self.log_detail(f"❌ Erro OpenRouter: {exc}")
                 return ""
 
-            message = (
-                self.response_message(
-                    response
-                )
-            )
-
+            message = self.response_message(response)
             if message is None:
-
-                self.log_detail(
-                    "⚠️ OpenRouter não retornou "
-                    "uma mensagem."
-                )
-
+                self.log_detail("⚠️ OpenRouter não retornou uma mensagem.")
                 continue
 
-            text = (
-                self.clean_final_response(
-                    self.response_text(
-                        response
-                    )
-                )
+            text = self.clean_final_response(
+                self.response_text(response)
             )
-
             if text:
-
                 self.last_agent_text = text
 
-            tool_calls = (
-                self.response_tool_calls(
-                    response
-                )
-            )
-
-            # ---------------------------------------------------------------
-            # GUARDA A MENSAGEM DO ASSISTANT
-            # ---------------------------------------------------------------
-
+            tool_calls = self.response_tool_calls(response)
             self.messages.append(
-                self._assistant_message_to_dict(
-                    message
-                )
+                self._assistant_message_to_dict(message)
             )
-
-            # ---------------------------------------------------------------
-            # SEM TOOL CALL
-            # ---------------------------------------------------------------
 
             if not tool_calls:
+                result = await self.ensure_application_evaluation()
+
+                if result is not None:
+                    if not self.technical_context_added:
+                        self.append_technical_context(result)
+
+                    # Em multi-hop, a aplicação já executou todos os hops.
+                    # NÃO voltar ao OpenRouter: devolver o controle ao ask().
+                    if (
+                        self.multi_hop_requested
+                        and getattr(self, "multi_hop_executed", False)
+                    ):
+                        self.log_detail(
+                            "🟢 Multi-hop concluído após a geocodificação."
+                        )
+                        self.log_detail("Encerrando agent_turn().")
+                        return text
+
+                    continue
 
                 if (
-                    len(
-                        self.geocoded_points
-                    ) >= 2
-                    and not self.evaluate_executed
+                    self.multi_hop_requested
+                    and len(self.geocoded_points) < 3
+                    and not self.geocoding_followup_sent
                 ):
-
-                    result = (
-                        await self.ensure_evaluate_link()
-                    )
-
-                    if result is not None:
-
-                        self.append_technical_context(
-                            result
-                        )
-
-                        continue
+                    self.geocoding_followup_sent = True
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "A solicitação atual descreve uma rota multi-hop. "
+                            "Ainda existem menos de três pontos geocodificados. "
+                            "Continue identificando e geocodificando, na ordem "
+                            "solicitada pelo usuário, todas as localidades restantes. "
+                            "Não execute avaliação técnica."
+                        ),
+                    })
+                    continue
 
                 return text
 
-            # ---------------------------------------------------------------
-            # TOOL CALLS
-            # ---------------------------------------------------------------
-
+            # O único tool permitido ao modelo é geocode_place.
             for call in tool_calls:
-
-                function = getattr(
-                    call,
-                    "function",
-                    None,
-                )
-
+                function = getattr(call, "function", None)
                 if function is None:
                     continue
 
-                tool_name = getattr(
-                    function,
-                    "name",
-                    "",
-                )
-
-                arguments_text = getattr(
-                    function,
-                    "arguments",
-                    "{}",
-                )
+                tool_name = getattr(function, "name", "")
+                arguments_text = getattr(function, "arguments", "{}")
 
                 try:
-
-                    arguments = json.loads(
-                        arguments_text
-                    )
-
+                    arguments = json.loads(arguments_text)
                 except Exception:
-
                     arguments = {}
 
-                if not isinstance(
-                    arguments,
-                    dict,
-                ):
-
+                if not isinstance(arguments, dict):
                     arguments = {}
 
-                # -----------------------------------------------------------
-                # SOMENTE TOOLS PERMITIDAS
-                # -----------------------------------------------------------
-
-                if (
-                    tool_name
-                    in APPLICATION_CONTROLLED_TOOLS
-                ):
-
+                if tool_name in APPLICATION_CONTROLLED_TOOLS:
                     self.log_detail(
-                        f"⚠️ OpenRouter tentou executar "
-                        f"{tool_name}, mas esta ferramenta "
-                        "é controlada pela aplicação."
+                        f"⚠️ OpenRouter tentou executar {tool_name}, "
+                        "mas esta ferramenta é controlada pela aplicação."
                     )
-
                     tool_result = {
                         "error": (
-                            f"A ferramenta {tool_name} "
-                            "é controlada pela aplicação "
-                            "e não deve ser executada pelo LLM."
+                            f"A ferramenta {tool_name} é controlada pela "
+                            "aplicação e não deve ser executada pelo LLM."
                         )
                     }
-
-                elif (
-                    tool_name
-                    not in MODEL_ALLOWED_TOOLS
-                ):
-
+                elif tool_name not in MODEL_ALLOWED_TOOLS:
                     self.log_detail(
-                        f"⚠️ Ferramenta não permitida "
-                        f"ao OpenRouter: {tool_name}"
+                        f"⚠️ Ferramenta não permitida ao OpenRouter: {tool_name}"
                     )
-
                     tool_result = {
-                        "error": (
-                            f"A ferramenta {tool_name} "
-                            "não está disponível ao modelo."
-                        )
+                        "error": f"A ferramenta {tool_name} não está disponível ao modelo."
                     }
-
                 else:
-
-                    self.log_detail(
-                        f"MCP TOOL: {tool_name}"
-                    )
-
+                    self.log_detail(f"MCP TOOL: {tool_name}")
                     self.log_detail(
                         "Argumentos: "
-                        + json.dumps(
-                            arguments,
-                            ensure_ascii=False,
-                        )
+                        + json.dumps(arguments, ensure_ascii=False)
                     )
-
                     try:
-
-                        tool_result = (
-                            await self.execute_mcp_tool(
-                                tool_name,
-                                arguments,
-                            )
+                        tool_result = await self.execute_mcp_tool(
+                            tool_name, arguments
                         )
-
                     except Exception as exc:
+                        self.log_detail(f"❌ Erro MCP: {exc}")
+                        tool_result = {"error": str(exc)}
 
-                        self.log_detail(
-                            f"❌ Erro MCP: {exc}"
-                        )
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(
+                        tool_result,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                })
 
-                        tool_result = {
-                            "error": str(
-                                exc
-                            )
-                        }
+            # Depois das tools, a aplicação decide se já há pontos suficientes
+            # para executar a avaliação. Em multi-hop, ela aguarda todos os pontos.
+            result = await self.ensure_application_evaluation()
 
-                # -----------------------------------------------------------
-                # TOOL RESULT
-                # -----------------------------------------------------------
+            if result is not None:
+                if not self.technical_context_added:
+                    self.append_technical_context(result)
 
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": json.dumps(
-                            tool_result,
-                            ensure_ascii=False,
-                            default=str,
-                        ),
-                    }
-                )
+                if (
+                    self.multi_hop_requested
+                    and getattr(self, "multi_hop_executed", False)
+                ):
+                    self.log_detail(
+                        "🟢 Multi-hop concluído após a execução das ferramentas."
+                    )
+                    self.log_detail("Encerrando agent_turn().")
+                    return text
 
-            # ---------------------------------------------------------------
-            # SE JÁ TEMOS TX + RX, APLICAÇÃO EXECUTA EVALUATE_LINK
-            # ---------------------------------------------------------------
+                continue
 
             if (
-                len(
-                    self.geocoded_points
-                ) >= 2
-                and not self.evaluate_executed
+                self.multi_hop_requested
+                and len(self.geocoded_points) < 3
+                and not self.geocoding_followup_sent
             ):
-
-                result = (
-                    await self.ensure_evaluate_link()
-                )
-
-                if result is not None:
-
-                    self.append_technical_context(
-                        result
-                    )
+                self.geocoding_followup_sent = True
+                self.messages.append({
+                    "role": "user",
+                    "content": (
+                        "Continue a geocodificação da rota multi-hop solicitada. "
+                        "Use geocode_place para os pontos restantes na ordem original. "
+                        "Não execute avaliação técnica."
+                    ),
+                })
+                continue
 
             continue
 
-        self.log_detail(
-            "⚠️ Limite máximo de iterações atingido."
-        )
-
+        self.log_detail("⚠️ Limite máximo de iterações atingido.")
         return self.last_agent_text
 
     # ========================================================================
@@ -2112,239 +2251,158 @@ REGRAS ABSOLUTAS:
         text,
     ):
 
-        # --------------------------------------------------------------------
-        # RESET DO ESTADO COMUM
-        # --------------------------------------------------------------------
-
         self.reset_common_state()
 
-        # --------------------------------------------------------------------
-        # RESET DO ESTADO DO AGENTE
-        # --------------------------------------------------------------------
-
         self.registered = False
-
         self.technical_context_added = False
-
         self.last_agent_text = ""
-
         self.technical_report = ""
-
         self.report_pdf_path = None
-
         self.user_request = text
 
+        # ETAPA 2 — MULTI-HOP
+        self.multi_hop_requested = self.detect_multi_hop_request(text)
+        self.geocoding_followup_sent = False
+        self.visualizations_generated_hops = set()
+
+        self.log_detail(
+            "🔗 Solicitação multi-hop detectada."
+            if self.multi_hop_requested
+            else "🔗 Solicitação de enlace único."
+        )
+
         self.map = None
-
         self.map_image_bytes = None
-
         self.visualizations = []
-
         self.visualization_images = []
 
-        # --------------------------------------------------------------------
-        # EXTRAÇÃO DOS PARÂMETROS
-        # --------------------------------------------------------------------
-
         try:
-
-            self.extract_link_parameters(
-                text
-            )
-
+            self.extract_link_parameters(text)
         except Exception as exc:
-
-            self.log_detail(
-                f"⚠️ Erro ao extrair parâmetros: "
-                f"{exc}"
-            )
-
-        # --------------------------------------------------------------------
-        # OPENROUTER
-        # --------------------------------------------------------------------
+            self.log_detail(f"⚠️ Erro ao extrair parâmetros: {exc}")
 
         try:
-
             await self.create_client()
-
         except Exception as exc:
-
-            self.log_detail(
-                f"❌ Erro ao criar cliente OpenRouter: "
-                f"{exc}"
-            )
-
-            return (
-                "Não foi possível conectar ao "
-                "OpenRouter. Verifique a "
-                "OPENROUTER_API_KEY."
-            )
-
-        # --------------------------------------------------------------------
-        # MCP
-        # --------------------------------------------------------------------
+            self.log_detail(f"❌ Erro ao criar cliente OpenRouter: {exc}")
+            return "Não foi possível conectar ao OpenRouter. Verifique a OPENROUTER_API_KEY."
 
         try:
-
             await self.connect()
-
         except Exception as exc:
-
-            self.log_detail(
-                f"❌ Erro ao conectar ao MCP: "
-                f"{exc}"
-            )
-
-            return (
-                "Não foi possível conectar ao "
-                "serviço PlanApp."
-            )
-
-        # --------------------------------------------------------------------
-        # REGISTER
-        # --------------------------------------------------------------------
+            self.log_detail(f"❌ Erro ao conectar ao MCP: {exc}")
+            return "Não foi possível conectar ao serviço PlanApp."
 
         try:
-
             await self.register()
-
             self.registered = True
-
         except Exception as exc:
-
-            self.log_detail(
-                f"❌ Erro no registro do usuário: "
-                f"{exc}"
-            )
-
-            return (
-                "Não foi possível registrar o "
-                "usuário no serviço PlanApp."
-            )
-
-        # --------------------------------------------------------------------
-        # MENSAGENS
-        # --------------------------------------------------------------------
+            self.log_detail(f"❌ Erro no registro do usuário: {exc}")
+            return "Não foi possível registrar o usuário no serviço PlanApp."
 
         self.messages = [
-
-            {
-                "role": "system",
-                "content": self.system_prompt(),
-            },
-
-            {
-                "role": "user",
-                "content": text,
-            },
+            {"role": "system", "content": self.system_prompt()},
+            {"role": "user", "content": text},
         ]
 
-        # --------------------------------------------------------------------
-        # AGENTE
-        # --------------------------------------------------------------------
-
         try:
-
             await self.agent_turn()
-
         except Exception as exc:
+            self.log_detail(f"❌ Erro no agent_turn: {exc}")
 
-            self.log_detail(
-                f"❌ Erro no agent_turn: "
-                f"{exc}"
+        # APLICAÇÃO — avaliação final
+        try:
+            result = await self.ensure_application_evaluation()
+        except Exception as exc:
+            self.log_detail(f"❌ Erro na avaliação da aplicação: {exc}")
+            result = None
+
+        if result is not None:
+            if not self.technical_context_added:
+                self.append_technical_context(result)
+
+            final_result = (
+                getattr(self, "global_result", result)
+                if self.multi_hop_requested
+                else self.last_evaluate_result
             )
+        else:
+            final_result = None
 
-        # --------------------------------------------------------------------
-        # GARANTIA DE EVALUATE_LINK
-        #
-        # A aplicação executa a avaliação.
-        # --------------------------------------------------------------------
-
-        if (
-            len(
-                self.geocoded_points
-            ) >= 2
-            and not self.evaluate_executed
-        ):
-
-            try:
-
-                result = (
-                    await self.ensure_evaluate_link()
-                )
-
-                if result is not None:
-
-                    self.append_technical_context(
-                        result
+        # MAPA
+        if self.multi_hop_requested:
+            if (
+                getattr(self, "multi_hop_executed", False)
+                and getattr(self, "hops", None)
+            ):
+                try:
+                    from map_utils import (
+                        mostrar_mapa_multihop,
+                        gerar_imagem_mapa_multihop,
                     )
 
-            except Exception as exc:
+                    self.map = mostrar_mapa_multihop(self.hops)
+                    if self.map_callback:
+                        self.map_callback(self.map)
 
-                self.log_detail(
-                    f"❌ Erro ao executar "
-                    f"evaluate_link: {exc}"
-                )
+                    self.log_detail(
+                        "Mapa multi-hop preparado "
+                        f"com {len(self.hops)} hops."
+                    )
+                    self.log_detail(
+                        "Mapa interativo contém "
+                        f"{len(self.geocoded_points)} pontos da rota."
+                    )
 
-        # --------------------------------------------------------------------
-        # MAPA
-        # --------------------------------------------------------------------
-
-        if len(
-            self.geocoded_points
-        ) >= 2:
-
+                    self.map_image_bytes = gerar_imagem_mapa_multihop(
+                        self.hops
+                    )
+                    self.log_detail(
+                        "Imagem estática do mapa multi-hop preparada para o relatório."
+                    )
+                except Exception as exc:
+                    self.log_detail(f"⚠️ Erro no mapa multi-hop: {exc}")
+        elif len(self.geocoded_points) >= 2:
             await self.mostrar_mapa_apos_geocodificacao()
 
-        # --------------------------------------------------------------------
         # VISUALIZAÇÕES
-        # --------------------------------------------------------------------
-
+        # Em multi-hop elas já são geradas pela orquestração da aplicação.
         if (
-            self.evaluate_executed
+            not self.multi_hop_requested
+            and self.evaluate_executed
             and not self.evaluate_error
         ):
-
             await self.gerar_visualizacoes()
 
-        # --------------------------------------------------------------------
         # RESPOSTA FINAL
-        #
-        # IMPORTANTE:
-        #
-        # O relatório/PDF continua sendo gerado pelo fluxo da interface.
-        # Porém, self.technical_report agora contém a análise final
-        # produzida pelo OpenRouter.
-        # --------------------------------------------------------------------
+        if final_result is not None:
+            self.log_detail(
+                "🧠 Iniciando análise técnica final do OpenRouter."
+            )
 
-        if self.evaluate_executed:
-
-            answer = (
-                await self.generate_final_response(
-                    text,
-                    self.last_evaluate_result,
-                    technical_report=None,
-                )
+            answer = await self.generate_final_response(
+                text,
+                final_result,
+                technical_report=None,
             )
 
             if not answer:
-
                 self.log_detail(
-                    "⚠️ OpenRouter não retornou "
-                    "texto final. Usando fallback."
+                    "⚠️ OpenRouter não retornou texto final. Usando fallback."
                 )
+                answer = self._fallback_final_response()
 
-                answer = (
-                    self._fallback_final_response()
-                )
+            self.technical_report = answer
 
-                self.technical_report = answer
-
+            self.build_report(
+                final_result,
+                analysis_text=answer,
+            )
         else:
-
             answer = self.last_agent_text
 
         return answer
+
 
     # ========================================================================
     # CLOSE

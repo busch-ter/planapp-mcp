@@ -33,6 +33,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 
 import requests
 import ipywidgets as widgets
@@ -66,6 +67,12 @@ OLLAMA_MODEL = os.getenv(
     "OLLAMA_MODEL",
     "qwen3:8b",
 )
+
+# Limites específicos da análise final.
+# A chamada final não precisa das ferramentas MCP nem de uma resposta
+# gigantesca: o trabalho técnico já foi executado pela aplicação.
+OLLAMA_FINAL_TIMEOUT = int(os.getenv("OLLAMA_FINAL_TIMEOUT", "300"))
+OLLAMA_FINAL_NUM_PREDICT = int(os.getenv("OLLAMA_FINAL_NUM_PREDICT", "2500"))
 
 
 # ============================================================
@@ -452,34 +459,90 @@ REGRAS FUNDAMENTAIS:
     # CHAT OLLAMA
     # ============================================================
 
-    async def ollama_chat(self):
+    async def ollama_chat(
+        self,
+        *,
+        use_tools=True,
+        options=None,
+    ):
+        """Envia uma conversa ao Ollama.
+
+        Durante o agente normal, as ferramentas MCP são enviadas.
+        Na análise final, porém, não há nenhuma ferramenta a executar;
+        portanto a chamada final pode ser muito menor e mais previsível.
+        """
 
         payload = {
             "model": OLLAMA_MODEL,
             "messages": self.messages,
-            "tools": self.build_ollama_tools(),
             "stream": False,
             "think": False,
         }
+
+        if use_tools:
+            payload["tools"] = self.build_ollama_tools()
+
+        if options:
+            payload["options"] = options
 
         self.log_detail(
             f"Enviando requisição ao Ollama: {OLLAMA_MODEL}"
         )
 
+        if not use_tools:
+            self.log_detail(
+                "Análise final: chamada ao Ollama sem ferramentas MCP."
+            )
+
         try:
+
+            timeout = (
+                OLLAMA_FINAL_TIMEOUT
+                if not use_tools
+                else 600
+            )
 
             response = await asyncio.to_thread(
                 requests.post,
                 f"{OLLAMA_URL}/api/chat",
                 json=payload,
-                timeout=600,
+                timeout=timeout,
             )
 
             response.raise_for_status()
 
             data = response.json()
 
+            if not isinstance(data, dict):
+                raise RuntimeError(
+                    "Ollama retornou uma resposta em formato inesperado."
+                )
+
+            if not use_tools:
+                final_text = self.response_text(data)
+                self.log_detail(
+                    "Resposta final do Qwen recebida: "
+                    f"{len(final_text)} caracteres."
+                )
+
+                if not final_text:
+                    self.log_detail(
+                        "⚠️ O Qwen respondeu sem texto na análise final."
+                    )
+
             return data
+
+        except requests.Timeout as exc:
+
+            self.log_detail(
+                "⚠️ Timeout na análise final do Qwen: "
+                f"{exc}"
+            )
+
+            raise RuntimeError(
+                "O Ollama não concluiu a análise final dentro do "
+                f"tempo limite de {OLLAMA_FINAL_TIMEOUT}s."
+            )
 
         except requests.RequestException as exc:
 
@@ -1870,6 +1933,1260 @@ REGRAS ABSOLUTAS:
             answer = self.last_agent_text
 
         return answer
+
+
+    # ============================================================
+    # ETAPA 2 — MULTI-HOP
+    # ============================================================
+
+    def detect_multi_hop_request(
+            self,
+            text,
+        ):
+            """
+            Detecta se a solicitação do usuário aparenta descrever
+            uma rota com três ou mais pontos.
+
+            Esta função NÃO identifica as localidades.
+
+            A identificação das localidades continua sendo responsabilidade
+            do LLM através de geocode_place.
+
+            O objetivo aqui é somente impedir que o fluxo da ETAPA 1
+            execute A -> B antes de o agente terminar de obter os demais
+            pontos da rota.
+            """
+
+            if not text:
+                return False
+
+            normalized = (
+                str(text)
+                .strip()
+                .lower()
+            )
+
+            # ------------------------------------------------------------
+            # Indicadores explícitos de multi-hop
+            # ------------------------------------------------------------
+
+            explicit_patterns = [
+                r"\bmulti[\s-]?hop\b",
+                r"\bmulti[\s-]?enlace\b",
+                r"\bmulti[\s-]?link\b",
+                r"\bpor\s+.+\s+passando\s+por\b",
+                r"\bpassando\s+por\b",
+                r"\batrav[eé]s\s+de\b",
+                r"\bvia\b",
+                r"\brota\b",
+                r"\btrajeto\b",
+                r"\bsequ[eê]ncia\s+de\s+enlaces\b",
+                r"\bv[aá]rios\s+enlaces\b",
+                r"\bv[aá]rios\s+saltos\b",
+                r"\bsaltos\b",
+                r"\bhops?\b",
+            ]
+
+            for pattern in explicit_patterns:
+
+                if re.search(
+                    pattern,
+                    normalized,
+                ):
+                    return True
+
+            # ------------------------------------------------------------
+            # Notação explícita:
+            #
+            # A -> B -> C
+            # A → B → C
+            # ------------------------------------------------------------
+
+            arrow_count = len(
+                re.findall(
+                    r"(?:->|→|⇒|⟶)",
+                    normalized,
+                )
+            )
+
+            if arrow_count >= 2:
+                return True
+
+            # ------------------------------------------------------------
+            # Listas com três ou mais localidades
+            # ------------------------------------------------------------
+
+            multi_point_patterns = [
+
+                r"\bentre\s+.+,\s*.+\s+e\s+.+",
+
+                r"\bentre\s+.+,\s*.+,\s*.+",
+
+                r"\bde\s+.+\s+até\s+.+\s+passando\s+por\s+.+",
+
+                r"\banalise\s+.+,\s*.+\s+e\s+.+",
+
+                r"\banalisar\s+.+,\s*.+\s+e\s+.+",
+
+                r"\bavalie\s+.+,\s*.+\s+e\s+.+",
+
+                r"\bavaliar\s+.+,\s*.+\s+e\s+.+",
+
+                # Exemplos adicionais:
+                #
+                # "faça uma análise entre A, B e C"
+                # "faca uma analise entre A, B e C"
+                # "faça uma análise de A, B e C"
+                # "analise os enlaces entre A, B e C"
+                #
+
+                r"\bfa[cç]a\s+(?:uma\s+)?an[aá]lise\b.+,\s*.+\s+e\s+.+",
+
+                r"\ban[aá]lise\s+(?:dos\s+enlaces\s+)?entre\s+.+,\s*.+\s+e\s+.+",
+
+                r"\banalis[ea]\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
+
+                r"\bavalie\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
+            ]
+
+            for pattern in multi_point_patterns:
+
+                if re.search(
+                    pattern,
+                    normalized,
+                ):
+                    return True
+
+            # ------------------------------------------------------------
+            # Indicador adicional:
+            #
+            # uma solicitação contendo duas vírgulas ou mais junto com
+            # uma conjunção "e" normalmente representa uma sequência
+            # de três elementos.
+            #
+            # Não usamos isso isoladamente: exigimos também um verbo/
+            # contexto de análise ou de rota.
+            # ------------------------------------------------------------
+
+            comma_count = normalized.count(",")
+
+            route_context = re.search(
+                r"\b("
+                r"analise|analisar|análise|analise|"
+                r"avalie|avaliar|enlace|enlaces|"
+                r"link|links|rota|trajeto|"
+                r"pontos?|localidades?"
+                r")\b",
+                normalized,
+            )
+
+            if (
+                comma_count >= 2
+                and re.search(
+                    r"\be\b",
+                    normalized,
+                )
+                and route_context
+            ):
+                return True
+
+            return False
+
+    async def ensure_application_evaluation(
+            self,
+        ):
+            """
+            Decide qual orquestrador deve ser utilizado.
+
+            2 pontos:
+                ensure_evaluate_link()
+
+            3+ pontos:
+                ensure_multi_hop_evaluation()
+
+            A função nunca transforma evaluate_link em super-tool.
+
+            IMPORTANTE:
+            Se 3 ou mais pontos já foram geocodificados, a aplicação
+            promove automaticamente a solicitação para multi-hop.
+
+            Isso funciona como uma proteção adicional caso a detecção
+            textual inicial não tenha identificado corretamente a intenção.
+            """
+
+            point_count = len(
+                self.geocoded_points
+            )
+
+            # ------------------------------------------------------------
+            # PROTEÇÃO MULTI-HOP
+            #
+            # Se a aplicação já possui 3 ou mais pontos, não existe
+            # justificativa para executar somente o primeiro enlace.
+            #
+            # A rota é formada pelos pontos consecutivos:
+            #
+            # A -> B
+            # B -> C
+            # C -> D
+            #
+            # etc.
+            # ------------------------------------------------------------
+
+            if (
+                point_count >= 3
+                and not self.multi_hop_requested
+            ):
+
+                self.multi_hop_requested = True
+
+                self.log_detail(
+                    "🔗 Três ou mais pontos geocodificados; "
+                    "solicitação promovida automaticamente "
+                    "para multi-hop."
+                )
+
+            # ------------------------------------------------------------
+            # MULTI-HOP
+            # ------------------------------------------------------------
+
+            if self.multi_hop_requested:
+
+                if point_count < 3:
+
+                    self.log_detail(
+                        "⏳ Solicitação multi-hop detectada. "
+                        f"Aguardando pontos adicionais "
+                        f"(atualmente {point_count})."
+                    )
+
+                    return None
+
+                if getattr(
+                    self,
+                    "multi_hop_executed",
+                    False,
+                ):
+
+                    return self.global_result
+
+                return await (
+                    self.ensure_multi_hop_evaluation(
+                        route_points=self.geocoded_points,
+                        parameters=self.link_parameters,
+                    )
+                )
+
+            # ------------------------------------------------------------
+            # ETAPA 1 — ENLACE ÚNICO
+            # ------------------------------------------------------------
+
+            if point_count >= 2:
+
+                if self.evaluate_executed:
+
+                    return self.last_evaluate_result
+
+                return await (
+                    self.ensure_evaluate_link()
+                )
+
+            return None
+
+    def _get_current_hop_info(
+            self,
+        ):
+            """
+            Retorna informações do hop atualmente em processamento.
+            """
+
+            if not self.multi_hop_requested:
+
+                return {
+                    "key": "single",
+                    "index": None,
+                    "name": None,
+                }
+
+            current_hop = getattr(
+                self,
+                "current_hop",
+                None,
+            )
+
+            if isinstance(
+                current_hop,
+                dict,
+            ):
+
+                index = current_hop.get(
+                    "index"
+                )
+
+                hop_id = current_hop.get(
+                    "id"
+                )
+
+                name = current_hop.get(
+                    "name"
+                )
+
+                if index is not None:
+
+                    key = (
+                        f"hop_{index}"
+                    )
+
+                elif hop_id:
+
+                    key = str(
+                        hop_id
+                    )
+
+                else:
+
+                    key = (
+                        f"hop_{id(current_hop)}"
+                    )
+
+                return {
+                    "key": key,
+                    "index": index,
+                    "name": name,
+                }
+
+            return None
+
+    async def gerar_visualizacoes(
+            self,
+        ):
+
+            if not self.multi_hop_requested:
+
+                if not self.evaluate_executed:
+                    return
+
+                if self.evaluate_error:
+                    return
+
+                hop_info = {
+                    "key": "single",
+                    "index": None,
+                    "name": None,
+                }
+
+            else:
+
+                if self.multi_hop_error:
+                    return
+
+                hop_info = (
+                    self._get_current_hop_info()
+                )
+
+                if hop_info is None:
+
+                    self.log_detail(
+                        "⚠️ Não foi possível identificar "
+                        "o hop atual para gerar "
+                        "as visualizações."
+                    )
+
+                    return
+
+            hop_key = hop_info["key"]
+
+            if hop_key in (
+                self.visualizations_generated_hops
+            ):
+
+                self.log_detail(
+                    "Visualizações já preparadas "
+                    f"para {hop_key}; "
+                    "nova geração ignorada."
+                )
+
+                return
+
+            if self.multi_hop_requested:
+
+                hop_index = (
+                    hop_info.get("index")
+                )
+
+                hop_name = (
+                    hop_info.get("name")
+                )
+
+                if hop_name:
+
+                    if hop_index is not None:
+
+                        hop_title = (
+                            f"Hop {hop_index} — "
+                            f"{hop_name}"
+                        )
+
+                    else:
+
+                        hop_title = (
+                            str(hop_name)
+                        )
+
+                else:
+
+                    if hop_index is not None:
+
+                        hop_title = (
+                            f"Hop {hop_index}"
+                        )
+
+                    else:
+
+                        hop_title = "Hop"
+
+            else:
+
+                hop_title = None
+
+            tools = [
+                (
+                    "link_area",
+                    {"ds_string": "DTM"},
+                    "DTM",
+                ),
+                (
+                    "link_area",
+                    {"ds_string": "DSM"},
+                    "DSM",
+                ),
+                (
+                    "link_area",
+                    {"ds_string": "COVER"},
+                    "COVER",
+                ),
+                (
+                    "link_profile",
+                    {},
+                    "Perfil",
+                ),
+                (
+                    "lulc_fresnel",
+                    {},
+                    "LULC / Fresnel",
+                ),
+                (
+                    "bldg_prepare",
+                    {},
+                    "Buildings prepare",
+                ),
+                (
+                    "bldg_fresnel",
+                    {},
+                    "Buildings / Fresnel",
+                ),
+                (
+                    "bldg_profile",
+                    {},
+                    "Buildings profile",
+                ),
+            ]
+
+            generated_count = 0
+
+            for (
+                tool_name,
+                arguments,
+                image_type,
+            ) in tools:
+
+                try:
+
+                    raw = (
+                        await self.execute_mcp_tool_raw(
+                            tool_name,
+                            arguments,
+                        )
+                    )
+
+                    parsed = (
+                        self.parse_mcp_result(
+                            raw
+                        )
+                    )
+
+                    if not isinstance(
+                        parsed,
+                        dict,
+                    ):
+
+                        self.log_detail(
+                            f"⚠️ {image_type}: "
+                            "resultado não é um objeto."
+                        )
+
+                        continue
+
+                    if parsed.get(
+                        "kind"
+                    ) != "image":
+
+                        self.log_detail(
+                            f"⚠️ {image_type}: "
+                            "resultado não contém imagem."
+                        )
+
+                        continue
+
+                    data = parsed.get(
+                        "data"
+                    )
+
+                    if not data:
+
+                        self.log_detail(
+                            f"⚠️ {image_type}: "
+                            "imagem sem dados."
+                        )
+
+                        continue
+
+                    image_bytes = (
+                        base64.b64decode(
+                            data
+                        )
+                    )
+
+                    image = widgets.Image(
+                        value=image_bytes,
+                        format="png",
+                        layout=widgets.Layout(
+                            width="100%",
+                            height="auto",
+                        ),
+                    )
+
+                    if hop_title:
+
+                        title = (
+                            f"{hop_title} — "
+                            f"{image_type}"
+                        )
+
+                    else:
+
+                        title = image_type
+
+                    self.visualizations.append(
+                        image
+                    )
+
+                    self.visualization_images.append(
+                        {
+                            "title": title,
+                            "data": image_bytes,
+                            "mime_type": "image/png",
+                        }
+                    )
+
+                    generated_count += 1
+
+                    if self.visualization_callback:
+
+                        self.visualization_callback(
+                            image,
+                            title,
+                        )
+
+                    self.log_detail(
+                        f"Visualização preparada: "
+                        f"{title}"
+                    )
+
+                except Exception as exc:
+
+                    self.log_detail(
+                        f"⚠️ Visualização "
+                        f"{image_type}: {exc}"
+                    )
+
+            self.visualizations_generated_hops.add(
+                hop_key
+            )
+
+            self.log_detail(
+                "Visualizações do "
+                f"{hop_title or 'enlace único'} "
+                f"preparadas: {generated_count}"
+            )
+
+            self.log_detail(
+                "Total acumulado de visualizações: "
+                f"{len(self.visualization_images)}"
+            )
+
+    def build_report(
+            self,
+            technical_result,
+            analysis_text=None,
+        ):
+
+            requested_parameters = {
+                "frequency": getattr(
+                    self,
+                    "requested_frequency",
+                    None,
+                ),
+                "frequency_unit": getattr(
+                    self,
+                    "requested_frequency_unit",
+                    None,
+                ),
+                "frequency_text": getattr(
+                    self,
+                    "requested_frequency_text",
+                    None,
+                ),
+                "tx_ha": getattr(
+                    self,
+                    "requested_tx_ha",
+                    None,
+                ),
+                "rx_ha": getattr(
+                    self,
+                    "requested_rx_ha",
+                    None,
+                ),
+            }
+
+            link_parameters = getattr(
+                self,
+                "link_parameters",
+                {},
+            )
+
+            if not isinstance(
+                link_parameters,
+                dict,
+            ):
+
+                link_parameters = {}
+
+            effective_parameters = {
+                "freq_mhz": link_parameters.get(
+                    "freq_mhz",
+                    DEFAULT_FREQ_MHZ,
+                ),
+                "tx_ha": link_parameters.get(
+                    "tx_ha",
+                    DEFAULT_TX_HA,
+                ),
+                "rx_ha": link_parameters.get(
+                    "rx_ha",
+                    DEFAULT_RX_HA,
+                ),
+                "on_rooftop": link_parameters.get(
+                    "on_rooftop",
+                    DEFAULT_ON_ROOFTOP,
+                ),
+            }
+
+            if (
+                self.map_image_bytes is None
+                and len(
+                    self.geocoded_points
+                ) >= 2
+            ):
+
+                try:
+
+                    if (
+                        self.multi_hop_requested
+                        and getattr(
+                            self,
+                            "hops",
+                            None,
+                        )
+                    ):
+
+                        from map_utils import (
+                            gerar_imagem_mapa_multihop,
+                        )
+
+                        self.map_image_bytes = (
+                            gerar_imagem_mapa_multihop(
+                                self.hops
+                            )
+                        )
+
+                    else:
+
+                        from map_utils import (
+                            gerar_imagem_mapa_enlace,
+                        )
+
+                        p1 = (
+                            self.geocoded_points[0]
+                        )
+
+                        p2 = (
+                            self.geocoded_points[1]
+                        )
+
+                        self.map_image_bytes = (
+                            gerar_imagem_mapa_enlace(
+                                p1["lat"],
+                                p1["lon"],
+                                p2["lat"],
+                                p2["lon"],
+                            )
+                        )
+
+                except Exception as exc:
+
+                    self.log_detail(
+                        "⚠️ Não foi possível "
+                        "gerar imagem do mapa "
+                        "para o relatório: "
+                        f"{exc}"
+                    )
+
+            if analysis_text is None:
+                analysis_text = self.technical_report or None
+
+            generator = ReportGenerator(
+                requested_params=requested_parameters,
+                effective_params=effective_parameters,
+                technical_result=technical_result,
+                geocoded_points=self.geocoded_points,
+                map_image=self.map_image_bytes,
+                visualization_images=self.visualization_images,
+                user_request=self.user_request,
+                analysis_text=analysis_text,
+            )
+
+            report = generator.generate_report(
+                include_raw_result=False
+            )
+
+            self.technical_report = report
+
+            pdf_path = generator.generate_pdf(
+                report_text=report,
+                include_raw_result=False,
+            )
+
+            self.report_pdf_path = pdf_path
+
+            self.log_detail(
+                "Relatório PDF gerado: "
+                f"{pdf_path}"
+            )
+
+            self.log_detail(
+                "Mapa no relatório: "
+                + (
+                    "SIM"
+                    if self.map_image_bytes
+                    else "NÃO"
+                )
+            )
+
+            self.log_detail(
+                "Visualizações no relatório: "
+                f"{len(self.visualization_images)}"
+            )
+
+            return report
+
+    def system_prompt(self):
+
+        return """
+Você é o PlanApp AI, assistente técnico especializado em planejamento e avaliação de enlaces de rádio.
+
+O PlanApp é a fonte oficial dos resultados técnicos.
+
+REGRAS:
+1. Nunca invente valores, unidades ou resultados.
+2. Nunca altere resultados retornados pelo PlanApp.
+3. Não recalcule valores técnicos quando o PlanApp já os forneceu.
+4. Use geocode_place para todas as localidades informadas pelo usuário.
+5. Em uma rota com 3 ou mais localidades, geocodifique TODAS na ordem informada antes da avaliação.
+6. Preserve rigorosamente a ordem dos pontos.
+7. A -> B -> C representa Hop 1 A -> B e Hop 2 B -> C.
+8. Não pare a geocodificação depois dos dois primeiros pontos em uma rota multi-hop.
+9. NÃO execute evaluate_link diretamente. A aplicação controla a avaliação.
+10. Em multi-hop, evaluate_link continua representando somente UM enlace.
+11. Mapa e visualizações são controlados pela aplicação.
+12. Preserve frequência, TX, RX e rooftop solicitados.
+13. Padrões: 900 MHz, TX 7 m, RX 7 m, rooftop=false.
+14. FSPL significa perda de percurso em espaço livre; não significa interferência.
+15. Não invente potência TX, ganho, sensibilidade, margem ou limiares.
+16. Não atribua significado físico próprio a core, fresnel, boundary, delta_diffra, VV, v_v ou d_norm.
+17. Não converta radianos para graus.
+18. status=OK significa sucesso de execução, não viabilidade.
+19. Não declare enlace ou rota viável/inviável sem critério técnico explícito.
+20. Em multi-hop, apresente os resultados de cada hop separadamente e compare os hops.
+21. Pode comparar maior/menor e diferenças entre valores efetivamente retornados.
+22. Destaque valores negativos, especialmente clearances negativas, sem inventar sua causa.
+23. Identifique pontos de atenção sustentados pelos próprios dados.
+24. Diferencie parâmetros solicitados, parâmetros efetivos, resultados, interpretação e limitações.
+25. Sugestões não testadas devem ser apresentadas como sugestões.
+26. Responda em português do Brasil.
+27. Seja técnico, claro, objetivo e informativo.
+"""
+
+
+    async def agent_turn(self):
+
+        for iteration in range(MAX_AGENT_ITERATIONS):
+
+            self.log_detail(
+                f"Iteração do agente: {iteration + 1}/{MAX_AGENT_ITERATIONS}"
+            )
+
+            response = await self.ollama_chat()
+            message = self.response_message(response)
+            text = self.response_text(response)
+            tool_calls = self.response_tool_calls(response)
+
+            if text:
+                self.last_agent_text = text
+
+            if message:
+                self.messages.append(message)
+
+            # ------------------------------------------------------------
+            # SEM TOOL CALLS
+            # ------------------------------------------------------------
+            if not tool_calls:
+
+                result = await self.ensure_application_evaluation()
+
+                if result is not None:
+                    self.append_technical_context(result)
+
+                    # ----------------------------------------------------
+                    # MULTI-HOP CONCLUÍDO
+                    #
+                    # A avaliação dos hops já foi executada pela aplicação.
+                    # NÃO voltar ao Qwen neste ponto: isso fazia o agente
+                    # continuar em novas iterações e impedia que ask()
+                    # chegasse à preparação do mapa multi-hop e à análise
+                    # final.
+                    # ----------------------------------------------------
+                    if (
+                        self.multi_hop_requested
+                        and getattr(
+                            self,
+                            "multi_hop_executed",
+                            False,
+                        )
+                    ):
+                        self.log_detail(
+                            "🟢 Multi-hop concluído após a geocodificação."
+                        )
+                        self.log_detail(
+                            "Encerrando agent_turn()."
+                        )
+                        return text
+
+                    continue
+
+                if (
+                    self.multi_hop_requested
+                    and len(self.geocoded_points) < 3
+                    and not self.geocoding_followup_sent
+                ):
+                    self.geocoding_followup_sent = True
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "A solicitação atual descreve uma rota multi-hop. "
+                            "Ainda existem menos de três pontos geocodificados. "
+                            "Continue identificando e geocodificando, na ordem "
+                            "solicitada pelo usuário, todas as localidades restantes. "
+                            "Não execute avaliação técnica."
+                        ),
+                    })
+                    continue
+
+                return text
+
+            # ------------------------------------------------------------
+            # EXECUÇÃO DAS TOOLS
+            # ------------------------------------------------------------
+            tool_messages=[]
+
+            for call in tool_calls:
+                function=call.get("function",{})
+                if not isinstance(function,dict):
+                    continue
+
+                name=function.get("name")
+                if not name:
+                    continue
+
+                arguments=function.get("arguments",{})
+                if isinstance(arguments,str):
+                    try:
+                        arguments=json.loads(arguments or "{}")
+                    except Exception as exc:
+                        self.log_detail(f"⚠️ Argumentos inválidos para {name}: {exc}")
+                        arguments={}
+
+                if not isinstance(arguments,dict):
+                    arguments={}
+
+                if name in APPLICATION_CONTROLLED_TOOLS:
+                    self.log_detail(
+                        f"⚠️ Ferramenta {name} é controlada pela aplicação."
+                    )
+                    continue
+
+                self.log_detail(f"Executando ferramenta MCP: {name}")
+
+                try:
+                    result=await self.execute_mcp_tool(name,arguments)
+                    tool_messages.append({
+                        "role":"tool",
+                        "content":json.dumps(result,ensure_ascii=False,default=str),
+                    })
+                except Exception as exc:
+                    self.log_detail(f"⚠️ Erro na ferramenta {name}: {exc}")
+                    tool_messages.append({
+                        "role":"tool",
+                        "content":json.dumps({"error":str(exc)},ensure_ascii=False),
+                    })
+
+            if tool_messages:
+                self.messages.extend(tool_messages)
+                # Não avaliar aqui: o Qwen precisa ter a oportunidade de
+                # geocodificar todos os pontos da rota.
+                continue
+
+            result=await self.ensure_application_evaluation()
+            if result is not None:
+                self.append_technical_context(result)
+
+                if (
+                    self.multi_hop_requested
+                    and getattr(
+                        self,
+                        "multi_hop_executed",
+                        False,
+                    )
+                ):
+                    self.log_detail(
+                        "🟢 Multi-hop concluído após a execução das ferramentas."
+                    )
+                    self.log_detail(
+                        "Encerrando agent_turn()."
+                    )
+                    return text
+
+                continue
+
+            if (
+                self.multi_hop_requested
+                and len(self.geocoded_points)<3
+                and not self.geocoding_followup_sent
+            ):
+                self.geocoding_followup_sent=True
+                self.messages.append({
+                    "role":"user",
+                    "content":(
+                        "Continue a geocodificação da rota multi-hop solicitada. "
+                        "Use geocode_place para os pontos restantes na ordem original. "
+                        "Não execute avaliação técnica."
+                    ),
+                })
+                continue
+
+            return text
+
+        return (
+            "Não foi possível concluir o processamento dentro do "
+            "limite de iterações."
+        )
+
+
+    def _compact_analysis_context(self, technical_result):
+        """Remove somente conteúdo pesado que não é necessário ao Qwen.
+
+        O resultado técnico continua sendo o resultado real do PlanApp.
+        A compactação evita enviar imagens/base64/geometrias gigantescas
+        para a análise textual final.
+        """
+
+        def compact(value, key="", depth=0):
+
+            key_lower = str(key).lower()
+
+            # Conteúdo visual não deve ser enviado ao modelo textual.
+            if key_lower in {
+                "data",
+                "image",
+                "image_data",
+                "image_bytes",
+                "base64",
+                "png",
+                "jpeg",
+                "jpg",
+            }:
+                return "[conteúdo visual omitido da análise textual]"
+
+            if isinstance(value, dict):
+                result = {}
+                for k, v in value.items():
+                    result[k] = compact(v, k, depth + 1)
+                return result
+
+            if isinstance(value, list):
+                # Não cortar listas pequenas. Para listas enormes de
+                # coordenadas/geometrias, preservar apenas uma amostra.
+                if len(value) > 200:
+                    return {
+                        "_total_itens": len(value),
+                        "_amostra_inicial": [
+                            compact(v, key, depth + 1)
+                            for v in value[:20]
+                        ],
+                        "_amostra_final": [
+                            compact(v, key, depth + 1)
+                            for v in value[-5:]
+                        ],
+                        "_observacao": "lista extensa compactada para análise textual",
+                    }
+                return [compact(v, key, depth + 1) for v in value]
+
+            if isinstance(value, str) and len(value) > 20000:
+                return (
+                    value[:20000]
+                    + "\n[texto extenso truncado para análise final]"
+                )
+
+            return value
+
+        return compact(technical_result)
+
+    async def generate_final_response(
+        self,
+        original_text,
+        technical_result,
+        technical_report=None,
+    ):
+        """Gera somente a interpretação final dos resultados já calculados.
+
+        Esta chamada é deliberadamente independente do histórico do agente:
+        não reutiliza self.messages e não envia ferramentas MCP ao Qwen.
+        """
+
+        context = self._compact_analysis_context(
+            self.build_technical_context(technical_result)
+        )
+
+        context_json = json.dumps(
+            context,
+            ensure_ascii=False,
+            default=str,
+        )
+
+        self.log_detail(
+            "Contexto compacto preparado para a análise final: "
+            f"{len(context_json)} caracteres."
+        )
+
+        final_instruction = """
+Produza agora a análise técnica final do PlanApp, em português do Brasil.
+
+IMPORTANTE: a avaliação técnica já foi executada pela aplicação. Você NÃO
+precisa e NÃO deve executar ferramentas. Apenas interprete os resultados
+fornecidos abaixo.
+
+Use somente valores efetivamente retornados pelo PlanApp.
+Não invente potência, ganho, sensibilidade, margem, limiar ou critério de
+viabilidade.
+Não atribua significado físico a campos cuja definição não esteja
+explicitamente documentada.
+Não trate status OK como indicação de viabilidade.
+
+Para uma rota multi-hop:
+
+## 1. IDENTIFICAÇÃO DA ROTA
+Liste os pontos na ordem e os hops consecutivos.
+
+## 2. PARÂMETROS UTILIZADOS
+Diferencie, quando disponível, parâmetros solicitados e efetivamente usados.
+
+## 3. ANÁLISE POR HOP
+Para cada hop, destaque distância, FSPL, delta_diffra e outros resultados
+relevantes efetivamente retornados.
+
+## 4. COMPARAÇÃO ENTRE OS HOPS
+Compare objetivamente os valores disponíveis. Destaque maior/menor valor e
+combinações de indicadores que ocorram no mesmo hop. Não crie métricas novas.
+
+## 5. TERRENO, VEGETAÇÃO, FRESNEL E EDIFICAÇÕES
+Apresente os resultados disponíveis dessas etapas. Não invente semântica para
+campos não documentados.
+
+## 6. PRINCIPAIS PONTOS DE ATENÇÃO
+Identifique quais resultados/hops merecem atenção e justifique com os dados.
+Valores negativos ou muito diferentes entre hops podem ser destacados como
+pontos de atenção, sem transformá-los automaticamente em inviabilidade.
+
+## 7. CONCLUSÃO TÉCNICA
+Explique o que os dados permitem afirmar sobre a rota e quais limitações
+permanecem. Se não houver critério técnico explícito para viabilidade,
+declare essa limitação claramente.
+
+Se houver apenas um enlace, adapte a estrutura para um único enlace.
+
+Seja técnico, objetivo e claro. Não reproduza o JSON integralmente.
+"""
+
+        final_messages = [
+            {
+                "role": "system",
+                "content": self.system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "SOLICITAÇÃO ORIGINAL DO USUÁRIO:\n"
+                    + str(original_text)
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "RESULTADOS TÉCNICOS DO PLANAPP:\n"
+                    + context_json
+                ),
+            },
+            {
+                "role": "user",
+                "content": final_instruction,
+            },
+        ]
+
+        old_messages = self.messages
+
+        try:
+            self.messages = final_messages
+
+            response = await self.ollama_chat(
+                use_tools=False,
+                options={
+                    "temperature": 0.2,
+                    "num_predict": OLLAMA_FINAL_NUM_PREDICT,
+                },
+            )
+
+            answer = self.response_text(response)
+
+            if answer:
+                self.last_agent_text = answer
+                self.log_detail(
+                    "🧠 Análise final do Qwen concluída."
+                )
+            else:
+                self.log_detail(
+                    "⚠️ Análise final do Qwen retornou texto vazio."
+                )
+
+            return answer
+
+        finally:
+            self.messages = old_messages
+
+
+    async def ask(self,text):
+
+        self.reset_common_state()
+        self.registered=False
+        self.technical_context_added=False
+        self.last_agent_text=""
+        self.technical_report=""
+        self.report_pdf_path=None
+        self.user_request=text
+
+        self.multi_hop_requested=self.detect_multi_hop_request(text)
+        self.geocoding_followup_sent=False
+
+        self.log_detail(
+            "🔗 Solicitação multi-hop detectada."
+            if self.multi_hop_requested
+            else "🔗 Solicitação de enlace único."
+        )
+
+        self.map=None
+        self.map_image_bytes=None
+        self.visualizations=[]
+        self.visualization_images=[]
+        self.visualizations_generated_hops=set()
+
+        self.extract_link_parameters(text)
+
+        await self.connect_ollama()
+        await self.connect()
+        await self.register()
+
+        self.messages=[
+            {"role":"system","content":self.system_prompt()},
+            {"role":"user","content":text},
+        ]
+
+        await self.agent_turn()
+
+        result=await self.ensure_application_evaluation()
+
+        if result is not None:
+            if not self.technical_context_added:
+                self.append_technical_context(result)
+
+            final_result=(
+                getattr(self,"global_result",result)
+                if self.multi_hop_requested
+                else self.last_evaluate_result
+            )
+        else:
+            final_result=None
+
+        if self.multi_hop_requested:
+            if (
+                getattr(self,"multi_hop_executed",False)
+                and getattr(self,"hops",None)
+            ):
+                try:
+                    from map_utils import mostrar_mapa_multihop, gerar_imagem_mapa_multihop
+                    self.map=mostrar_mapa_multihop(self.hops)
+                    if self.map_callback:
+                        self.map_callback(self.map)
+                    self.map_image_bytes=gerar_imagem_mapa_multihop(self.hops)
+                    self.log_detail(
+                        "Mapa multi-hop preparado "
+                        f"com {len(self.hops)} hops."
+                    )
+                except Exception as exc:
+                    self.log_detail(f"⚠️ Erro no mapa multi-hop: {exc}")
+        elif len(self.geocoded_points)>=2:
+            await self.mostrar_mapa_apos_geocodificacao()
+
+        if final_result is not None:
+            answer=await self.generate_final_response(
+                text,
+                final_result,
+                technical_report=None,
+            )
+            self.technical_report=answer
+            self.build_report(final_result,analysis_text=answer)
+        else:
+            answer=self.last_agent_text
+
+        return answer
+
 
     # ============================================================
     # CLOSE

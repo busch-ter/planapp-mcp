@@ -230,8 +230,6 @@ class PlanAppAgent(PlanAppAgentCommon):
             r"\bpassando\s+por\b",
             r"\batrav[eé]s\s+de\b",
             r"\bvia\b",
-            r"\brota\b",
-            r"\btrajeto\b",
             r"\bsequ[eê]ncia\s+de\s+enlaces\b",
             r"\bv[aá]rios\s+enlaces\b",
             r"\bv[aá]rios\s+saltos\b",
@@ -997,8 +995,7 @@ REGRAS:
 
             self.map_image_bytes = (
                 gerar_imagem_mapa_enlace(
-                    tx_lat,
-                    tx_lon,
+                    tx_lat,tx_lon,
                     rx_lat,
                     rx_lon,
                 )
@@ -1580,15 +1577,16 @@ REGRAS:
                         result
                     )
 
-                    response = (
-                        await self.openai_chat(
-                            self.messages,
-                            self.build_openai_tools(),
-                            previous_response_id=None,
-                        )
+                    # A avaliação técnica já foi executada pela aplicação.
+                    # Não retornar ao GPT com geocode_place disponível:
+                    # isso fazia o modelo repetir a geocodificação dos
+                    # pontos já conhecidos e atrasava o mapa, o relatório
+                    # e a análise final.
+                    self.log_detail(
+                        "🟢 Avaliação técnica concluída. "
+                        "Encerrando agent_turn()."
                     )
-
-                    continue
+                    return text
 
                 # ------------------------------------------------------------
                 # Se uma solicitação foi identificada como multi-hop mas
@@ -1794,15 +1792,11 @@ REGRAS:
                     result
                 )
 
-                response = (
-                    await self.openai_chat(
-                        self.messages,
-                        self.build_openai_tools(),
-                        previous_response_id=None,
-                    )
+                self.log_detail(
+                    "🟢 Avaliação técnica concluída. "
+                    "Encerrando agent_turn()."
                 )
-
-                continue
+                return text
 
             if (
                 self.multi_hop_requested
@@ -1997,8 +1991,7 @@ IMPORTANTE:
 - Não declare um enlace ou rota como viável ou inviável sem um critério técnico explícito.
 - Não diga que um enlace está "bom", "ruim", "aprovado" ou "reprovado" sem um critério documentado.
 - Quando um valor não tiver definição explícita, apresente-o simplesmente como resultado retornado pelo PlanApp.
-- Faça uma síntese técnica clara dos dados disponíveis.
-""",
+- Faça uma síntese técnica clara dos dados disponíveis.""",
             }
         )
 
