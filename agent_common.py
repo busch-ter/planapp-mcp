@@ -76,15 +76,12 @@ USER_ID = os.getenv(
     "jupyter-user",
 )
 
-
 DEFAULT_FREQ_MHZ = 900
 DEFAULT_TX_HA = 7
 DEFAULT_RX_HA = 7
 DEFAULT_ON_ROOFTOP = False
 
-
 MAX_AGENT_ITERATIONS = 12
-
 
 LOG_DIR = os.path.expanduser(
     "~/work/planapp-mcp/logs"
@@ -93,9 +90,6 @@ LOG_DIR = os.path.expanduser(
 
 # ============================================================
 # FERRAMENTAS CONTROLADAS PELA APLICAÇÃO
-#
-# Nenhum dos modelos deve decidir executar diretamente estas
-# ferramentas.
 # ============================================================
 
 APPLICATION_CONTROLLED_TOOLS = {
@@ -118,8 +112,6 @@ class PlanAppAgentCommon:
 
     """
     Classe base compartilhada pelos três agentes.
-
-    IMPORTANTE:
 
     Esta classe não implementa a chamada ao LLM.
 
@@ -150,39 +142,20 @@ class PlanAppAgentCommon:
         # Callbacks
         # --------------------------------------------------------
 
-        self.progress_callback = (
-            progress_callback
-        )
-
-        self.map_callback = (
-            map_callback
-        )
-
-        self.log_callback = (
-            log_callback
-        )
-
-        self.result_callback = (
-            result_callback
-        )
-
-        self.visualization_callback = (
-            visualization_callback
-        )
-
+        self.progress_callback = progress_callback
+        self.map_callback = map_callback
+        self.log_callback = log_callback
+        self.result_callback = result_callback
+        self.visualization_callback = visualization_callback
 
         # --------------------------------------------------------
         # MCP
         # --------------------------------------------------------
 
         self.exit_stack = AsyncExitStack()
-
         self.mcp_session = None
-
         self.mcp_tools = []
-
         self.connected = False
-
 
         # --------------------------------------------------------
         # Conversação
@@ -190,41 +163,30 @@ class PlanAppAgentCommon:
 
         self.messages = []
 
-
         # --------------------------------------------------------
         # Pontos geocodificados
         # --------------------------------------------------------
 
         self.geocoded_points = []
 
-
         # --------------------------------------------------------
         # ETAPA 2 — ESTADO MULTI-HOP
         # --------------------------------------------------------
 
         self.route_points = []
-
         self.hops = []
-
         self.current_hop = None
-
         self.global_result = None
-
         self.multi_hop_executed = False
-
         self.multi_hop_error = None
-
 
         # --------------------------------------------------------
         # Estado da avaliação
         # --------------------------------------------------------
 
         self.evaluate_executed = False
-
         self.last_evaluate_result = None
-
         self.evaluate_error = None
-
 
         # --------------------------------------------------------
         # Visualizações
@@ -232,22 +194,18 @@ class PlanAppAgentCommon:
 
         self.visualizations = []
 
-
         # --------------------------------------------------------
         # Mapa
         # --------------------------------------------------------
 
         self.map = None
 
-
         # --------------------------------------------------------
         # Controle
         # --------------------------------------------------------
 
         self.tool_count = 0
-
         self.current_stage = 0
-
 
         # --------------------------------------------------------
         # Parâmetros do enlace
@@ -260,21 +218,15 @@ class PlanAppAgentCommon:
             "on_rooftop": DEFAULT_ON_ROOFTOP,
         }
 
-
         # --------------------------------------------------------
         # Parâmetros solicitados pelo usuário
         # --------------------------------------------------------
 
         self.requested_frequency = None
-
         self.requested_frequency_unit = None
-
         self.requested_frequency_text = None
-
         self.requested_tx_ha = None
-
         self.requested_rx_ha = None
-
 
         # --------------------------------------------------------
         # Logging
@@ -311,11 +263,9 @@ class PlanAppAgentCommon:
 
         self.logger.propagate = False
 
-        self.file_handler = (
-            logging.FileHandler(
-                self.log_file_path,
-                encoding="utf-8",
-            )
+        self.file_handler = logging.FileHandler(
+            self.log_file_path,
+            encoding="utf-8",
         )
 
         self.file_handler.setFormatter(
@@ -331,7 +281,6 @@ class PlanAppAgentCommon:
             self.file_handler
         )
 
-
     # ============================================================
     # STATUS / LOG
     # ============================================================
@@ -344,26 +293,15 @@ class PlanAppAgentCommon:
         text = str(message)
 
         try:
-
-            self.logger.info(
-                text
-            )
-
+            self.logger.info(text)
         except Exception:
             pass
 
-
         if self.progress_callback:
-
             try:
-
-                self.progress_callback(
-                    text
-                )
-
+                self.progress_callback(text)
             except Exception:
                 pass
-
 
     def log_detail(
         self,
@@ -373,26 +311,15 @@ class PlanAppAgentCommon:
         text = str(message)
 
         try:
-
-            self.logger.info(
-                text
-            )
-
+            self.logger.info(text)
         except Exception:
             pass
 
-
         if self.log_callback:
-
             try:
-
-                self.log_callback(
-                    text
-                )
-
+                self.log_callback(text)
             except Exception:
                 pass
-
 
     def publish_technical_result(
         self,
@@ -400,16 +327,10 @@ class PlanAppAgentCommon:
     ):
 
         if self.result_callback:
-
             try:
-
-                self.result_callback(
-                    result
-                )
-
+                self.result_callback(result)
             except Exception:
                 pass
-
 
     # ============================================================
     # EXTRAÇÃO DOS PARÂMETROS
@@ -422,7 +343,6 @@ class PlanAppAgentCommon:
 
         text = text or ""
 
-
         parameters = {
             "freq_mhz": DEFAULT_FREQ_MHZ,
             "tx_ha": DEFAULT_TX_HA,
@@ -430,21 +350,15 @@ class PlanAppAgentCommon:
             "on_rooftop": DEFAULT_ON_ROOFTOP,
         }
 
-
         # --------------------------------------------------------
         # Reset dos parâmetros solicitados
         # --------------------------------------------------------
 
         self.requested_frequency = None
-
         self.requested_frequency_unit = None
-
         self.requested_frequency_text = None
-
         self.requested_tx_ha = None
-
         self.requested_rx_ha = None
-
 
         # --------------------------------------------------------
         # Frequência
@@ -456,16 +370,11 @@ class PlanAppAgentCommon:
             re.IGNORECASE,
         )
 
-        freq_match = (
-            freq_pattern.search(text)
-        )
-
+        freq_match = freq_pattern.search(text)
 
         if freq_match:
 
-            value_text = (
-                freq_match.group(1)
-            )
+            value_text = freq_match.group(1)
 
             unit = (
                 freq_match.group(2)
@@ -479,44 +388,23 @@ class PlanAppAgentCommon:
                 )
             )
 
-
-            self.requested_frequency = (
-                value
-            )
-
-            self.requested_frequency_unit = (
-                unit
-            )
-
+            self.requested_frequency = value
+            self.requested_frequency_unit = unit
             self.requested_frequency_text = (
                 freq_match.group(0)
             )
 
-
             if unit == "ghz":
-
-                parameters[
-                    "freq_mhz"
-                ] = value * 1000.0
+                parameters["freq_mhz"] = value * 1000.0
 
             elif unit == "mhz":
-
-                parameters[
-                    "freq_mhz"
-                ] = value
+                parameters["freq_mhz"] = value
 
             elif unit == "khz":
-
-                parameters[
-                    "freq_mhz"
-                ] = value / 1000.0
+                parameters["freq_mhz"] = value / 1000.0
 
             elif unit == "hz":
-
-                parameters[
-                    "freq_mhz"
-                ] = value / 1_000_000.0
-
+                parameters["freq_mhz"] = value / 1_000_000.0
 
         # --------------------------------------------------------
         # Duas antenas com mesma altura
@@ -537,9 +425,7 @@ class PlanAppAgentCommon:
             ),
         ]
 
-
         same_height_match = None
-
 
         for pattern in same_height_patterns:
 
@@ -550,9 +436,7 @@ class PlanAppAgentCommon:
             )
 
             if same_height_match:
-
                 break
-
 
         if same_height_match:
 
@@ -564,22 +448,11 @@ class PlanAppAgentCommon:
                 )
             )
 
-            parameters["tx_ha"] = (
-                height
-            )
+            parameters["tx_ha"] = height
+            parameters["rx_ha"] = height
 
-            parameters["rx_ha"] = (
-                height
-            )
-
-            self.requested_tx_ha = (
-                height
-            )
-
-            self.requested_rx_ha = (
-                height
-            )
-
+            self.requested_tx_ha = height
+            self.requested_rx_ha = height
 
         else:
 
@@ -596,7 +469,6 @@ class PlanAppAgentCommon:
                 re.IGNORECASE,
             )
 
-
             # ----------------------------------------------------
             # RX
             # ----------------------------------------------------
@@ -610,7 +482,6 @@ class PlanAppAgentCommon:
                 re.IGNORECASE,
             )
 
-
             if tx_match:
 
                 height = float(
@@ -621,14 +492,8 @@ class PlanAppAgentCommon:
                     )
                 )
 
-                parameters["tx_ha"] = (
-                    height
-                )
-
-                self.requested_tx_ha = (
-                    height
-                )
-
+                parameters["tx_ha"] = height
+                self.requested_tx_ha = height
 
             if rx_match:
 
@@ -640,14 +505,8 @@ class PlanAppAgentCommon:
                     )
                 )
 
-                parameters["rx_ha"] = (
-                    height
-                )
-
-                self.requested_rx_ha = (
-                    height
-                )
-
+                parameters["rx_ha"] = height
+                self.requested_rx_ha = height
 
         # --------------------------------------------------------
         # Rooftop
@@ -664,7 +523,6 @@ class PlanAppAgentCommon:
             r"\brooftop\b",
         ]
 
-
         for pattern in rooftop_patterns:
 
             if re.search(
@@ -673,19 +531,12 @@ class PlanAppAgentCommon:
                 re.IGNORECASE,
             ):
 
-                parameters[
-                    "on_rooftop"
-                ] = True
-
+                parameters["on_rooftop"] = True
                 break
 
-
-        self.link_parameters = (
-            parameters
-        )
+        self.link_parameters = parameters
 
         return parameters
-
 
     # ============================================================
     # CONEXÃO MCP
@@ -696,14 +547,11 @@ class PlanAppAgentCommon:
     ):
 
         if self.connected:
-
             return
-
 
         self.log(
             "🔌 Conectando ao PlanApp MCP..."
         )
-
 
         transport = await (
             self.exit_stack
@@ -713,7 +561,6 @@ class PlanAppAgentCommon:
                 )
             )
         )
-
 
         if len(transport) == 2:
 
@@ -730,7 +577,6 @@ class PlanAppAgentCommon:
                 _,
             ) = transport
 
-
         self.mcp_session = await (
             self.exit_stack
             .enter_async_context(
@@ -741,14 +587,11 @@ class PlanAppAgentCommon:
             )
         )
 
-
         await self.mcp_session.initialize()
-
 
         tools_result = await (
             self.mcp_session.list_tools()
         )
-
 
         self.mcp_tools = (
             getattr(
@@ -759,9 +602,7 @@ class PlanAppAgentCommon:
             or []
         )
 
-
         self.connected = True
-
 
         self.log(
             "🟢 MCP conectado — "
@@ -769,23 +610,18 @@ class PlanAppAgentCommon:
             "ferramentas disponíveis."
         )
 
-
         self.log_detail(
             "Ferramentas MCP disponíveis:"
         )
 
-
         for tool in self.mcp_tools:
 
             try:
-
                 self.log_detail(
                     f"  - {tool.name}"
                 )
-
             except Exception:
                 pass
-
 
     # ============================================================
     # PARSING MCP
@@ -797,16 +633,13 @@ class PlanAppAgentCommon:
     ):
 
         if result is None:
-
             return None
-
 
         structured = getattr(
             result,
             "structuredContent",
             None,
         )
-
 
         if structured is None:
 
@@ -816,11 +649,8 @@ class PlanAppAgentCommon:
                 None,
             )
 
-
         if structured is not None:
-
             return structured
-
 
         content = getattr(
             result,
@@ -828,11 +658,9 @@ class PlanAppAgentCommon:
             None,
         )
 
-
         if content:
 
             parsed_items = []
-
 
             for item in content:
 
@@ -841,7 +669,6 @@ class PlanAppAgentCommon:
                     "text",
                     None,
                 )
-
 
                 if text is None:
 
@@ -854,11 +681,8 @@ class PlanAppAgentCommon:
                             "text"
                         )
 
-
                 if text is None:
-
                     continue
-
 
                 try:
 
@@ -872,21 +696,13 @@ class PlanAppAgentCommon:
                         text
                     )
 
-
-            if len(
-                parsed_items
-            ) == 1:
-
+            if len(parsed_items) == 1:
                 return parsed_items[0]
 
-
             if parsed_items:
-
                 return parsed_items
 
-
         return result
-
 
     # ============================================================
     # DETECÇÃO DE ERROS
@@ -909,31 +725,22 @@ class PlanAppAgentCommon:
                 )
             ).lower()
 
-
             if status in {
                 "error",
                 "failed",
                 "failure",
             }:
-
                 return True
 
-
-            if value.get(
-                "error"
-            ):
-
+            if value.get("error"):
                 return True
-
 
             for child in value.values():
 
                 if self.contains_nested_error(
                     child
                 ):
-
                     return True
-
 
         elif isinstance(
             value,
@@ -945,12 +752,9 @@ class PlanAppAgentCommon:
                 if self.contains_nested_error(
                     child
                 ):
-
                     return True
 
-
         return False
-
 
     def is_mcp_error(
         self,
@@ -964,7 +768,6 @@ class PlanAppAgentCommon:
             None,
         )
 
-
         if is_error is None:
 
             is_error = getattr(
@@ -973,18 +776,12 @@ class PlanAppAgentCommon:
                 False,
             )
 
-
         if is_error:
-
             return True
 
-
-        return (
-            self.contains_nested_error(
-                parsed
-            )
+        return self.contains_nested_error(
+            parsed
         )
-
 
     # ============================================================
     # LOG SEGURO
@@ -1002,10 +799,7 @@ class PlanAppAgentCommon:
 
             safe = {}
 
-
-            for key, child in (
-                value.items()
-            ):
+            for key, child in value.items():
 
                 if (
                     key == "data"
@@ -1029,9 +823,7 @@ class PlanAppAgentCommon:
                         )
                     )
 
-
             return safe
-
 
         if isinstance(
             value,
@@ -1045,9 +837,7 @@ class PlanAppAgentCommon:
                 for child in value
             ]
 
-
         return value
-
 
     # ============================================================
     # GEOCODE SUMMARY
@@ -1062,68 +852,43 @@ class PlanAppAgentCommon:
             parsed,
             dict,
         ):
-
             return None
-
 
         results = parsed.get(
             "results"
         )
 
-
         if not results:
-
             return None
 
-
         first = results[0]
-
 
         if not isinstance(
             first,
             dict,
         ):
-
             return None
 
-
-        lat = first.get(
-            "lat"
-        )
-
-        lon = first.get(
-            "lon"
-        )
-
+        lat = first.get("lat")
+        lon = first.get("lon")
 
         if lat is None or lon is None:
-
             return None
-
 
         try:
 
-            lat = float(
-                lat
-            )
-
-            lon = float(
-                lon
-            )
+            lat = float(lat)
+            lon = float(lon)
 
         except Exception:
 
             return None
 
-
         return {
-            "name": first.get(
-                "name"
-            ),
+            "name": first.get("name"),
             "lat": lat,
             "lon": lon,
         }
-
 
     # ============================================================
     # REGISTRA PONTO GEOCODIFICADO
@@ -1134,12 +899,9 @@ class PlanAppAgentCommon:
         parsed,
     ):
 
-        point = (
-            self.summarize_geocode(
-                parsed
-            )
+        point = self.summarize_geocode(
+            parsed
         )
-
 
         if point is None:
 
@@ -1151,11 +913,9 @@ class PlanAppAgentCommon:
 
             return None
 
-
         self.geocoded_points.append(
             point
         )
-
 
         self.log(
             "📍 "
@@ -1164,9 +924,7 @@ class PlanAppAgentCommon:
             f"{point['lon']:.6f}"
         )
 
-
         return point
-
 
     # ============================================================
     # RESUMO EVALUATE
@@ -1181,19 +939,14 @@ class PlanAppAgentCommon:
             parsed,
             dict,
         ):
-
             return None
 
-
         if "fspl" in parsed:
-
             return parsed["fspl"]
-
 
         technical = parsed.get(
             "technical"
         )
-
 
         if isinstance(
             technical,
@@ -1201,14 +954,11 @@ class PlanAppAgentCommon:
         ):
 
             if "fspl" in technical:
-
                 return technical["fspl"]
-
 
         data = parsed.get(
             "data"
         )
-
 
         if isinstance(
             data,
@@ -1216,12 +966,9 @@ class PlanAppAgentCommon:
         ):
 
             if "fspl" in data:
-
                 return data["fspl"]
 
-
         return None
-
 
     # ============================================================
     # EXECUÇÃO MCP — RAW
@@ -1239,21 +986,16 @@ class PlanAppAgentCommon:
                 "Sessão MCP não conectada."
             )
 
-
         self.tool_count += 1
 
-
         self.log_detail("")
-
         self.log_detail(
             f"🔧 MCP TOOL: {tool_name}"
         )
 
-
         self.log_detail(
             "Argumentos:"
         )
-
 
         self.log_detail(
             json.dumps(
@@ -1264,7 +1006,6 @@ class PlanAppAgentCommon:
             )
         )
 
-
         try:
 
             result = await (
@@ -1273,7 +1014,6 @@ class PlanAppAgentCommon:
                     arguments or {},
                 )
             )
-
 
         except Exception as exc:
 
@@ -1284,12 +1024,10 @@ class PlanAppAgentCommon:
                 "error": str(exc),
             }
 
-
             self.log_detail(
                 "❌ Exceção durante "
                 "chamada MCP:"
             )
-
 
             self.log_detail(
                 json.dumps(
@@ -1300,11 +1038,7 @@ class PlanAppAgentCommon:
                 )
             )
 
-
-            if (
-                tool_name
-                == "evaluate_link"
-            ):
+            if tool_name == "evaluate_link":
 
                 self.evaluate_executed = True
 
@@ -1320,21 +1054,15 @@ class PlanAppAgentCommon:
                     error_result
                 )
 
-
             return error_result
 
-
-        parsed = (
-            self.parse_mcp_result(
-                result
-            )
+        parsed = self.parse_mcp_result(
+            result
         )
-
 
         self.log_detail(
             "Resultado:"
         )
-
 
         self.log_detail(
             json.dumps(
@@ -1347,14 +1075,10 @@ class PlanAppAgentCommon:
             )
         )
 
-
-        mcp_error = (
-            self.is_mcp_error(
-                result,
-                parsed,
-            )
+        mcp_error = self.is_mcp_error(
+            result,
+            parsed,
         )
-
 
         if mcp_error:
 
@@ -1362,15 +1086,11 @@ class PlanAppAgentCommon:
                 "❌ MCP retornou erro."
             )
 
-
         # --------------------------------------------------------
         # GEOCODE
         # --------------------------------------------------------
 
-        if (
-            tool_name
-            == "geocode_place"
-        ):
+        if tool_name == "geocode_place":
 
             if not mcp_error:
 
@@ -1378,16 +1098,13 @@ class PlanAppAgentCommon:
                     self.geocoded_points
                 )
 
-
                 self.register_geocoded_point(
                     parsed
                 )
 
-
                 after = len(
                     self.geocoded_points
                 )
-
 
                 if (
                     before < 2
@@ -1407,29 +1124,23 @@ class PlanAppAgentCommon:
                             f"mapa: {exc}"
                         )
 
-
             else:
 
                 self.log(
                     "❌ Falha na geocodificação."
                 )
 
-
         # --------------------------------------------------------
         # EVALUATE
         # --------------------------------------------------------
 
-        elif (
-            tool_name
-            == "evaluate_link"
-        ):
+        elif tool_name == "evaluate_link":
 
             self.evaluate_executed = True
 
             self.last_evaluate_result = (
                 parsed
             )
-
 
             if mcp_error:
 
@@ -1446,7 +1157,6 @@ class PlanAppAgentCommon:
                     parsed
                 )
 
-
             else:
 
                 self.evaluate_error = None
@@ -1454,7 +1164,6 @@ class PlanAppAgentCommon:
                 self.publish_technical_result(
                     parsed
                 )
-
 
                 try:
 
@@ -1469,13 +1178,11 @@ class PlanAppAgentCommon:
                         f"visualizações: {exc}"
                     )
 
-
                 fspl = (
                     self.summarize_evaluate(
                         parsed
                     )
                 )
-
 
                 if fspl is not None:
 
@@ -1499,9 +1206,7 @@ class PlanAppAgentCommon:
                         "concluída."
                     )
 
-
         return result
-
 
     # ============================================================
     # EXECUÇÃO MCP — PARSED
@@ -1520,11 +1225,9 @@ class PlanAppAgentCommon:
             )
         )
 
-
         return self.parse_mcp_result(
             raw
         )
-
 
     # ============================================================
     # REGISTER
@@ -1539,7 +1242,6 @@ class PlanAppAgentCommon:
             "no PlanApp..."
         )
 
-
         result = await (
             self.execute_mcp_tool(
                 "register",
@@ -1548,7 +1250,6 @@ class PlanAppAgentCommon:
                 },
             )
         )
-
 
         if isinstance(
             result,
@@ -1562,7 +1263,6 @@ class PlanAppAgentCommon:
                 )
             ).lower()
 
-
             if status == "error":
 
                 self.log(
@@ -1572,14 +1272,11 @@ class PlanAppAgentCommon:
 
                 return result
 
-
         self.log(
             "🟢 Usuário registrado."
         )
 
-
         return result
-
 
     # ============================================================
     # EVALUATE AUTOMÁTICO
@@ -1589,6 +1286,7 @@ class PlanAppAgentCommon:
         self,
         parameters=None,
     ):
+
         """
         Mantém o comportamento da ETAPA 1:
 
@@ -1605,13 +1303,11 @@ class PlanAppAgentCommon:
                 self.last_evaluate_result
             )
 
-
         if len(
             self.geocoded_points
         ) < 2:
 
             return None
-
 
         if parameters is None:
 
@@ -1619,11 +1315,8 @@ class PlanAppAgentCommon:
                 self.link_parameters
             )
 
-
         tx = self.geocoded_points[0]
-
         rx = self.geocoded_points[1]
-
 
         arguments = {
 
@@ -1656,18 +1349,15 @@ class PlanAppAgentCommon:
             ),
         }
 
-
         self.log(
             "📡 Executando avaliação "
             "técnica do enlace..."
         )
 
-
         self.log_detail(
             "Parâmetros enviados "
             "ao PlanApp:"
         )
-
 
         self.log_detail(
             json.dumps(
@@ -1678,14 +1368,12 @@ class PlanAppAgentCommon:
             )
         )
 
-
         return await (
             self.execute_mcp_tool(
                 "evaluate_link",
                 arguments,
             )
         )
-
 
     # ============================================================
     # ETAPA 2 — AVALIAÇÃO MULTI-HOP
@@ -1696,6 +1384,7 @@ class PlanAppAgentCommon:
         route_points=None,
         parameters=None,
     ):
+
         """
         ETAPA 2 — executa uma rota composta por vários enlaces.
 
@@ -1709,16 +1398,12 @@ class PlanAppAgentCommon:
             Hop 2: B -> C
             Hop 3: C -> D
 
-        IMPORTANTE:
-
-        - evaluate_link continua sendo uma operação de UM enlace.
-        - Esta função apenas orquestra várias chamadas independentes.
-        - ensure_evaluate_link() da ETAPA 1 não é alterada.
+        evaluate_link continua sendo uma operação de UM enlace.
         """
 
         if self.multi_hop_executed:
-            return self.global_result
 
+            return self.global_result
 
         # --------------------------------------------------------
         # Pontos da rota
@@ -1730,16 +1415,21 @@ class PlanAppAgentCommon:
         if route_points is None:
             route_points = []
 
-
         if len(route_points) < 2:
 
             self.multi_hop_error = {
-                "status": "error",
-                "kind": "invalid_route",
-                "error": (
-                    "Uma rota multi-hop precisa "
-                    "de pelo menos dois pontos."
-                ),
+
+                "status":
+                    "error",
+
+                "kind":
+                    "invalid_route",
+
+                "error":
+                    (
+                        "Uma rota multi-hop precisa "
+                        "de pelo menos dois pontos."
+                    ),
             }
 
             self.log(
@@ -1749,14 +1439,12 @@ class PlanAppAgentCommon:
 
             return self.multi_hop_error
 
-
         # --------------------------------------------------------
         # Parâmetros
         # --------------------------------------------------------
 
         if parameters is None:
             parameters = self.link_parameters
-
 
         # --------------------------------------------------------
         # Copia da rota
@@ -1767,22 +1455,18 @@ class PlanAppAgentCommon:
             for point in route_points
         ]
 
-
         # --------------------------------------------------------
         # Monta os hops consecutivos
         # --------------------------------------------------------
 
         self.hops = []
 
-
         for index in range(
             len(self.route_points) - 1
         ):
 
             tx = self.route_points[index]
-
             rx = self.route_points[index + 1]
-
 
             tx_name = tx.get(
                 "name",
@@ -1793,7 +1477,6 @@ class PlanAppAgentCommon:
                 "name",
                 f"Ponto {index + 2}",
             )
-
 
             hop = {
 
@@ -1849,11 +1532,9 @@ class PlanAppAgentCommon:
                     [],
             }
 
-
             self.hops.append(
                 hop
             )
-
 
         # --------------------------------------------------------
         # Resultado global
@@ -1906,12 +1587,10 @@ class PlanAppAgentCommon:
             },
         }
 
-
         self.log(
             "📡 Iniciando avaliação "
             "multi-hop..."
         )
-
 
         self.log(
             "🗺️ Rota: "
@@ -1926,12 +1605,10 @@ class PlanAppAgentCommon:
             )
         )
 
-
         self.log(
             f"🔗 Total de hops: "
             f"{len(self.hops)}"
         )
-
 
         # --------------------------------------------------------
         # Executa cada hop independentemente
@@ -1939,33 +1616,11 @@ class PlanAppAgentCommon:
 
         for hop in self.hops:
 
-            # ----------------------------------------------------
-            # CORREÇÃO ETAPA 2:
-            #
-            # current_hop precisa conter o objeto completo do hop,
-            # e não apenas o índice.
-            #
-            # agent_openai.py utiliza:
-            #
-            #   current_hop["index"]
-            #   current_hop["id"]
-            #   current_hop["name"]
-            #
-            # Isso permite que gerar_visualizacoes() identifique
-            # corretamente o hop atual.
-            # ----------------------------------------------------
-
             self.current_hop = hop
 
-
             tx = hop["tx"]
-
             rx = hop["rx"]
-
-            hop_parameters = (
-                hop["parameters"]
-            )
-
+            hop_parameters = hop["parameters"]
 
             arguments = {
 
@@ -2006,7 +1661,6 @@ class PlanAppAgentCommon:
                     ),
             }
 
-
             self.log("")
 
             self.log(
@@ -2016,11 +1670,9 @@ class PlanAppAgentCommon:
                 f"{hop['name']}"
             )
 
-
             self.log_detail(
                 "Parâmetros do hop:"
             )
-
 
             self.log_detail(
                 json.dumps(
@@ -2031,7 +1683,6 @@ class PlanAppAgentCommon:
                 )
             )
 
-
             try:
 
                 result = await (
@@ -2041,9 +1692,7 @@ class PlanAppAgentCommon:
                     )
                 )
 
-
                 hop["result"] = result
-
 
                 # ------------------------------------------------
                 # Verifica erro no resultado
@@ -2055,22 +1704,18 @@ class PlanAppAgentCommon:
                     )
                 )
 
-
                 if hop_error:
 
                     hop["error"] = result
-
 
                     self.log(
                         "❌ Erro no "
                         f"{hop['name']}"
                     )
 
-
                     self.global_result[
                         "status"
                     ] = "error"
-
 
                     self.global_result[
                         "error"
@@ -2086,16 +1731,13 @@ class PlanAppAgentCommon:
                             result,
                     }
 
-
                     self.global_result[
                         "completed_hops"
                     ] = (
                         hop["index"] - 1
                     )
 
-
                     break
-
 
                 # ------------------------------------------------
                 # Hop concluído
@@ -2105,13 +1747,11 @@ class PlanAppAgentCommon:
                     "completed_hops"
                 ] = hop["index"]
 
-
                 self.log(
                     "✅ "
                     f"Hop {hop['index']} "
                     "concluído."
                 )
-
 
             except Exception as exc:
 
@@ -2127,18 +1767,15 @@ class PlanAppAgentCommon:
                         str(exc),
                 }
 
-
                 self.log(
                     "❌ Exceção no "
                     f"{hop['name']}: "
                     f"{exc}"
                 )
 
-
                 self.global_result[
                     "status"
                 ] = "error"
-
 
                 self.global_result[
                     "error"
@@ -2154,16 +1791,13 @@ class PlanAppAgentCommon:
                         str(exc),
                 }
 
-
                 self.global_result[
                     "completed_hops"
                 ] = (
                     hop["index"] - 1
                 )
 
-
                 break
-
 
         # --------------------------------------------------------
         # Finalização
@@ -2180,7 +1814,6 @@ class PlanAppAgentCommon:
                 "status"
             ] = "OK"
 
-
         self.multi_hop_executed = True
 
         self.multi_hop_error = (
@@ -2189,9 +1822,7 @@ class PlanAppAgentCommon:
             )
         )
 
-
         self.current_hop = None
-
 
         if (
             self.global_result[
@@ -2214,7 +1845,6 @@ class PlanAppAgentCommon:
                 "multi-hop encerrada com erro."
             )
 
-
         # --------------------------------------------------------
         # Publica resultado global
         # --------------------------------------------------------
@@ -2223,18 +1853,339 @@ class PlanAppAgentCommon:
             self.global_result
         )
 
-
         return self.global_result
-
 
     # ============================================================
     # CONTEXTO TÉCNICO
+    # ============================================================
+
+    def _prepare_technical_analysis_value(
+        self,
+        value,
+        key=None,
+    ):
+        """
+        Prepara uma cópia dos resultados do PlanApp para análise
+        textual pelo LLM.
+
+        IMPORTANTE:
+
+        Não elimina a chave genérica "data".
+
+        Em vários resultados do PlanApp, "data" contém justamente
+        os dados técnicos do evaluate_link, incluindo:
+
+            fspl
+            dist_m
+            delta_diffra
+            terrain
+            vegetation
+            buildings
+            terrain_peaks_vv
+            etc.
+
+        O agent_ollama possui uma compactação histórica que trata
+        "data" como conteúdo visual. Para evitar que os dados
+        técnicos desapareçam, esta função renomeia essa chave para
+        "dados_tecnicos" na cópia destinada exclusivamente à
+        análise textual.
+
+        Conteúdo visual pesado/base64 é removido somente quando
+        identificado como tal.
+        """
+
+        key_text = (
+            str(key).lower()
+            if key is not None
+            else ""
+        )
+
+        # --------------------------------------------------------
+        # Chaves explicitamente visuais
+        # --------------------------------------------------------
+
+        visual_keys = {
+            "image",
+            "image_data",
+            "image_bytes",
+            "base64",
+            "png",
+            "jpeg",
+            "jpg",
+        }
+
+        if key_text in visual_keys:
+
+            return (
+                "[conteúdo visual omitido "
+                "da análise textual]"
+            )
+
+        # --------------------------------------------------------
+        # Dict
+        # --------------------------------------------------------
+
+        if isinstance(
+            value,
+            dict,
+        ):
+
+            prepared = {}
+
+            for child_key, child_value in (
+                value.items()
+            ):
+
+                child_key_text = str(
+                    child_key
+                ).lower()
+
+                # ----------------------------------------------
+                # A chave "data" pode conter dados técnicos.
+                #
+                # NÃO descartamos.
+                #
+                # Renomeamos somente na cópia de análise.
+                # ----------------------------------------------
+
+                if child_key_text == "data":
+
+                    output_key = (
+                        "dados_tecnicos"
+                    )
+
+                else:
+
+                    output_key = child_key
+
+                # ----------------------------------------------
+                # Chaves visuais explícitas
+                # ----------------------------------------------
+
+                if child_key_text in visual_keys:
+
+                    prepared[output_key] = (
+                        "[conteúdo visual omitido "
+                        "da análise textual]"
+                    )
+
+                    continue
+
+                prepared[output_key] = (
+                    self._prepare_technical_analysis_value(
+                        child_value,
+                        child_key,
+                    )
+                )
+
+            return prepared
+
+        # --------------------------------------------------------
+        # List
+        # --------------------------------------------------------
+
+        if isinstance(
+            value,
+            list,
+        ):
+
+            return [
+                self._prepare_technical_analysis_value(
+                    child,
+                    key,
+                )
+                for child in value
+            ]
+
+        # --------------------------------------------------------
+        # Strings
+        # --------------------------------------------------------
+
+        if isinstance(
+            value,
+            str,
+        ):
+
+            # ----------------------------------------------------
+            # Detecta strings que parecem base64 muito grandes.
+            #
+            # Não descarta textos técnicos normais.
+            # ----------------------------------------------------
+
+            if len(value) > 1000:
+
+                compact = value.strip()
+
+                if (
+                    len(compact) > 1000
+                    and re.fullmatch(
+                        r"[A-Za-z0-9+/=\s]+",
+                        compact,
+                    )
+                ):
+
+                    return (
+                        "[conteúdo codificado "
+                        "omitido da análise textual]"
+                    )
+
+            # ----------------------------------------------------
+            # Evita enviar blocos textuais gigantes.
+            # ----------------------------------------------------
+
+            if len(value) > 30000:
+
+                return (
+                    value[:30000]
+                    + "\n[texto extenso truncado]"
+                )
+
+        return value
+
+    # ============================================================
+
+    def _build_multi_hop_analysis_context(
+        self,
+        technical_result,
+    ):
+        """
+        Constrói uma representação explícita dos resultados
+        técnicos de cada hop.
+
+        O objetivo é impedir que o LLM receba somente o estado
+        global da rota sem os dados individuais de cada enlace.
+        """
+
+        if not isinstance(
+            technical_result,
+            dict,
+        ):
+
+            return None
+
+        hops = technical_result.get(
+            "hops"
+        )
+
+        if not isinstance(
+            hops,
+            list,
+        ):
+
+            return None
+
+        prepared_hops = []
+
+        for hop in hops:
+
+            if not isinstance(
+                hop,
+                dict,
+            ):
+                continue
+
+            prepared_hop = {
+
+                "id":
+                    hop.get("id"),
+
+                "index":
+                    hop.get("index"),
+
+                "name":
+                    hop.get("name"),
+
+                "tx":
+                    hop.get("tx"),
+
+                "rx":
+                    hop.get("rx"),
+
+                "parameters":
+                    hop.get("parameters"),
+
+                "resultado_tecnico":
+                    self._prepare_technical_analysis_value(
+                        hop.get("result"),
+                        "result",
+                    ),
+
+                "erro":
+                    self._prepare_technical_analysis_value(
+                        hop.get("error"),
+                        "error",
+                    ),
+            }
+
+            prepared_hops.append(
+                prepared_hop
+            )
+
+        return {
+
+            "status":
+                technical_result.get(
+                    "status"
+                ),
+
+            "total_hops":
+                technical_result.get(
+                    "total_hops"
+                ),
+
+            "completed_hops":
+                technical_result.get(
+                    "completed_hops"
+                ),
+
+            "parameters":
+                technical_result.get(
+                    "parameters"
+                ),
+
+            "route_points":
+                technical_result.get(
+                    "route_points"
+                ),
+
+            "hops":
+                prepared_hops,
+
+            "error":
+                self._prepare_technical_analysis_value(
+                    technical_result.get(
+                        "error"
+                    ),
+                    "error",
+                ),
+        }
+
     # ============================================================
 
     def build_technical_context(
         self,
         technical_result,
     ):
+        """
+        Monta o contexto técnico final enviado ao LLM.
+
+        A versão anterior simplesmente colocava o resultado bruto
+        em "resultado_tecnico_real_do_planapp".
+
+        Isso era insuficiente para a análise final porque o
+        agent_ollama possui uma etapa de compactação que trata
+        chaves chamadas "data" como conteúdo visual.
+
+        Agora mantemos:
+
+        1. o resultado bruto original;
+        2. uma representação técnica normalizada;
+        3. uma representação explícita por hop em multi-hop.
+
+        Assim os três agentes continuam recebendo o resultado real
+        do PlanApp, enquanto a análise textual recebe também uma
+        cópia segura dos dados técnicos.
+        """
 
         effective = {
 
@@ -2263,7 +2214,6 @@ class PlanAppAgentCommon:
             ),
         }
 
-
         requested = {
 
             "frequency": (
@@ -2287,9 +2237,7 @@ class PlanAppAgentCommon:
             ),
         }
 
-
         conversion_text = ""
-
 
         if (
             self.requested_frequency
@@ -2308,8 +2256,28 @@ class PlanAppAgentCommon:
                 "freq_mhz enviado ao PlanApp."
             )
 
+        # --------------------------------------------------------
+        # Cópia técnica normalizada
+        # --------------------------------------------------------
 
-        return {
+        technical_analysis_result = (
+            self._prepare_technical_analysis_value(
+                technical_result,
+                "resultado_tecnico",
+            )
+        )
+
+        # --------------------------------------------------------
+        # Contexto explícito dos hops
+        # --------------------------------------------------------
+
+        multi_hop_context = (
+            self._build_multi_hop_analysis_context(
+                technical_result
+            )
+        )
+
+        context = {
 
             "parametros_solicitados_pelo_usuario":
                 requested,
@@ -2323,8 +2291,26 @@ class PlanAppAgentCommon:
             "pontos_geocodificados":
                 self.geocoded_points,
 
+            # ----------------------------------------------------
+            # Resultado bruto.
+            #
+            # Preservado para compatibilidade com os agentes
+            # existentes.
+            # ----------------------------------------------------
+
             "resultado_tecnico_real_do_planapp":
                 technical_result,
+
+            # ----------------------------------------------------
+            # NOVO:
+            #
+            # Cópia destinada explicitamente à análise textual.
+            #
+            # Aqui "data" foi transformado em "dados_tecnicos".
+            # ----------------------------------------------------
+
+            "resultado_tecnico_para_analise":
+                technical_analysis_result,
 
             "regras_criticas": [
 
@@ -2354,9 +2340,32 @@ class PlanAppAgentCommon:
                 "Se houver erro, informar "
                 "o erro real retornado "
                 "pelo PlanApp.",
+
+                "Os valores numéricos "
+                "retornados pelo PlanApp "
+                "devem ser preservados "
+                "na análise final.",
+
+                "Em multi-hop, analisar "
+                "cada hop separadamente "
+                "antes de comparar os hops.",
             ],
         }
 
+        # --------------------------------------------------------
+        # NOVO:
+        #
+        # Só adiciona o bloco multi-hop quando realmente existe
+        # uma estrutura de hops.
+        # --------------------------------------------------------
+
+        if multi_hop_context is not None:
+
+            context[
+                "resultado_multi_hop_para_analise"
+            ] = multi_hop_context
+
+        return context
 
     # ============================================================
     # VISUALIZAÇÕES
@@ -2368,7 +2377,6 @@ class PlanAppAgentCommon:
 
         return None
 
-
     # ============================================================
     # MAPA
     # ============================================================
@@ -2379,7 +2387,6 @@ class PlanAppAgentCommon:
 
         return None
 
-
     # ============================================================
     # RESET
     # ============================================================
@@ -2387,6 +2394,7 @@ class PlanAppAgentCommon:
     def reset_common_state(
         self,
     ):
+
         """
         Reseta todo o estado comum, incluindo o estado
         multi-hop.
@@ -2399,12 +2407,8 @@ class PlanAppAgentCommon:
 
         self.geocoded_points = []
 
-
         # --------------------------------------------------------
-        # CORREÇÃO ETAPA 2:
-        #
-        # O estado multi-hop também precisa ser limpo entre
-        # duas execuções do mesmo objeto agente.
+        # Estado multi-hop
         # --------------------------------------------------------
 
         self.route_points = []
@@ -2419,7 +2423,6 @@ class PlanAppAgentCommon:
 
         self.multi_hop_error = None
 
-
         # --------------------------------------------------------
         # Estado da avaliação
         # --------------------------------------------------------
@@ -2430,20 +2433,17 @@ class PlanAppAgentCommon:
 
         self.evaluate_error = None
 
-
         # --------------------------------------------------------
         # Visualizações
         # --------------------------------------------------------
 
         self.visualizations = []
 
-
         # --------------------------------------------------------
         # Mapa
         # --------------------------------------------------------
 
         self.map = None
-
 
         # --------------------------------------------------------
         # Controle
@@ -2452,7 +2452,6 @@ class PlanAppAgentCommon:
         self.tool_count = 0
 
         self.current_stage = 0
-
 
         # --------------------------------------------------------
         # Parâmetros
@@ -2473,7 +2472,6 @@ class PlanAppAgentCommon:
                 DEFAULT_ON_ROOFTOP,
         }
 
-
         self.requested_frequency = None
 
         self.requested_frequency_unit = None
@@ -2483,7 +2481,6 @@ class PlanAppAgentCommon:
         self.requested_tx_ha = None
 
         self.requested_rx_ha = None
-
 
     # ============================================================
     # CLOSE
@@ -2507,7 +2504,6 @@ class PlanAppAgentCommon:
 
             self.connected = False
 
-
             try:
 
                 self.file_handler.flush()
@@ -2517,7 +2513,6 @@ class PlanAppAgentCommon:
             except Exception:
 
                 pass
-
 
             try:
 
