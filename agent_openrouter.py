@@ -1456,6 +1456,32 @@ REGRAS FUNDAMENTAIS:
 
         self.technical_report = report
 
+        pdf_path = generator.generate_pdf(
+            report_text=report,
+            include_raw_result=False,
+        )
+
+        self.report_pdf_path = pdf_path
+
+        self.log_detail(
+            "Relatório PDF gerado: "
+            f"{pdf_path}"
+        )
+
+        self.log_detail(
+            "Mapa no relatório: "
+            + (
+                "SIM"
+                if self.map_image_bytes
+                else "NÃO"
+            )
+        )
+
+        self.log_detail(
+            "Visualizações no relatório: "
+            f"{len(self.visualization_images)}"
+        )
+
         return report
 
     # ========================================================================

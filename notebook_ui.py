@@ -85,7 +85,7 @@ def iniciar_planapp():
             ),
         ],
         value="openai",
-        description="🤖 Agente:",
+        description="Agente:",
         layout=widgets.Layout(
             width="350px"
         ),
