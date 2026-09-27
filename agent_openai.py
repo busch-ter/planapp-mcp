@@ -138,15 +138,17 @@ class PlanAppAgent(PlanAppAgentCommon):
         # ================================================================
         # CONTROLE DO ESTADO DE GEOCODIFICAÇÃO
         #
+        # A aplicação pode promover automaticamente uma solicitação
+        # para multi-hop quando efetivamente forem geocodificados
+        # 3 ou mais pontos.
+        #
         # IMPORTANTE:
         #
-        # A aplicação não deve executar evaluate_link apenas porque
-        # apareceram dois pontos.
+        # Dois pontos continuam representando um único enlace.
         #
-        # Primeiro deixamos o GPT continuar o processo de geocodificação.
-        #
-        # Quando existirem 3 ou mais pontos, a aplicação promove
-        # automaticamente a solicitação para multi-hop.
+        # A detecção textual NÃO deve utilizar parâmetros técnicos
+        # como frequência, potência, altura ou outros argumentos
+        # como evidência de uma terceira localidade.
         # ================================================================
 
         self.geocoding_followup_sent = False
@@ -196,17 +198,36 @@ class PlanAppAgent(PlanAppAgentCommon):
         text,
     ):
         """
-        Detecta se a solicitação do usuário aparenta descrever
-        uma rota com três ou mais pontos.
+        Detecta se a solicitação do usuário contém uma indicação
+        explícita de uma rota multi-hop.
 
-        Esta função NÃO identifica as localidades.
+        IMPORTANTE:
+
+        Esta função NÃO identifica localidades.
 
         A identificação das localidades continua sendo responsabilidade
         do LLM através de geocode_place.
 
-        O objetivo aqui é somente impedir que o fluxo da ETAPA 1
-        execute A -> B antes de o agente terminar de obter os demais
-        pontos da rota.
+        A detecção textual deve ser conservadora.
+
+        Em particular, NÃO devemos considerar automaticamente como
+        multi-hop uma frase contendo vírgulas e a conjunção "e", pois
+        isso gera falsos positivos em solicitações como:
+
+            "Analise um enlace entre A e B, antenas de 1 Watt
+             e em 450 MHz."
+
+        Nesse caso existem somente dois pontos:
+
+            A -> B
+
+        Portanto:
+
+            2 pontos = 1 enlace
+
+        Uma solicitação com 3 ou mais pontos será promovida para
+        multi-hop pela aplicação assim que os pontos forem efetivamente
+        geocodificados.
         """
 
         if not text:
@@ -219,7 +240,10 @@ class PlanAppAgent(PlanAppAgentCommon):
         )
 
         # ------------------------------------------------------------
-        # Indicadores explícitos de multi-hop
+        # INDICADORES EXPLÍCITOS DE MULTI-HOP
+        #
+        # Estes indicadores são suficientemente fortes para indicar
+        # que o usuário está descrevendo uma sequência de enlaces.
         # ------------------------------------------------------------
 
         explicit_patterns = [
@@ -228,8 +252,6 @@ class PlanAppAgent(PlanAppAgentCommon):
             r"\bmulti[\s-]?link\b",
             r"\bpor\s+.+\s+passando\s+por\b",
             r"\bpassando\s+por\b",
-            r"\batrav[eé]s\s+de\b",
-            r"\bvia\b",
             r"\bsequ[eê]ncia\s+de\s+enlaces\b",
             r"\bv[aá]rios\s+enlaces\b",
             r"\bv[aá]rios\s+saltos\b",
@@ -246,10 +268,21 @@ class PlanAppAgent(PlanAppAgentCommon):
                 return True
 
         # ------------------------------------------------------------
-        # Notação explícita:
+        # NOTAÇÃO EXPLÍCITA DE ROTA
+        #
+        # Exemplos:
         #
         # A -> B -> C
         # A → B → C
+        # A ⇒ B ⇒ C
+        #
+        # IMPORTANTE:
+        #
+        # Um único separador:
+        #
+        # A -> B
+        #
+        # continua sendo apenas um enlace.
         # ------------------------------------------------------------
 
         arrow_count = len(
@@ -263,82 +296,25 @@ class PlanAppAgent(PlanAppAgentCommon):
             return True
 
         # ------------------------------------------------------------
-        # Listas com três ou mais localidades
-        # ------------------------------------------------------------
-
-        multi_point_patterns = [
-
-            r"\bentre\s+.+,\s*.+\s+e\s+.+",
-
-            r"\bentre\s+.+,\s*.+,\s*.+",
-
-            r"\bde\s+.+\s+até\s+.+\s+passando\s+por\s+.+",
-
-            r"\banalise\s+.+,\s*.+\s+e\s+.+",
-
-            r"\banalisar\s+.+,\s*.+\s+e\s+.+",
-
-            r"\bavalie\s+.+,\s*.+\s+e\s+.+",
-
-            r"\bavaliar\s+.+,\s*.+\s+e\s+.+",
-
-            # Exemplos adicionais:
-            #
-            # "faça uma análise entre A, B e C"
-            # "faca uma analise entre A, B e C"
-            # "faça uma análise de A, B e C"
-            # "analise os enlaces entre A, B e C"
-            #
-
-            r"\bfa[cç]a\s+(?:uma\s+)?an[aá]lise\b.+,\s*.+\s+e\s+.+",
-
-            r"\ban[aá]lise\s+(?:dos\s+enlaces\s+)?entre\s+.+,\s*.+\s+e\s+.+",
-
-            r"\banalis[ea]\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
-
-            r"\bavalie\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
-        ]
-
-        for pattern in multi_point_patterns:
-
-            if re.search(
-                pattern,
-                normalized,
-            ):
-                return True
-
-        # ------------------------------------------------------------
-        # Indicador adicional:
+        # NÃO USAR MAIS:
         #
-        # uma solicitação contendo duas vírgulas ou mais junto com
-        # uma conjunção "e" normalmente representa uma sequência
-        # de três elementos.
+        #   comma_count >= 2
+        #   + "e"
+        #   + contexto de enlace
         #
-        # Não usamos isso isoladamente: exigimos também um verbo/
-        # contexto de análise ou de rota.
+        # Essa heurística era responsável por falsos positivos.
+        #
+        # Exemplo problemático:
+        #
+        # "Analise um enlace entre A e B, antenas de 1 Watt
+        #  e em 450 MHz em Florianópolis."
+        #
+        # A frase possui vírgula e "e", mas continua tendo somente
+        # duas localidades.
+        #
+        # A quantidade real de pontos deve ser determinada pela
+        # geocodificação.
         # ------------------------------------------------------------
-
-        comma_count = normalized.count(",")
-
-        route_context = re.search(
-            r"\b("
-            r"analise|analisar|análise|analise|"
-            r"avalie|avaliar|enlace|enlaces|"
-            r"link|links|rota|trajeto|"
-            r"pontos?|localidades?"
-            r")\b",
-            normalized,
-        )
-
-        if (
-            comma_count >= 2
-            and re.search(
-                r"\be\b",
-                normalized,
-            )
-            and route_context
-        ):
-            return True
 
         return False
 
@@ -361,11 +337,22 @@ class PlanAppAgent(PlanAppAgentCommon):
         A função nunca transforma evaluate_link em super-tool.
 
         IMPORTANTE:
-        Se 3 ou mais pontos já foram geocodificados, a aplicação
-        promove automaticamente a solicitação para multi-hop.
+
+        Se 3 ou mais pontos já foram efetivamente geocodificados,
+        a aplicação promove automaticamente a solicitação para
+        multi-hop.
 
         Isso funciona como uma proteção adicional caso a detecção
         textual inicial não tenha identificado corretamente a intenção.
+
+        Dois pontos continuam sendo tratados como um único enlace,
+        mesmo que a solicitação contenha parâmetros técnicos como:
+
+            1 Watt
+            450 MHz
+            TX 10 m
+            RX 15 m
+            rooftop
         """
 
         point_count = len(
@@ -432,7 +419,9 @@ class PlanAppAgent(PlanAppAgentCommon):
             )
 
         # ------------------------------------------------------------
-        # ETAPA 1 — ENLACE ÚNICO
+        # ENLACE ÚNICO
+        #
+        # Dois pontos são suficientes para executar um enlace.
         # ------------------------------------------------------------
 
         if point_count >= 2:
@@ -995,7 +984,8 @@ REGRAS:
 
             self.map_image_bytes = (
                 gerar_imagem_mapa_enlace(
-                    tx_lat,tx_lon,
+                    tx_lat,
+                    tx_lon,
                     rx_lat,
                     rx_lon,
                 )
@@ -1589,12 +1579,12 @@ REGRAS:
                     return text
 
                 # ------------------------------------------------------------
-                # Se uma solicitação foi identificada como multi-hop mas
-                # ainda temos menos de 3 pontos, não devemos simplesmente
-                # encerrar o turno.
+                # Solicitação explicitamente multi-hop:
                 #
-                # Pedimos explicitamente ao GPT para continuar a
-                # geocodificação da rota.
+                # nesse caso ainda precisamos dos pontos restantes.
+                #
+                # Dois pontos em uma solicitação NORMAL não entram aqui,
+                # pois multi_hop_requested permanece False.
                 # ------------------------------------------------------------
 
                 if (
@@ -1740,6 +1730,14 @@ REGRAS:
             #   multi-hop
             #   evaluate A -> B
             #   evaluate B -> C
+            #
+            # Para uma solicitação de apenas dois pontos:
+            #
+            #   geocode A
+            #   geocode B
+            #   GPT conclui
+            #   2 pontos
+            #   evaluate A -> B
             #
             # ================================================================
 

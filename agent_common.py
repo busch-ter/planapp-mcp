@@ -68,7 +68,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 MCP_URL = os.getenv(
     "PLANAPP_MCP_URL",
-    "http://172.17.0.1:8010/mcp",
+    "http://mcp-fernando-2ebusch-40ter-2egrupomarista-2eorg-2ebr:8010/mcp",
 )
 
 USER_ID = os.getenv(
@@ -912,6 +912,61 @@ class PlanAppAgentCommon:
             )
 
             return None
+
+        # --------------------------------------------------------
+        # PROTEÇÃO CONTRA DUPLICAÇÃO
+        #
+        # O LLM pode chamar geocode_place novamente para uma
+        # localidade já obtida.
+        #
+        # Não devemos transformar:
+        #
+        #   A, B
+        #
+        # em:
+        #
+        #   A, B, A, B
+        #
+        # A comparação é feita pelas coordenadas exatas
+        # retornadas pelo geocoder.
+        #
+        # Não usamos somente o nome porque o geocoder pode
+        # retornar nomes diferentes para o mesmo local.
+        # --------------------------------------------------------
+
+        for existing_point in self.geocoded_points:
+
+            try:
+
+                same_lat = (
+                    float(existing_point["lat"])
+                    == float(point["lat"])
+                )
+
+                same_lon = (
+                    float(existing_point["lon"])
+                    == float(point["lon"])
+                )
+
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+
+                continue
+
+            if same_lat and same_lon:
+
+                self.log_detail(
+                    "⚠️ Ponto já geocodificado; "
+                    "não será adicionado novamente: "
+                    f"{point.get('name')} — "
+                    f"{point['lat']:.6f}, "
+                    f"{point['lon']:.6f}"
+                )
+
+                return existing_point
 
         self.geocoded_points.append(
             point
@@ -1864,45 +1919,12 @@ class PlanAppAgentCommon:
         value,
         key=None,
     ):
-        """
-        Prepara uma cópia dos resultados do PlanApp para análise
-        textual pelo LLM.
-
-        IMPORTANTE:
-
-        Não elimina a chave genérica "data".
-
-        Em vários resultados do PlanApp, "data" contém justamente
-        os dados técnicos do evaluate_link, incluindo:
-
-            fspl
-            dist_m
-            delta_diffra
-            terrain
-            vegetation
-            buildings
-            terrain_peaks_vv
-            etc.
-
-        O agent_ollama possui uma compactação histórica que trata
-        "data" como conteúdo visual. Para evitar que os dados
-        técnicos desapareçam, esta função renomeia essa chave para
-        "dados_tecnicos" na cópia destinada exclusivamente à
-        análise textual.
-
-        Conteúdo visual pesado/base64 é removido somente quando
-        identificado como tal.
-        """
 
         key_text = (
             str(key).lower()
             if key is not None
             else ""
         )
-
-        # --------------------------------------------------------
-        # Chaves explicitamente visuais
-        # --------------------------------------------------------
 
         visual_keys = {
             "image",
@@ -1921,10 +1943,6 @@ class PlanAppAgentCommon:
                 "da análise textual]"
             )
 
-        # --------------------------------------------------------
-        # Dict
-        # --------------------------------------------------------
-
         if isinstance(
             value,
             dict,
@@ -1940,14 +1958,6 @@ class PlanAppAgentCommon:
                     child_key
                 ).lower()
 
-                # ----------------------------------------------
-                # A chave "data" pode conter dados técnicos.
-                #
-                # NÃO descartamos.
-                #
-                # Renomeamos somente na cópia de análise.
-                # ----------------------------------------------
-
                 if child_key_text == "data":
 
                     output_key = (
@@ -1957,10 +1967,6 @@ class PlanAppAgentCommon:
                 else:
 
                     output_key = child_key
-
-                # ----------------------------------------------
-                # Chaves visuais explícitas
-                # ----------------------------------------------
 
                 if child_key_text in visual_keys:
 
@@ -1980,10 +1986,6 @@ class PlanAppAgentCommon:
 
             return prepared
 
-        # --------------------------------------------------------
-        # List
-        # --------------------------------------------------------
-
         if isinstance(
             value,
             list,
@@ -1997,20 +1999,10 @@ class PlanAppAgentCommon:
                 for child in value
             ]
 
-        # --------------------------------------------------------
-        # Strings
-        # --------------------------------------------------------
-
         if isinstance(
             value,
             str,
         ):
-
-            # ----------------------------------------------------
-            # Detecta strings que parecem base64 muito grandes.
-            #
-            # Não descarta textos técnicos normais.
-            # ----------------------------------------------------
 
             if len(value) > 1000:
 
@@ -2029,10 +2021,6 @@ class PlanAppAgentCommon:
                         "omitido da análise textual]"
                     )
 
-            # ----------------------------------------------------
-            # Evita enviar blocos textuais gigantes.
-            # ----------------------------------------------------
-
             if len(value) > 30000:
 
                 return (
@@ -2048,13 +2036,6 @@ class PlanAppAgentCommon:
         self,
         technical_result,
     ):
-        """
-        Constrói uma representação explícita dos resultados
-        técnicos de cada hop.
-
-        O objetivo é impedir que o LLM receba somente o estado
-        global da rota sem os dados individuais de cada enlace.
-        """
 
         if not isinstance(
             technical_result,
@@ -2166,26 +2147,6 @@ class PlanAppAgentCommon:
         self,
         technical_result,
     ):
-        """
-        Monta o contexto técnico final enviado ao LLM.
-
-        A versão anterior simplesmente colocava o resultado bruto
-        em "resultado_tecnico_real_do_planapp".
-
-        Isso era insuficiente para a análise final porque o
-        agent_ollama possui uma etapa de compactação que trata
-        chaves chamadas "data" como conteúdo visual.
-
-        Agora mantemos:
-
-        1. o resultado bruto original;
-        2. uma representação técnica normalizada;
-        3. uma representação explícita por hop em multi-hop.
-
-        Assim os três agentes continuam recebendo o resultado real
-        do PlanApp, enquanto a análise textual recebe também uma
-        cópia segura dos dados técnicos.
-        """
 
         effective = {
 
@@ -2256,20 +2217,12 @@ class PlanAppAgentCommon:
                 "freq_mhz enviado ao PlanApp."
             )
 
-        # --------------------------------------------------------
-        # Cópia técnica normalizada
-        # --------------------------------------------------------
-
         technical_analysis_result = (
             self._prepare_technical_analysis_value(
                 technical_result,
                 "resultado_tecnico",
             )
         )
-
-        # --------------------------------------------------------
-        # Contexto explícito dos hops
-        # --------------------------------------------------------
 
         multi_hop_context = (
             self._build_multi_hop_analysis_context(
@@ -2291,23 +2244,8 @@ class PlanAppAgentCommon:
             "pontos_geocodificados":
                 self.geocoded_points,
 
-            # ----------------------------------------------------
-            # Resultado bruto.
-            #
-            # Preservado para compatibilidade com os agentes
-            # existentes.
-            # ----------------------------------------------------
-
             "resultado_tecnico_real_do_planapp":
                 technical_result,
-
-            # ----------------------------------------------------
-            # NOVO:
-            #
-            # Cópia destinada explicitamente à análise textual.
-            #
-            # Aqui "data" foi transformado em "dados_tecnicos".
-            # ----------------------------------------------------
 
             "resultado_tecnico_para_analise":
                 technical_analysis_result,
@@ -2352,13 +2290,6 @@ class PlanAppAgentCommon:
             ],
         }
 
-        # --------------------------------------------------------
-        # NOVO:
-        #
-        # Só adiciona o bloco multi-hop quando realmente existe
-        # uma estrutura de hops.
-        # --------------------------------------------------------
-
         if multi_hop_context is not None:
 
             context[
@@ -2395,21 +2326,9 @@ class PlanAppAgentCommon:
         self,
     ):
 
-        """
-        Reseta todo o estado comum, incluindo o estado
-        multi-hop.
-
-        Isso evita que uma nova chamada ask() reutilize
-        pontos, hops ou resultados de uma execução anterior.
-        """
-
         self.messages = []
 
         self.geocoded_points = []
-
-        # --------------------------------------------------------
-        # Estado multi-hop
-        # --------------------------------------------------------
 
         self.route_points = []
 
@@ -2423,39 +2342,19 @@ class PlanAppAgentCommon:
 
         self.multi_hop_error = None
 
-        # --------------------------------------------------------
-        # Estado da avaliação
-        # --------------------------------------------------------
-
         self.evaluate_executed = False
 
         self.last_evaluate_result = None
 
         self.evaluate_error = None
 
-        # --------------------------------------------------------
-        # Visualizações
-        # --------------------------------------------------------
-
         self.visualizations = []
 
-        # --------------------------------------------------------
-        # Mapa
-        # --------------------------------------------------------
-
         self.map = None
-
-        # --------------------------------------------------------
-        # Controle
-        # --------------------------------------------------------
 
         self.tool_count = 0
 
         self.current_stage = 0
-
-        # --------------------------------------------------------
-        # Parâmetros
-        # --------------------------------------------------------
 
         self.link_parameters = {
 
