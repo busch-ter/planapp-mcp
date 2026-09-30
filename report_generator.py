@@ -12,7 +12,8 @@
 #   - manter compatibilidade com o relatório técnico anterior;
 #   - salvar PDFs em:
 #
-#       <planapp-mcp>/reports/
+#       <PLANAPP_REPORT_DIR>/       se configurado
+#       <planapp-mcp>/reports/      caso contrário
 #
 # ============================================================================
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
 import re
 
 from datetime import datetime
@@ -44,7 +46,26 @@ from reportlab.platypus import (
 )
 
 PROJECT_DIR = Path(__file__).resolve().parent
-REPORT_DIR = PROJECT_DIR / "reports"
+
+# ============================================================================
+# RELATÓRIOS POR USUÁRIO
+#
+# No JupyterHub:
+#
+#   PLANAPP_REPORT_DIR
+#       -> /home/jovyan/work/planapp-user/reports
+#
+# Fora do JupyterHub, mantém o comportamento anterior:
+#
+#   <planapp-mcp>/reports
+# ============================================================================
+
+REPORT_DIR = Path(
+    os.getenv(
+        "PLANAPP_REPORT_DIR",
+        str(PROJECT_DIR / "reports"),
+    )
+)
 
 
 # ============================================================================

@@ -66,15 +66,45 @@ from mcp.client.streamable_http import streamable_http_client
 # CONFIGURAÇÕES COMUNS
 # ============================================================
 
+# ------------------------------------------------------------
+# MCP DINÂMICO POR USUÁRIO
+#
+# O JupyterHub injeta PLANAPP_MCP_URL no container do usuário.
+#
+# Exemplo:
+#
+#   PLANAPP_MCP_URL=
+#   http://mcp-fernandobusch8-40gmail-2ecom:8010/mcp
+#
+# Não existe mais fallback para um MCP específico de usuário.
+# ------------------------------------------------------------
+
 MCP_URL = os.getenv(
-    "PLANAPP_MCP_URL",
-    "http://mcp-fernando-2ebusch-40ter-2egrupomarista-2eorg-2ebr:8010/mcp",
+    "PLANAPP_MCP_URL"
 )
+
+if not MCP_URL:
+
+    raise RuntimeError(
+        "PLANAPP_MCP_URL não foi configurada pelo JupyterHub."
+    )
+
+
+# ------------------------------------------------------------
+# IDENTIDADE DO USUÁRIO
+#
+# O JupyterHub injeta PLANAPP_USER_ID.
+#
+# O fallback jupyter-user é mantido apenas para preservar
+# compatibilidade com execuções de desenvolvimento fora do
+# ambiente JupyterHub.
+# ------------------------------------------------------------
 
 USER_ID = os.getenv(
     "PLANAPP_USER_ID",
     "jupyter-user",
 )
+
 
 DEFAULT_FREQ_MHZ = 900
 DEFAULT_TX_HA = 7
@@ -83,11 +113,12 @@ DEFAULT_ON_ROOFTOP = False
 
 MAX_AGENT_ITERATIONS = 12
 
-LOG_DIR = os.path.expanduser(
-    "~/work/planapp-mcp/logs"
+LOG_DIR = os.getenv(
+    "PLANAPP_LOG_DIR",
+    os.path.expanduser(
+        "~/work/planapp-mcp/logs"
+    ),
 )
-
-
 # ============================================================
 # FERRAMENTAS CONTROLADAS PELA APLICAÇÃO
 # ============================================================
