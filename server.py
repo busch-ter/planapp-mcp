@@ -5,6 +5,7 @@ from tools.session import register_session_tools
 from tools.link import register_link_tools
 from tools.geocode import register_geocode_tools
 from tools.visualization import register_visualization_tools
+from tools.planner import register_planner_tools
 
 
 # ============================================================
@@ -41,28 +42,50 @@ client = FastAPIClient(
 # REGISTRO DAS FERRAMENTAS MCP
 # ============================================================
 
+# ------------------------------------------------------------
 # Sessão / autenticação
+# ------------------------------------------------------------
 register_session_tools(
     mcp,
     client,
 )
 
+
+# ------------------------------------------------------------
 # Avaliação do enlace
+# ------------------------------------------------------------
 register_link_tools(
     mcp,
     client,
 )
 
+
+# ------------------------------------------------------------
 # Geocodificação
+# ------------------------------------------------------------
 register_geocode_tools(
     mcp,
     client,
 )
 
+
+# ------------------------------------------------------------
 # Visualizações do enlace
+# ------------------------------------------------------------
 register_visualization_tools(
     mcp,
     client,
+)
+
+
+# ------------------------------------------------------------
+# Planejamento
+#
+# Os planner tools utilizam o PlannerClient / Planning SDK
+# e não dependem do FastAPIClient acima.
+# ------------------------------------------------------------
+register_planner_tools(
+    mcp,
 )
 
 

@@ -8,16 +8,17 @@
 #   - fornecer contexto de domínio ao LLM, quando configurado;
 #   - fornecer o estado atual da aplicação;
 #   - interpretar a mensagem do usuário em uma ação estruturada;
-#   - delegar a execução da ação ao ScenarioAgent.
+#   - delegar a execução da ação ao ScenarioAgent;
+#   - encaminhar intenções de planejamento ao PlannerOrchestrator.
 #
 # NÃO é responsabilidade deste módulo:
 #   - alterar diretamente o ScenarioBuilder;
 #   - escrever scenario.toml;
-#   - executar Planning Service;
-#   - executar MCP;
-#   - executar ferramentas externas;
+#   - executar Planning Service diretamente;
+#   - executar MCP diretamente;
+#   - executar ferramentas externas diretamente;
 #   - inventar valores técnicos;
-#   - definir defaults técnicos.
+#   - definir defaults técnicos do cenário.
 #
 # O domínio é fornecido através de DomainContextProvider,
 # mantendo o agente independente da implementação concreta
@@ -26,8 +27,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +39,10 @@ from openai import OpenAI
 from cisei_planning_sdk.project import PlanningProject
 from scenario_agent import ScenarioAgent
 from scenario_domain.provider import DomainContextProvider
+from planner_orchestrator import (
+    PlannerOrchestrator,
+    PlannerOrchestratorError,
+)
 
 
 DEFAULT_MODEL = "gpt-5.6-luna"
@@ -52,6 +59,7 @@ class ScenarioAgentOpenAIError(RuntimeError):
 
 
 class ScenarioAgentOpenAI:
+
     """
     Adapter OpenAI para o ScenarioAgent.
 
@@ -70,6 +78,22 @@ class ScenarioAgentOpenAI:
         - escreve arquivos;
         - executa Planning Service;
         - cria defaults técnicos.
+
+    Para planejamento:
+
+        LLM
+         |
+         v
+        planning_run
+         |
+         v
+        aplicação
+         |
+         v
+        PlannerOrchestrator
+         |
+         v
+        MCP
     """
 
     ALLOWED_ACTIONS = {
@@ -78,6 +102,7 @@ class ScenarioAgentOpenAI:
         "confirm",
         "reject_confirmation",
         "finalize",
+        "planning_run",
     }
 
     def __init__(
@@ -88,20 +113,38 @@ class ScenarioAgentOpenAI:
         client: OpenAI | None = None,
         domain_context_provider: DomainContextProvider | None = None,
         domain_context_sections: tuple[str, ...] | None = None,
+        planner_orchestrator: PlannerOrchestrator | None = None,
     ):
-        if not isinstance(project, PlanningProject):
+
+        if not isinstance(
+            project,
+            PlanningProject,
+        ):
             raise TypeError(
                 "project must be an instance of PlanningProject"
             )
 
         if domain_context_sections is not None:
-            if not isinstance(domain_context_sections, tuple):
+
+            if not isinstance(
+                domain_context_sections,
+                tuple,
+            ):
                 raise TypeError(
-                    "domain_context_sections must be a tuple[str, ...] or None"
+                    "domain_context_sections must be "
+                    "a tuple[str, ...] or None"
                 )
 
             for section in domain_context_sections:
-                if not isinstance(section, str) or not section.strip():
+
+                if (
+                    not isinstance(
+                        section,
+                        str,
+                    )
+                    or not section.strip()
+                ):
+
                     raise ValueError(
                         "domain_context_sections must contain "
                         "non-empty strings"
@@ -111,33 +154,49 @@ class ScenarioAgentOpenAI:
 
         self.model = (
             model
-            or os.getenv("SCENARIO_AGENT_OPENAI_MODEL")
+            or os.getenv(
+                "SCENARIO_AGENT_OPENAI_MODEL"
+            )
             or DEFAULT_MODEL
         )
 
-        self.client = client or OpenAI()
+        self.client = (
+            client
+            or OpenAI()
+        )
 
         # ----------------------------------------------------
         # ScenarioAgent subjacente
         #
-        # IMPORTANTE:
-        # O POC-07b utiliza self.scenario_agent como objeto
-        # interno. A propriedade scenario abaixo expõe esse
-        # objeto sem permitir atribuição direta.
+        # O ScenarioAgent continua sendo a autoridade para
+        # construção/validação/finalização do cenário.
         # ----------------------------------------------------
 
-        self.scenario_agent = ScenarioAgent(project)
+        self.scenario_agent = ScenarioAgent(
+            project
+        )
+
+        # ----------------------------------------------------
+        # Planner
+        #
+        # A aplicação controla o PlannerOrchestrator.
+        #
+        # O LLM não recebe acesso ao objeto nem ao MCP.
+        # ----------------------------------------------------
+
+        self.planner_orchestrator = (
+            planner_orchestrator
+            if planner_orchestrator is not None
+            else PlannerOrchestrator()
+        )
 
         # ----------------------------------------------------
         # Domain Context
-        #
-        # O provider é opcional.
-        # O adapter conhece somente a interface genérica
-        # DomainContextProvider, nunca a implementação concreta
-        # do plugin CISEI.
         # ----------------------------------------------------
 
-        self.domain_context_provider = domain_context_provider
+        self.domain_context_provider = (
+            domain_context_provider
+        )
 
         self.domain_context_sections = (
             domain_context_sections
@@ -145,12 +204,15 @@ class ScenarioAgentOpenAI:
             else DEFAULT_DOMAIN_CONTEXT_SECTIONS
         )
 
+        # ----------------------------------------------------
         # Histórico conversacional do LLM.
         #
         # O contexto de domínio NÃO é armazenado aqui.
-        # Ele é carregado novamente a cada request para garantir
-        # que o contexto seja independente do histórico da conversa.
-        self.messages: list[dict[str, Any]] = []
+        # ----------------------------------------------------
+
+        self.messages: list[
+            dict[str, Any]
+        ] = []
 
     # ========================================================
     # PROPERTIES
@@ -158,45 +220,37 @@ class ScenarioAgentOpenAI:
 
     @property
     def scenario_state(self) -> dict[str, Any]:
-        """
-        Retorna o estado conversacional atual do ScenarioAgent.
-        """
-        return self.scenario_agent.conversation_state()
+
+        return (
+            self.scenario_agent
+            .conversation_state()
+        )
 
     @property
     def scenario(self) -> ScenarioAgent:
-        """
-        Retorna o ScenarioAgent subjacente.
-        """
+
         return self.scenario_agent
 
     @property
     def project_path(self) -> Path:
-        """
-        Retorna o caminho do projeto.
-        """
-        return Path(self.project.path)
+
+        return Path(
+            self.project.path
+        )
 
     @property
     def scenario_path(self) -> Path:
-        """
-        Retorna o caminho do scenario.toml.
-        """
-        return self.project_path / "scenario.toml"
+
+        return (
+            self.project_path
+            / "scenario.toml"
+        )
 
     # ========================================================
     # SYSTEM PROMPT
     # ========================================================
 
     def _system_prompt(self) -> str:
-        """
-        Prompt de comportamento do agente.
-
-        As regras operacionais permanecem aqui.
-
-        O plugin/domain context fornece conhecimento técnico,
-        mas não substitui estas regras.
-        """
 
         return """
 You are the OpenAI conversational adapter for the CISEI Scenario Agent.
@@ -216,7 +270,7 @@ IMPORTANT AUTHORITY RULES
 
 4. Never invent technical values.
 
-5. Never create technical defaults.
+5. Never create technical defaults for scenario construction.
 
 6. Never convert an example from documentation into a scenario value
    unless the user explicitly provides that value.
@@ -229,7 +283,7 @@ IMPORTANT AUTHORITY RULES
    - common LTE/Wi-SUN configurations;
    - plugin recommendations.
 
-8. If a required value is missing, ask the user.
+8. If a required scenario value is missing, ask the user.
 
 9. Do not directly mutate application state.
 
@@ -253,17 +307,10 @@ IMPORTANT AUTHORITY RULES
 EXPLICIT USER VALUES — MANDATORY UPDATE RULE
 =============================================
 
-This rule has priority when choosing between update_scenario
-and ask_user.
-
 If the current USER MESSAGE contains one or more explicit scenario
 values, you MUST return "update_scenario".
 
-This remains true even when the scenario is incomplete and other
-required values are still missing.
-
-An incomplete scenario is NOT a reason to discard explicit values
-provided by the user.
+This remains true even when the scenario is incomplete.
 
 The correct behavior is:
 
@@ -283,23 +330,22 @@ User:
 
 Correct:
 
-    {
-        "action": "update_scenario",
-        "updates": {
-            "interfaces": {
-                "lte": {
-                    "tech": "LTE",
-                    "freq_mhz": 915
-                }
+{
+    "action": "update_scenario",
+    "updates": {
+        "interfaces": {
+            "lte": {
+                "tech": "LTE",
+                "freq_mhz": 915
             }
         }
     }
+}
 
-Even if tx_power_dbm, antenna_id, devices, metrics, CRS, or CSV
-information is still missing.
+Only explicitly supplied values may be included.
 
-The missing values must be requested by the APPLICATION after the
-update is applied.
+Do not invent tx_power_dbm, antenna_id, devices, metrics,
+CRS, CSV information, or other technical values.
 
 Another example:
 
@@ -308,19 +354,16 @@ User:
 
 Correct:
 
-    {
-        "action": "update_scenario",
-        "updates": {
-            "interfaces": {
-                "lte": {
-                    "tx_power_dbm": 43
-                }
+{
+    "action": "update_scenario",
+    "updates": {
+        "interfaces": {
+            "lte": {
+                "tx_power_dbm": 43
             }
         }
     }
-
-Do not return "ask_user" merely because other required fields are
-missing.
+}
 
 Another example:
 
@@ -330,26 +373,20 @@ User:
 
 Correct:
 
-    {
-        "action": "update_scenario",
-        "updates": {
-            "antennas": {
-                "antena_lte_01": {
-                    "height_m": 7,
-                    "gain_dbi": 17
-                }
+{
+    "action": "update_scenario",
+    "updates": {
+        "antennas": {
+            "antena_lte_01": {
+                "height_m": 7,
+                "gain_dbi": 17
             }
         }
     }
+}
 
-Only the explicitly supplied values may be included.
-
-Do not invent kind, model_id, azimuth, downtilt, beamwidth, or any
-other antenna value.
-
-If a user message contains multiple explicit values, include all
-explicitly supplied values in the same update_scenario action when
-they can be represented by the current scenario schema.
+Do not invent kind, model_id, azimuth, downtilt, beamwidth, or
+other antenna values.
 
 INCREMENTAL CONVERSATION
 ========================
@@ -357,9 +394,8 @@ INCREMENTAL CONVERSATION
 Treat each user message as an incremental update to the current
 application state.
 
-If a value was explicitly provided in an earlier user message and
-is already present in APPLICATION CONTEXT, do not invent or replace
-it.
+If a value was explicitly provided earlier and is already present
+in APPLICATION CONTEXT, do not invent or replace it.
 
 If the current user message provides a NEW explicit value, update
 only the values explicitly supplied by that message.
@@ -368,130 +404,35 @@ Do not erase existing values.
 
 Do not replace existing values with documentation values.
 
-Do not repeat unrelated technical values merely because they are
-present in the domain context.
-
-If the user explicitly changes a previously supplied value, the
-new explicit user value takes precedence and may replace the
-existing value.
+If the user explicitly changes a previously supplied value, the new
+explicit user value takes precedence.
 
 EXPLICIT TECHNICAL VALUES — NO INFERENCE
 =========================================
 
 Every technical value, identifier, association, key, target, or
-relationship introduced into "updates" must be explicitly stated by
-the user in the CURRENT USER MESSAGE, unless it is already being
+relationship introduced into "updates" must be explicitly stated
+by the user in the CURRENT USER MESSAGE, unless it is already being
 preserved unchanged from an existing scenario value.
 
 The current application state may be used to understand what
 already exists, what is missing, and what is valid, but it MUST NOT
 be used to infer a NEW technical value.
 
-In particular, do NOT infer:
+Do NOT infer:
 
-- a technology from a metric;
-- an interface from a metric;
-- a metric target from an existing interface;
-- an antenna from an interface;
-- an interface from an antenna;
-- a device from an interface;
-- a site from an antenna;
-- an identifier from a naming convention;
-- an association merely because it is technically plausible;
-- a relationship merely because only one compatible object currently
-  exists.
+- technology from a metric;
+- interface from a metric;
+- metric target from an interface;
+- antenna from an interface;
+- interface from an antenna;
+- device from an interface;
+- site from an antenna;
+- identifier from naming conventions;
+- associations merely because they are technically plausible.
 
-The existence of an object in APPLICATION CONTEXT does not mean that
-the user selected that object in the current message.
-
-Example:
-
-Current application state:
-
-    interfaces:
-        lte:
-            tech: LTE
-
-User:
-
-    "Quero avaliar a métrica RSRP."
-
-The user explicitly supplied:
-
-    RSRP
-
-The user did NOT explicitly supply:
-
-    LTE
-
-Therefore the model MUST NOT produce:
-
-    {
-        "action": "update_scenario",
-        "updates": {
-            "metrics": {
-                "LTE": {
-                    "spec": "RSRP"
-                }
-            }
-        }
-    }
-
-If the application schema requires a metric target and the target
-was not explicitly provided, the model MUST ask the user to specify
-that target.
-
-For example:
-
-    {
-        "action": "ask_user",
-        "questions": [
-            "Para qual interface ou tecnologia a métrica RSRP deve ser avaliada?"
-        ]
-    }
-
-Only if the user explicitly says:
-
-    "Quero avaliar RSRP para a interface LTE."
-
-may the model introduce:
-
-    LTE
-
-into the update.
-
-The same principle applies to every technical association.
-
-For example, if the application contains:
-
-    antennas:
-        antena_lte_01: ...
-
-and the user says:
-
-    "A interface LTE deve usar uma antena."
-
-do NOT automatically choose:
-
-    antena_lte_01
-
-The user must explicitly identify the antenna if the association is
-required by the application.
-
-Likewise, if the application contains:
-
-    interfaces:
-        lte: ...
-
-and the user says:
-
-    "Crie um dispositivo."
-
-do NOT automatically assign the LTE interface to that device unless
-the user explicitly requests that association.
-
-Existing application state is context, not permission to create new
-technical values.
+Existing application state is context, not permission to create
+new technical values.
 
 PARTIAL UPDATES
 ===============
@@ -499,24 +440,9 @@ PARTIAL UPDATES
 update_scenario does NOT mean that the entire scenario must be
 complete.
 
-It is valid and expected to return an update containing only a
-subset of scenario fields.
+It is valid to return only a subset of scenario fields.
 
-For example:
-
-    "Crie uma interface LTE."
-
-contains the technology but no explicit frequency, power, or
-antenna information.
-
-Therefore the model must NOT invent those missing values.
-
-However, because "LTE" itself is an explicit user-provided value,
-the model should preserve it in an update_scenario action when it
-can be represented by the current application schema.
-
-A subsequent application validation step may then report the
-remaining missing fields.
+The application validation step reports remaining missing fields.
 
 ASK_USER RULE
 =============
@@ -525,40 +451,13 @@ Use "ask_user" when required information is missing or clarification
 is needed AND the current user message does not contain a new
 scenario value that must be persisted.
 
-If the current user message contains an explicit scenario value but
-also requires an additional missing value to complete its meaning,
-do not invent the missing value.
+If the user message contains an explicit scenario value, preserve
+that value through update_scenario whenever it can be represented
+independently.
 
-In that case, preserve only the explicit value if it can be
-represented independently. If it cannot be represented without
-introducing an additional technical value, ask the user for the
-missing value instead.
+Do not invent missing values.
 
-Do NOT use an "ask_user" action as a container for scenario updates.
-
-For example:
-
-    "Quero avaliar a métrica RSRP."
-
-contains the explicit metric value:
-
-    RSRP
-
-but does not explicitly identify a target interface or technology.
-
-If the current application schema requires that target, do not infer
-it from APPLICATION CONTEXT. Ask the user to provide the target.
-
-If an explicit value can be persisted independently, it must still
-be preserved through "update_scenario".
-
-For example:
-
-    "Use 915 MHz. O que ainda falta?"
-
-must preserve 915 MHz through "update_scenario".
-
-Do not use "ask_user" to discard the explicit 915 MHz value.
+Do not use ask_user to discard explicit user values.
 
 SCENARIO VALUES
 ===============
@@ -569,71 +468,6 @@ MESSAGE may be introduced as NEW scenario values.
 Do not introduce additional technical values, identifiers,
 associations, keys, targets, or relationships merely because they
 are required by the application schema.
-
-If an explicit user value cannot be represented without another
-missing technical value, ask the user for that missing value.
-
-For example:
-
-If the domain context contains:
-
-    LTE frequency: 915 MHz
-
-and the user says:
-
-    "create an LTE interface"
-
-you MUST NOT set:
-
-    freq_mhz = 915
-
-However, "LTE" itself was explicitly provided and may be represented
-as the technology value if the current application schema supports it.
-
-If the user explicitly says:
-
-    "create an LTE interface at 915 MHz"
-
-then both LTE and 915 MHz may be included in the proposed update.
-
-The same rule applies to:
-
-- technology;
-- frequency;
-- transmit power;
-- antenna model;
-- antenna height;
-- azimuth;
-- downtilt;
-- beamwidth;
-- relay capability;
-- routing;
-- rank;
-- metrics;
-- instances;
-- connectivity;
-- candidate edges;
-- sites;
-- CSV-related values;
-- any other technical parameter.
-
-Never infer a value merely because another value makes it likely.
-
-For example:
-
-    "LTE"
-
-does not imply:
-
-    915 MHz
-
-and:
-
-    "antenna_lte_01"
-
-does not imply:
-
-    17 dBi
 
 DOMAIN KNOWLEDGE
 ================
@@ -646,7 +480,6 @@ Domain context may contain:
 - gaps;
 - examples;
 - engineering documentation;
-- architecture descriptions;
 - workflow descriptions.
 
 These categories must remain distinct.
@@ -686,8 +519,7 @@ domain documentation.
 ANTENNAS
 ========
 
-When discussing antenna configuration, respect the fields actually
-present in the current application.
+Respect the fields actually present in the current application.
 
 Potential fields include:
 
@@ -699,23 +531,169 @@ Potential fields include:
 - downtilt_deg
 - beamwidth_deg
 
-Do not move or reinterpret fields based only on domain documentation.
-
-If the current application requires a field, respect the current
-application behavior.
+Do not silently move or reinterpret fields based only on domain
+documentation.
 
 A known documentation/design conflict must not be silently resolved.
+
+PLANNING
+========
+
+There are two distinct operations:
+
+1. BUILD OR MODIFY A SCENARIO
+2. EXECUTE PLANNING FOR AN EXISTING SCENARIO
+
+These operations MUST NOT be confused.
+
+If the user asks to execute, run, calculate, perform, or start the
+planning of an EXISTING scenario, this is a planning intent.
+
+In that case:
+
+- do NOT convert the request into update_scenario;
+- do NOT ask again for the technical values already contained in
+  the scenario;
+- do NOT recreate the scenario;
+- do NOT ask for CRS, antennas, interfaces, devices, metrics, or
+  instances merely because those values belong to the existing
+  scenario;
+- do NOT execute MCP;
+- do NOT execute Planning Service;
+- return a "planning_run" action.
+
+The application will execute the planning action.
+
+Example:
+
+User:
+    "Quero executar o planejamento LTE do cenário curitiba_lte."
+
+Correct:
+
+{
+    "action": "planning_run",
+    "request": {
+        "scenario_id": "curitiba_lte",
+        "planner": "cell",
+        "rank_threshold": 10,
+        "primary_tech": "lte",
+        "solution_kind": "graph"
+    }
+}
+
+The scenario technical parameters are NOT copied into this action.
+
+They remain in the scenario itself.
+
+The planning execution parameters:
+
+- planner;
+- rank_threshold;
+- primary_tech;
+- solution_kind
+
+belong to the execution request.
+
+If the user explicitly supplies different execution parameters,
+preserve those values.
+
+Example:
+
+User:
+    "Execute curitiba_lte usando rank threshold 5."
+
+Correct:
+
+{
+    "action": "planning_run",
+    "request": {
+        "scenario_id": "curitiba_lte",
+        "rank_threshold": 5
+    }
+}
+
+Do not invent or rewrite the scenario.
+
+If the user explicitly identifies the scenario but does not provide
+an execution parameter, the application may apply its established
+planning execution contract.
+
+Do NOT use scenario-domain examples as execution defaults.
+
+If the user asks to execute a scenario and does not identify which
+scenario, ask the user for the scenario identifier.
+
+Example:
+
+{
+    "action": "ask_user",
+    "questions": [
+        "Qual cenário deve ser executado?"
+    ]
+}
+
+PLANNING ACTION CONTRACT
+========================
+
+For planning execution, return:
+
+{
+    "action": "planning_run",
+    "request": {
+        "scenario_id": "..."
+    }
+}
+
+Optional execution fields may include:
+
+{
+    "planner": "...",
+    "rank_threshold": 10,
+    "primary_tech": "...",
+    "solution_kind": "..."
+}
+
+Only include an execution parameter explicitly supplied by the user,
+unless that parameter is part of the established application-level
+planning execution contract.
+
+Do not copy scenario technical values into planning_run.
+
+Do not place scenario updates inside planning_run.
+
+Do not place planning parameters inside update_scenario unless the
+user is explicitly modifying the scenario and the current schema
+supports that field.
+
+PLANNING DOES NOT MODIFY THE SCENARIO
+=====================================
+
+planning_run means:
+
+    execute the existing scenario.
+
+It does NOT mean:
+
+    modify the scenario.
+
+The scenario.toml remains the source of the scenario technical
+configuration.
+
+The planner execution result is an operational result and does not
+become a scenario update automatically.
 
 ACTIONS
 =======
 
-You may return ONLY one of the following actions:
+You may return ONLY one of:
 
 1. update_scenario
 2. ask_user
 3. confirm
 4. reject_confirmation
 5. finalize
+6. planning_run
 
 Return valid JSON only.
 
@@ -728,39 +706,12 @@ update_scenario
 Use when the user explicitly provides one or more scenario values
 that can be represented by the current application schema.
 
-This action is valid even when the scenario remains incomplete.
-
-The "updates" object must contain only values explicitly supplied
-by the user in the current user message.
-
-Do not include technical defaults.
-
-Do not include values copied from domain examples.
-
-Do not include values merely because they are common engineering
-choices.
-
-Do not introduce technical identifiers, associations, targets, or
-relationships from APPLICATION CONTEXT unless the user explicitly
-provides them in the current user message.
-
 ask_user
 --------
 
-Use when required information is missing or clarification is needed
-AND the current user message contains no new scenario value that
-needs to be persisted.
+Use when required information is missing or clarification is needed.
 
-If the user has provided an explicit value but another value required
-to interpret or associate it is missing, do not invent that missing
-value.
-
-If the explicit value can be persisted independently, use
-update_scenario for that explicit value.
-
-Do not use ask_user to discard explicit user values.
-
-Do not put "updates" inside an ask_user action.
+Do not put "updates" inside ask_user.
 
 confirm
 -------
@@ -768,21 +719,11 @@ confirm
 Use only when the user explicitly confirms the current proposed
 scenario.
 
-Examples:
-
-- "yes"
-- "confirm"
-- "I confirm"
-- "pode prosseguir"
-- "pode finalizar"
-
-Do not infer confirmation from unrelated statements.
-
 reject_confirmation
 -------------------
 
-Use when the user explicitly rejects a confirmation request or asks
-to modify the scenario instead.
+Use when the user explicitly rejects confirmation or asks to modify
+the scenario.
 
 finalize
 --------
@@ -792,61 +733,77 @@ Use only when:
 - the scenario is complete;
 - the scenario is valid;
 - the user explicitly confirmed it;
-- the application indicates that finalization is ready.
+- the application indicates finalization is ready.
 
-Do not finalize merely because the model believes the scenario
-looks complete.
+planning_run
+------------
+
+Use when the user explicitly requests execution of planning for an
+existing scenario.
+
+Do not use update_scenario for this intent.
+
+Do not ask for scenario construction parameters again.
+
+Do not execute MCP.
+
+Do not execute Planning Service.
 
 JSON CONTRACT
 =============
 
-Return exactly one JSON object.
-
 For update_scenario:
 
-    {
-        "action": "update_scenario",
-        "updates": {
-            ...
-        }
+{
+    "action": "update_scenario",
+    "updates": {
+        ...
     }
+}
 
 For ask_user:
 
-    {
-        "action": "ask_user",
-        "questions": [
-            "..."
-        ]
-    }
+{
+    "action": "ask_user",
+    "questions": [
+        "..."
+    ]
+}
 
 For confirm:
 
-    {
-        "action": "confirm"
-    }
+{
+    "action": "confirm"
+}
 
 For reject_confirmation:
 
-    {
-        "action": "reject_confirmation"
-    }
+{
+    "action": "reject_confirmation"
+}
 
 For finalize:
 
-    {
-        "action": "finalize"
+{
+    "action": "finalize"
+}
+
+For planning_run:
+
+{
+    "action": "planning_run",
+    "request": {
+        "scenario_id": "..."
     }
+}
+
+Return exactly one JSON object.
 
 Do not return Markdown.
 
 Do not return explanations outside JSON.
 
 Do not return multiple actions.
-
-Do not put application validation questions inside update_scenario.
-
-Do not put scenario updates inside ask_user.
 
 The application will validate and execute the returned action.
 """.strip()
@@ -855,24 +812,27 @@ The application will validate and execute the returned action.
     # DOMAIN CONTEXT
     # ========================================================
 
-    def _domain_context(self) -> dict[str, Any]:
-        """
-        Obtém o contexto de domínio através do provider genérico.
+    def _domain_context(
+        self,
+    ) -> dict[str, Any]:
 
-        O ScenarioAgentOpenAI não conhece a implementação concreta
-        do plugin CISEI.
-        """
-
-        provider = self.domain_context_provider
+        provider = (
+            self.domain_context_provider
+        )
 
         if provider is None:
             return {}
 
         try:
+
             context = provider.get_context(
-                sections=self.domain_context_sections
+                sections=(
+                    self.domain_context_sections
+                )
             )
+
         except Exception as exc:
+
             raise ScenarioAgentOpenAIError(
                 f"Failed to load domain context: {exc}"
             ) from exc
@@ -883,14 +843,9 @@ The application will validate and execute the returned action.
         self,
         domain_context: dict[str, Any],
     ) -> str:
-        """
-        Converte o DomainContext em uma mensagem de contexto para o LLM.
-
-        O contexto de domínio é deliberadamente separado do
-        application context.
-        """
 
         if not domain_context:
+
             return """
 DOMAIN CONTEXT
 ==============
@@ -898,6 +853,7 @@ DOMAIN CONTEXT
 No domain context provider is configured.
 
 Therefore, do not assume technical values from external knowledge.
+
 Use only explicit user values and the application state.
 """.strip()
 
@@ -917,7 +873,7 @@ It is NOT the current scenario state.
 
 It is NOT user-provided scenario data.
 
-It is NOT a source of defaults.
+It is NOT a source of scenario defaults.
 
 It is NOT permission to execute functionality.
 
@@ -953,16 +909,17 @@ END DOMAIN CONTEXT
     # APPLICATION CONTEXT
     # ========================================================
 
-    def _application_context(self) -> dict[str, Any]:
-        """
-        Obtém o estado atual da aplicação.
-
-        Este método não incorpora domain context.
-        """
+    def _application_context(
+        self,
+    ) -> dict[str, Any]:
 
         return {
-            "scenario_state": self.scenario_agent.conversation_state(),
-            "scenario_snapshot": self.scenario_agent.snapshot(),
+
+            "scenario_state":
+                self.scenario_agent.conversation_state(),
+
+            "scenario_snapshot":
+                self.scenario_agent.snapshot(),
         }
 
     # ========================================================
@@ -973,24 +930,33 @@ END DOMAIN CONTEXT
         self,
         user_message: str,
     ) -> dict[str, Any]:
-        """
-        Envia a mensagem para o modelo OpenAI e retorna a ação JSON.
-        """
 
-        if not isinstance(user_message, str):
+        if not isinstance(
+            user_message,
+            str,
+        ):
+
             raise TypeError(
                 "user_message must be a string"
             )
 
-        user_message = user_message.strip()
+        user_message = (
+            user_message.strip()
+        )
 
         if not user_message:
+
             raise ValueError(
                 "user_message cannot be empty"
             )
 
-        application_context = self._application_context()
-        domain_context = self._domain_context()
+        application_context = (
+            self._application_context()
+        )
+
+        domain_context = (
+            self._domain_context()
+        )
 
         user_content = (
             "USER MESSAGE\n"
@@ -1001,7 +967,6 @@ END DOMAIN CONTEXT
             f"{json.dumps(application_context, ensure_ascii=False, indent=2)}"
         )
 
-        # Mantém o comportamento conversacional existente.
         self.messages.append(
             {
                 "role": "user",
@@ -1010,59 +975,91 @@ END DOMAIN CONTEXT
         )
 
         input_messages = [
+
             {
-                "role": "system",
-                "content": self._system_prompt(),
+                "role":
+                    "system",
+
+                "content":
+                    self._system_prompt(),
             },
+
             {
-                "role": "system",
-                "content": self._domain_context_prompt(
-                    domain_context
-                ),
+                "role":
+                    "system",
+
+                "content":
+                    self._domain_context_prompt(
+                        domain_context
+                    ),
             },
+
             *self.messages,
         ]
 
         try:
-            response = self.client.responses.create(
-                model=self.model,
-                reasoning={
-                    "effort": "medium",
-                },
-                input=input_messages,
+
+            response = (
+                self.client.responses.create(
+                    model=self.model,
+                    reasoning={
+                        "effort": "medium",
+                    },
+                    input=input_messages,
+                )
             )
+
         except Exception as exc:
+
             raise ScenarioAgentOpenAIError(
                 f"OpenAI request failed: {exc}"
             ) from exc
 
-        output_text = getattr(response, "output_text", None)
+        output_text = getattr(
+            response,
+            "output_text",
+            None,
+        )
 
         if not output_text:
+
             raise ScenarioAgentOpenAIError(
                 "OpenAI returned an empty response"
             )
 
-        output_text = output_text.strip()
+        output_text = (
+            output_text.strip()
+        )
 
         try:
-            action = json.loads(output_text)
+
+            action = json.loads(
+                output_text
+            )
+
         except json.JSONDecodeError as exc:
+
             raise ScenarioAgentOpenAIError(
                 "OpenAI returned invalid JSON: "
                 f"{output_text}"
             ) from exc
 
-        if not isinstance(action, dict):
+        if not isinstance(
+            action,
+            dict,
+        ):
+
             raise ScenarioAgentOpenAIError(
                 "OpenAI response must be a JSON object"
             )
 
-        # Guarda a resposta do modelo no histórico.
         self.messages.append(
             {
-                "role": "assistant",
-                "content": output_text,
+                "role":
+                    "assistant",
+
+                "content":
+                    output_text,
             }
         )
 
@@ -1076,55 +1073,259 @@ END DOMAIN CONTEXT
         self,
         action: dict[str, Any],
     ) -> None:
-        """
-        Valida minimamente a estrutura da ação retornada pelo LLM.
 
-        A validação semântica permanece sob responsabilidade do
-        ScenarioAgent/ScenarioBuilder.
+        if not isinstance(
+            action,
+            dict,
+        ):
 
-        Esta validação também protege o contrato entre o LLM e a
-        aplicação, evitando que ask_user seja utilizado para
-        transportar atualizações de cenário.
-        """
-
-        if not isinstance(action, dict):
             raise ScenarioAgentOpenAIError(
                 "Model action must be a JSON object"
             )
 
-        action_name = action.get("action")
+        action_name = action.get(
+            "action"
+        )
 
-        if action_name not in self.ALLOWED_ACTIONS:
+        if action_name not in (
+            self.ALLOWED_ACTIONS
+        ):
+
             raise ScenarioAgentOpenAIError(
-                f"Unsupported model action: {action_name!r}"
+                f"Unsupported model action: "
+                f"{action_name!r}"
             )
 
+        # ----------------------------------------------------
+        # UPDATE SCENARIO
+        # ----------------------------------------------------
+
         if action_name == "update_scenario":
+
             if "updates" not in action:
+
                 raise ScenarioAgentOpenAIError(
-                    "update_scenario action must contain 'updates'"
+                    "update_scenario action must "
+                    "contain 'updates'"
                 )
 
-            if not isinstance(action["updates"], dict):
+            if not isinstance(
+                action["updates"],
+                dict,
+            ):
+
                 raise ScenarioAgentOpenAIError(
-                    "update_scenario 'updates' must be a JSON object"
+                    "update_scenario 'updates' "
+                    "must be a JSON object"
                 )
+
+        # ----------------------------------------------------
+        # ASK USER
+        # ----------------------------------------------------
 
         if action_name == "ask_user":
+
             if "updates" in action:
+
                 raise ScenarioAgentOpenAIError(
-                    "ask_user action must not contain 'updates'"
+                    "ask_user action must not "
+                    "contain 'updates'"
                 )
 
-            questions = action.get("questions")
+            questions = action.get(
+                "questions"
+            )
 
-            if questions is not None and not isinstance(
-                questions,
-                list,
+            if questions is not None:
+
+                if not isinstance(
+                    questions,
+                    list,
+                ):
+
+                    raise ScenarioAgentOpenAIError(
+                        "ask_user 'questions' "
+                        "must be a list"
+                    )
+
+        # ----------------------------------------------------
+        # PLANNING RUN
+        # ----------------------------------------------------
+
+        if action_name == "planning_run":
+
+            if "request" not in action:
+
+                raise ScenarioAgentOpenAIError(
+                    "planning_run action must "
+                    "contain 'request'"
+                )
+
+            request = action[
+                "request"
+            ]
+
+            if not isinstance(
+                request,
+                dict,
             ):
+
                 raise ScenarioAgentOpenAIError(
-                    "ask_user 'questions' must be a list"
+                    "planning_run 'request' "
+                    "must be a JSON object"
                 )
+
+            scenario_id = request.get(
+                "scenario_id"
+            )
+
+            if not isinstance(
+                scenario_id,
+                str,
+            ) or not scenario_id.strip():
+
+                raise ScenarioAgentOpenAIError(
+                    "planning_run requires "
+                    "scenario_id"
+                )
+
+            if (
+                "planner" in request
+                and not isinstance(
+                    request["planner"],
+                    str,
+                )
+            ):
+
+                raise ScenarioAgentOpenAIError(
+                    "planning_run planner "
+                    "must be a string"
+                )
+
+            if (
+                "rank_threshold"
+                in request
+            ):
+
+                try:
+
+                    int(
+                        request[
+                            "rank_threshold"
+                        ]
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ) as exc:
+
+                    raise ScenarioAgentOpenAIError(
+                        "planning_run rank_threshold "
+                        "must be an integer"
+                    ) from exc
+
+            if (
+                "primary_tech"
+                in request
+                and not isinstance(
+                    request[
+                        "primary_tech"
+                    ],
+                    str,
+                )
+            ):
+
+                raise ScenarioAgentOpenAIError(
+                    "planning_run primary_tech "
+                    "must be a string"
+                )
+
+            if (
+                "solution_kind"
+                in request
+                and not isinstance(
+                    request[
+                        "solution_kind"
+                    ],
+                    str,
+                )
+            ):
+
+                raise ScenarioAgentOpenAIError(
+                    "planning_run solution_kind "
+                    "must be a string"
+                )
+
+    # ========================================================
+    # ASYNC EXECUTOR
+    # ========================================================
+
+    @staticmethod
+    def _run_coroutine_sync(
+        coroutine,
+    ):
+        """
+        Executa uma coroutine a partir de código síncrono.
+
+        O notebook Jupyter normalmente possui um event loop ativo.
+        Nesse caso, executamos a coroutine em uma thread própria.
+
+        Fora de um event loop ativo, asyncio.run() é utilizado
+        diretamente.
+        """
+
+        try:
+
+            asyncio.get_running_loop()
+
+        except RuntimeError:
+
+            return asyncio.run(
+                coroutine
+            )
+
+        # ----------------------------------------------------
+        # Já existe event loop.
+        #
+        # Não podemos chamar asyncio.run() no mesmo thread.
+        # ----------------------------------------------------
+
+        result = []
+        error = []
+
+        def runner():
+
+            try:
+
+                result.append(
+                    asyncio.run(
+                        coroutine
+                    )
+                )
+
+            except BaseException as exc:
+
+                error.append(
+                    exc
+                )
+
+        thread = threading.Thread(
+            target=runner,
+            daemon=True,
+        )
+
+        thread.start()
+        thread.join()
+
+        if error:
+            raise error[0]
+
+        return (
+            result[0]
+            if result
+            else None
+        )
 
     # ========================================================
     # ACTION APPLICATION
@@ -1134,36 +1335,142 @@ END DOMAIN CONTEXT
         self,
         action: dict[str, Any],
     ) -> dict[str, Any]:
-        """
-        Delega a ação ao ScenarioAgent.
 
-        Este adapter não modifica diretamente o ScenarioBuilder.
-        """
+        self._validate_action(
+            action
+        )
 
-        self._validate_action(action)
+        action_name = action[
+            "action"
+        ]
 
-        action_name = action["action"]
+        # ----------------------------------------------------
+        # SCENARIO
+        # ----------------------------------------------------
 
         if action_name == "update_scenario":
-            return self.scenario_agent.process_update(action["updates"])
+
+            return (
+                self.scenario_agent.process_update(
+                    action["updates"]
+                )
+            )
+
+        # ----------------------------------------------------
+        # ASK USER
+        # ----------------------------------------------------
 
         if action_name == "ask_user":
+
             return action
 
+        # ----------------------------------------------------
+        # CONFIRM
+        # ----------------------------------------------------
+
         if action_name == "confirm":
-            return self.scenario_agent.process_confirmation(
-                confirmed=True
+
+            return (
+                self.scenario_agent
+                .process_confirmation(
+                    confirmed=True
+                )
             )
+
+        # ----------------------------------------------------
+        # REJECT
+        # ----------------------------------------------------
 
         if action_name == "reject_confirmation":
-            return self.scenario_agent.process_confirmation(
-                confirmed=False
+
+            return (
+                self.scenario_agent
+                .process_confirmation(
+                    confirmed=False
+                )
             )
 
-        if action_name == "finalize":
-            return self.scenario_agent.process_finalize()
+        # ----------------------------------------------------
+        # FINALIZE
+        # ----------------------------------------------------
 
-        # Proteção adicional.
+        if action_name == "finalize":
+
+            return (
+                self.scenario_agent
+                .process_finalize()
+            )
+
+        # ----------------------------------------------------
+        # PLANNING
+        # ----------------------------------------------------
+
+        if action_name == "planning_run":
+
+            request = action[
+                "request"
+            ]
+
+            try:
+
+                result = (
+                    self._run_coroutine_sync(
+                        self.planner_orchestrator.execute(
+                            request
+                        )
+                    )
+                )
+
+            except PlannerOrchestratorError as exc:
+
+                return {
+
+                    "action":
+                        "planning_run",
+
+                    "status":
+                        "error",
+
+                    "scenario_id":
+                        request.get(
+                            "scenario_id"
+                        ),
+
+                    "error":
+                        str(exc),
+                }
+
+            except Exception as exc:
+
+                return {
+
+                    "action":
+                        "planning_run",
+
+                    "status":
+                        "error",
+
+                    "scenario_id":
+                        request.get(
+                            "scenario_id"
+                        ),
+
+                    "error":
+                        str(exc),
+                }
+
+            return {
+
+                "action":
+                    "planning_run",
+
+                **result,
+            }
+
+        # ----------------------------------------------------
+        # PROTEÇÃO
+        # ----------------------------------------------------
+
         raise ScenarioAgentOpenAIError(
             f"Unhandled action: {action_name}"
         )
@@ -1176,33 +1483,116 @@ END DOMAIN CONTEXT
         self,
         user_message: str,
     ) -> dict[str, Any]:
-        """
-        Processa uma mensagem do usuário.
 
-        Fluxo:
-
-            usuário
-                |
-                v
-            OpenAI
-                |
-                v
-            JSON action
-                |
-                v
-            ScenarioAgent
-                |
-                v
-            resultado da aplicação
-        """
-
-        action = self._request_model(
-            user_message
+        action = (
+            self._request_model(
+                user_message
+            )
         )
 
-        return self._apply_action(
+        return (
+            self._apply_action(
+                action
+            )
+        )
+
+    # ========================================================
+    # PUBLIC ASYNC CHAT API
+    # ========================================================
+
+    async def chat_async(
+        self,
+        user_message: str,
+    ) -> dict[str, Any]:
+
+        """
+        Variante assíncrona para notebooks/aplicações que
+        já trabalham nativamente com async.
+
+        O request OpenAI continua síncrono porque o cliente
+        atual é síncrono; apenas a execução do Planner é
+        aguardada de forma assíncrona.
+        """
+
+        action = (
+            self._request_model(
+                user_message
+            )
+        )
+
+        self._validate_action(
             action
         )
+
+        if action.get(
+            "action"
+        ) != "planning_run":
+
+            return (
+                self._apply_action(
+                    action
+                )
+            )
+
+        try:
+
+            result = await (
+                self.planner_orchestrator.execute(
+                    action[
+                        "request"
+                    ]
+                )
+            )
+
+        except PlannerOrchestratorError as exc:
+
+            return {
+
+                "action":
+                    "planning_run",
+
+                "status":
+                    "error",
+
+                "scenario_id":
+                    action[
+                        "request"
+                    ].get(
+                        "scenario_id"
+                    ),
+
+                "error":
+                    str(exc),
+            }
+
+        except Exception as exc:
+
+            return {
+
+                "action":
+                    "planning_run",
+
+                "status":
+                    "error",
+
+                "scenario_id":
+                    action[
+                        "request"
+                    ].get(
+                        "scenario_id"
+                    ),
+
+                "error":
+                    str(exc),
+            }
+
+        return {
+
+            "action":
+                "planning_run",
+
+            **result,
+        }
 
 
 # ============================================================
@@ -1215,15 +1605,8 @@ def create_scenario_agent_openai(
     model: str | None = None,
     domain_context_provider: DomainContextProvider | None = None,
     domain_context_sections: tuple[str, ...] | None = None,
+    planner_orchestrator: PlannerOrchestrator | None = None,
 ) -> ScenarioAgentOpenAI:
-    """
-    Cria um ScenarioAgentOpenAI.
-
-    O provider de domínio é opcional.
-
-    Quando não informado, o agente funciona normalmente sem
-    contexto adicional de domínio.
-    """
 
     project = PlanningProject(
         project_path
@@ -1234,6 +1617,7 @@ def create_scenario_agent_openai(
         model=model,
         domain_context_provider=domain_context_provider,
         domain_context_sections=domain_context_sections,
+        planner_orchestrator=planner_orchestrator,
     )
 
 
@@ -1242,6 +1626,7 @@ def create_scenario_agent_openai(
 # ============================================================
 
 if __name__ == "__main__":
+
     from scenario_domain.providers import (
         CISEIPluginDomainContextProvider,
     )
@@ -1254,12 +1639,16 @@ if __name__ == "__main__":
     )
 
     plugin_path = (
-        Path("/home/jovyan/work/planapp-mcp")
+        Path(
+            "/home/jovyan/work/planapp-mcp"
+        )
         / "cisei-planning-engineering"
     )
 
-    provider = CISEIPluginDomainContextProvider(
-        plugin_path
+    provider = (
+        CISEIPluginDomainContextProvider(
+            plugin_path
+        )
     )
 
     agent = create_scenario_agent_openai(

@@ -1,34 +1,3 @@
-# ============================================================
-# PLANAPP MCP — PLANNER CLIENT
-#
-# Adapter entre os MCP tools e o cisei_planning_sdk.
-#
-# Arquitetura:
-#
-#   MCP tool
-#      |
-#      v
-#   PlannerClient
-#      |
-#      v
-#   PlanningClient (SDK 0.1.18)
-#      |
-#      v
-#   ScenarioSession
-#      |
-#      v
-#   network-service
-#
-# Este módulo NÃO implementa:
-#   - HTTP manual
-#   - autenticação/X-Token manual
-#   - lógica de planejamento
-#   - validação própria do cenário
-#   - execução direta dos endpoints
-#
-# Toda comunicação com o Planning Service é delegada ao SDK.
-# ============================================================
-
 from __future__ import annotations
 
 import os
@@ -41,20 +10,27 @@ from cisei_planning_sdk.session import ScenarioSession
 
 class PlannerClient:
     """
-    Thin adapter sobre o cisei_planning_sdk.
+    Adapter de produção para o cisei_planning_sdk.
 
     Responsabilidades:
-      - criar/configurar PlanningClient;
-      - manter sessões de cenário;
-      - traduzir operações de alto nível para o SDK;
-      - devolver somente dados serializáveis aos MCP tools.
+    - conexão com o network-service;
+    - gerenciamento do workspace do planejador;
+    - abertura/reabertura de projetos;
+    - manutenção das sessões ScenarioSession em memória;
+    - exposição de operações de alto nível para a futura camada MCP.
 
-    Não implementa a lógica de planejamento.
+    O PlannerClient NÃO:
+    - interpreta linguagem natural;
+    - cria ou altera ScenarioBuilder;
+    - inventa parâmetros técnicos;
+    - executa lógica de planejamento própria;
+    - substitui o cisei_planning_sdk.
     """
 
     DEFAULT_BASE_URL = "http://network-service:8080"
     DEFAULT_TIMEOUT = 900.0
-    DEFAULT_PLANNER = "graph"
+    DEFAULT_PLANNER = "cell"
+    DEFAULT_WORKSPACE = "/workspace/cisei_workspace"
 
     def __init__(
         self,
@@ -78,7 +54,6 @@ class PlannerClient:
         )
 
         self.workspace = self._resolve_workspace(workspace)
-
         self.timeout = float(timeout)
 
         self.client = PlanningClient(
@@ -89,35 +64,36 @@ class PlannerClient:
             timeout=self.timeout,
         )
 
-        # scenario_id -> ScenarioSession
         self._sessions: dict[str, ScenarioSession] = {}
 
-    # ========================================================
-    # CONNECTION
-    # ========================================================
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
 
     def connect(self) -> dict[str, Any]:
         """
-        Register/re-register this MCP user with the planning hub.
+        Garante que o PlanningClient esteja autenticado.
 
-        Authentication is entirely delegated to PlanningClient.
+        Evita registro duplicado quando o SDK já realizou auto_register
+        durante o __init__.
         """
-        self.client.connect()
+        if not self.connected:
+            self.client.connect()
 
         return {
             "status": "ok",
             "user_id": self.client.user_id,
             "base_url": self.base_url,
+            "workspace": str(self.workspace),
         }
 
     @property
     def connected(self) -> bool:
-        """Return whether the SDK currently has an authentication token."""
         return self.client.token is not None
 
-    # ========================================================
-    # SCENARIO
-    # ========================================================
+    # ------------------------------------------------------------------
+    # Scenario lifecycle
+    # ------------------------------------------------------------------
 
     def define_scenario(
         self,
@@ -127,22 +103,20 @@ class PlannerClient:
         planner: str = DEFAULT_PLANNER,
     ) -> dict[str, Any]:
         """
-        Define a scenario on the planning service.
+        Define um cenário novo a partir de um scenario dict.
 
-        The scenario is supplied as a Python dictionary.
-
-        The SDK requires an active PlanningProject before calling
-        PlanningClient.define_scenario(). For MCP usage we create a
-        lightweight project directory associated with the scenario.
-
-        The actual scenario data remains the authority supplied by
-        the caller; this adapter does not generate or modify it.
+        Usado principalmente quando a aplicação ainda não abriu um
+        PlanningProject existente.
         """
+        if not scenario_id:
+            raise ValueError("scenario_id is required")
+
         if not isinstance(scenario, dict):
             raise TypeError("scenario must be a dictionary")
 
-        project = self._ensure_project(scenario_id)
+        self.connect()
 
+        project = self._ensure_project(scenario_id)
         self.client.project = project
 
         session = self.client.define_scenario(
@@ -155,27 +129,55 @@ class PlannerClient:
 
         return self._scenario_state(session)
 
-    def get_scenario(
+    def open_project(
         self,
+        *,
         scenario_id: str,
+        planner: str = DEFAULT_PLANNER,
     ) -> dict[str, Any]:
         """
-        Reload the Stage 1 scenario from the planning service.
+        Abre/reabre um projeto existente no workspace.
+
+        Esta é a operação preferencial quando o ScenarioBuilder já
+        produziu scenario.toml + nodes.csv.
         """
-        session = self._get_session(scenario_id)
+        if not scenario_id:
+            raise ValueError("scenario_id is required")
+
+        self.connect()
+
+        project = self._get_project(scenario_id)
+
+        session = self.client.open_project(
+            project,
+            planner=planner,
+        )
+
+        self._sessions[session.scenario_id] = session
+
+        return self._scenario_state(session)
+
+    def get_scenario(self, scenario_id: str) -> dict[str, Any]:
+        """
+        Obtém o estado de um cenário.
+
+        Se a sessão não estiver em memória, tenta reidratá-la a partir
+        do projeto persistido no workspace.
+        """
+        session = self._get_or_rehydrate_session(scenario_id)
 
         session.refresh()
 
         return self._scenario_state(session)
 
-    # ========================================================
-    # CANDIDATE EDGES
-    # ========================================================
+    # ------------------------------------------------------------------
+    # Candidate edges
+    # ------------------------------------------------------------------
 
     def build_candidate_edges(
         self,
-        *,
         scenario_id: str,
+        *,
         planner: str | None = None,
         preserve_existing: bool = True,
         primary_tech: str = "lte",
@@ -183,12 +185,9 @@ class PlannerClient:
         limit_m: float | None = None,
         degree: int | None = None,
     ) -> dict[str, Any]:
-        """
-        Execute Stage 2: candidate graph construction.
-        """
-        session = self._get_session(scenario_id)
+        session = self._get_or_rehydrate_session(scenario_id)
 
-        result = session.build_candidate_edges(
+        return session.build_candidate_edges(
             planner=planner,
             preserve_existing=preserve_existing,
             primary_tech=primary_tech,
@@ -197,50 +196,30 @@ class PlannerClient:
             degree=degree,
         )
 
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "candidate_edges": result,
-        }
-
     def get_candidate_edges(
         self,
-        *,
         scenario_id: str,
     ) -> dict[str, Any]:
-        """
-        Read the currently stored candidate graph.
-        """
-        session = self._get_session(scenario_id)
+        session = self._get_or_rehydrate_session(scenario_id)
+        return session.get_candidate_edges()
 
-        result = session.get_candidate_edges()
-
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "candidate_edges": result,
-        }
-
-    # ========================================================
-    # METRICS
-    # ========================================================
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
 
     def compute_metrics(
         self,
-        *,
         scenario_id: str,
+        *,
         geo_base_url: str = "http://planning-service:8080",
         geo_user_prefix: str = "planning-sdk",
         geo_pool_size: int = 1,
         geo_timeout: float = 120.0,
         include_features: bool = False,
     ) -> dict[str, Any]:
-        """
-        Execute Stage 3/metric computation through the SDK.
-        """
-        session = self._get_session(scenario_id)
+        session = self._get_or_rehydrate_session(scenario_id)
 
-        result = session.compute_metrics(
+        return session.compute_metrics(
             geo_base_url=geo_base_url,
             geo_user_prefix=geo_user_prefix,
             geo_pool_size=geo_pool_size,
@@ -248,193 +227,104 @@ class PlannerClient:
             include_features=include_features,
         )
 
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "metrics": result,
-        }
-
     def get_metrics(
         self,
-        *,
         scenario_id: str,
+        *,
         include_features: bool = False,
     ) -> dict[str, Any]:
-        """
-        Read already-computed metrics.
-        """
-        session = self._get_session(scenario_id)
+        session = self._get_or_rehydrate_session(scenario_id)
 
-        result = session.get_metrics(
+        return session.get_metrics(
             include_features=include_features,
         )
 
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "metrics": result,
-        }
-
-    # ========================================================
-    # SOLUTION
-    # ========================================================
+    # ------------------------------------------------------------------
+    # Solution
+    # ------------------------------------------------------------------
 
     def solve(
         self,
-        *,
         scenario_id: str,
     ) -> dict[str, Any]:
-        """
-        Execute the solver stage.
-        """
-        session = self._get_session(scenario_id)
-
-        result = session.solve()
-
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "solution": result,
-        }
+        session = self._get_or_rehydrate_session(scenario_id)
+        return session.solve()
 
     def get_solution(
         self,
-        *,
         scenario_id: str,
     ) -> dict[str, Any]:
-        """
-        Read an already-saved solution.
-        """
-        session = self._get_session(scenario_id)
+        session = self._get_or_rehydrate_session(scenario_id)
+        return session.get_solution()
 
-        result = session.get_solution()
-
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "solution": result,
-        }
-
-    # ========================================================
-    # EVALUATION
-    # ========================================================
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
 
     def evaluate(
         self,
-        *,
         scenario_id: str,
+        *,
         rank_threshold: float,
         primary_tech: str = "lte",
         solution_kind: str | None = None,
     ) -> dict[str, Any]:
-        """
-        Evaluate an already-solved scenario.
-        """
-        session = self._get_session(scenario_id)
+        session = self._get_or_rehydrate_session(scenario_id)
 
-        result = session.evaluate(
+        return session.evaluate(
             rank_threshold=rank_threshold,
             primary_tech=primary_tech,
             solution_kind=solution_kind,
         )
 
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "evaluation": result,
-        }
-
-    # ========================================================
-    # EXPORT
-    # ========================================================
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
 
     def export_result(
         self,
-        *,
         scenario_id: str,
+        *,
         include_features: bool = False,
         rank_threshold: float | None = None,
         primary_tech: str = "lte",
         solution_kind: str | None = None,
     ) -> dict[str, Any]:
-        """
-        Export the current server-side planning result.
-        """
-        session = self._get_session(scenario_id)
+        session = self._get_or_rehydrate_session(scenario_id)
 
-        result = session.export_result(
+        return session.export_result(
             include_features=include_features,
             rank_threshold=rank_threshold,
             primary_tech=primary_tech,
             solution_kind=solution_kind,
         )
 
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "result": result,
-        }
-
     def export_scenario(
         self,
-        *,
         scenario_id: str,
     ) -> dict[str, Any]:
-        """
-        Export the complete Stage 1 scenario stored by the server.
-        """
-        session = self._get_session(scenario_id)
+        session = self._get_or_rehydrate_session(scenario_id)
+        return session.export_scenario()
 
-        result = session.export_scenario()
-
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "scenario": result,
-        }
-
-    # ========================================================
-    # SESSION INFORMATION
-    # ========================================================
+    # ------------------------------------------------------------------
+    # Session state
+    # ------------------------------------------------------------------
 
     def session_state(
         self,
-        *,
         scenario_id: str,
     ) -> dict[str, Any]:
-        """
-        Return local SDK session state without executing a planning stage.
-        """
-        session = self._get_session(scenario_id)
+        session = self._get_or_rehydrate_session(scenario_id)
+        return self._scenario_state(session)
 
-        return {
-            "status": "ok",
-            "scenario_id": session.scenario_id,
-            "name": session.name,
-            "planner": session.planner,
-            "ok": session.ok,
-            "summary": session.summary,
-            "validation_errors": session.validation_errors,
-            "has_scenario": session.scenario is not None,
-            "has_candidate_edges": session.candidate_edges is not None,
-            "has_metrics": session.metrics is not None,
-            "has_solution": session.solution is not None,
-            "has_evaluation": session.evaluation is not None,
-            "has_result": session.result is not None,
-        }
+    # ------------------------------------------------------------------
+    # Internal session management
+    # ------------------------------------------------------------------
 
-    # ========================================================
-    # INTERNAL
-    # ========================================================
-
-    def _get_session(self, scenario_id: str) -> ScenarioSession:
-        """
-        Return an existing local ScenarioSession.
-
-        We deliberately do not silently create a new session because a
-        missing local session usually means the MCP caller has lost the
-        scenario handle.
-        """
+    def _get_session(
+        self,
+        scenario_id: str,
+    ) -> ScenarioSession:
         if not scenario_id:
             raise ValueError("scenario_id is required")
 
@@ -447,64 +337,134 @@ class PlannerClient:
 
         return session
 
-    def _ensure_project(self, scenario_id: str) -> PlanningProject:
+    def _get_or_rehydrate_session(
+        self,
+        scenario_id: str,
+        *,
+        planner: str | None = None,
+    ) -> ScenarioSession:
         """
-        Create a lightweight local project for SDK compatibility.
+        Retorna a sessão em memória ou reabre o projeto persistido.
 
-        The SDK's PlanningClient.define_scenario() requires client.project,
-        although the define operation itself can consume a dictionary and
-        does not need a scenario.toml file.
-
-        This directory is therefore only an SDK bookkeeping/workspace
-        requirement. The MCP adapter does not generate scenario.toml here.
+        Isso permite que o MCP continue trabalhando com um cenário
+        depois de um restart do processo.
         """
-        workspace = self.workspace
+        try:
+            return self._get_session(scenario_id)
+        except KeyError:
+            pass
 
-        projects_root = workspace / "projects"
+        project = self._get_project(scenario_id)
+
+        session = self.client.open_project(
+            project,
+            planner=planner or self.DEFAULT_PLANNER,
+        )
+
+        self._sessions[session.scenario_id] = session
+
+        return session
+
+    # ------------------------------------------------------------------
+    # Project management
+    # ------------------------------------------------------------------
+
+    def _ensure_project(
+        self,
+        scenario_id: str,
+    ) -> PlanningProject:
+        projects_root = self.workspace / "projects"
         project_path = projects_root / scenario_id
 
-        project = PlanningProject(project_path)
+        project_path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-        return project
+        return PlanningProject(project_path)
 
-    @staticmethod
+    def _get_project(
+        self,
+        scenario_id: str,
+    ) -> PlanningProject:
+        if not scenario_id:
+            raise ValueError("scenario_id is required")
+
+        project_path = (
+            self.workspace
+            / "projects"
+            / scenario_id
+        )
+
+        if not project_path.is_dir():
+            raise FileNotFoundError(
+                f"Planning project not found: {project_path}"
+            )
+
+        scenario_path = project_path / "scenario.toml"
+
+        if not scenario_path.is_file():
+            raise FileNotFoundError(
+                f"scenario.toml not found: {scenario_path}"
+            )
+
+        return PlanningProject(project_path)
+
+    # ------------------------------------------------------------------
+    # Workspace resolution
+    # ------------------------------------------------------------------
+
+    @classmethod
     def _resolve_workspace(
+        cls,
         workspace: str | Path | None,
     ) -> Path:
-        """
-        Resolve the MCP planning workspace.
-
-        Preference:
-          1. explicit workspace argument;
-          2. PLANAPP_PLANNING_WORKSPACE;
-          3. /workspace;
-          4. /workspace/planapp-user.
-        """
         if workspace is not None:
             path = Path(workspace).expanduser().resolve()
+
         else:
-            env_workspace = os.environ.get("PLANAPP_PLANNING_WORKSPACE")
+            env_workspace = os.environ.get(
+                "PLANAPP_PLANNING_WORKSPACE"
+            )
 
             if env_workspace:
-                path = Path(env_workspace).expanduser().resolve()
-            elif Path("/workspace").is_dir():
-                path = Path("/workspace").resolve()
-            elif Path("/workspace/planapp-user").is_dir():
-                path = Path("/workspace/planapp-user").resolve()
-            else:
-                path = Path("/tmp/planapp-planning-workspace").resolve()
+                path = Path(
+                    env_workspace
+                ).expanduser().resolve()
 
-        (path / "projects").mkdir(parents=True, exist_ok=True)
+            else:
+                path = Path(
+                    cls.DEFAULT_WORKSPACE
+                ).resolve()
+
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Planning workspace not found: {path}"
+            )
+
+        if not path.is_dir():
+            raise NotADirectoryError(
+                f"Planning workspace is not a directory: {path}"
+            )
+
+        projects_root = path / "projects"
+
+        if not projects_root.exists():
+            projects_root.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
         return path
+
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _scenario_state(
         session: ScenarioSession,
     ) -> dict[str, Any]:
-        """
-        Convert ScenarioSession state into an MCP-safe dictionary.
-        """
         return {
             "status": "ok",
             "scenario_id": session.scenario_id,

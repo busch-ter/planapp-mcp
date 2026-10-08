@@ -53,7 +53,6 @@ import logging
 import os
 import re
 
-from contextlib import AsyncExitStack
 from datetime import datetime
 
 import ipywidgets as widgets
@@ -76,7 +75,7 @@ from mcp.client.streamable_http import streamable_http_client
 #   PLANAPP_MCP_URL=
 #   http://mcp-fernandobusch8-40gmail-2ecom:8010/mcp
 #
-# Não existe mais fallback para um MCP específico de usuário.
+# Não existe fallback para um MCP específico de usuário.
 # ------------------------------------------------------------
 
 MCP_URL = os.getenv(
@@ -119,6 +118,8 @@ LOG_DIR = os.getenv(
         "~/work/planapp-mcp/logs"
     ),
 )
+
+
 # ============================================================
 # FERRAMENTAS CONTROLADAS PELA APLICAÇÃO
 # ============================================================
@@ -132,6 +133,19 @@ APPLICATION_CONTROLLED_TOOLS = {
     "bldg_prepare",
     "bldg_fresnel",
     "bldg_profile",
+
+    # --------------------------------------------------------
+    # PLANEJAMENTO
+    #
+    # Estas ferramentas são executadas pela aplicação /
+    # PlannerOrchestrator e não pelo LLM diretamente.
+    # --------------------------------------------------------
+
+    "planning_open",
+    "planning_run",
+    "planning_status",
+    "planning_result",
+    "planning_export",
 }
 
 
@@ -156,6 +170,37 @@ class PlanAppAgentCommon:
 
         OpenRouter:
             openrouter_chat()
+
+    ------------------------------------------------------------
+    LIFECYCLE MCP
+    ------------------------------------------------------------
+
+    A conexão MCP NÃO é mantida aberta através de diferentes
+    tasks/células do Jupyter.
+
+    Cada chamada a execute_mcp_tool_raw():
+
+        streamable_http_client
+              |
+              +--> ClientSession
+              |
+              +--> call_tool()
+              |
+              +--> fechamento da ClientSession
+              |
+              +--> fechamento do transporte
+
+    acontece dentro da mesma task assíncrona.
+
+    Isso evita o erro do AnyIO:
+
+        RuntimeError:
+        Attempted to exit cancel scope in a different task
+        than it was entered in
+
+    O objeto mcp_session permanece None fora de uma chamada
+    MCP. A API pública execute_mcp_tool() continua sendo a
+    mesma utilizada pelos agentes existentes.
     """
 
     AGENT_NAME = "PLANAPP AI"
@@ -181,9 +226,13 @@ class PlanAppAgentCommon:
 
         # --------------------------------------------------------
         # MCP
+        #
+        # Não existe mais AsyncExitStack persistente.
+        #
+        # A sessão MCP é criada dentro de cada chamada de
+        # execute_mcp_tool_raw() e destruída no mesmo contexto.
         # --------------------------------------------------------
 
-        self.exit_stack = AsyncExitStack()
         self.mcp_session = None
         self.mcp_tools = []
         self.connected = False
@@ -329,6 +378,7 @@ class PlanAppAgentCommon:
             pass
 
         if self.progress_callback:
+
             try:
                 self.progress_callback(text)
             except Exception:
@@ -347,6 +397,7 @@ class PlanAppAgentCommon:
             pass
 
         if self.log_callback:
+
             try:
                 self.log_callback(text)
             except Exception:
@@ -358,6 +409,7 @@ class PlanAppAgentCommon:
     ):
 
         if self.result_callback:
+
             try:
                 self.result_callback(result)
             except Exception:
@@ -426,16 +478,26 @@ class PlanAppAgentCommon:
             )
 
             if unit == "ghz":
-                parameters["freq_mhz"] = value * 1000.0
+
+                parameters["freq_mhz"] = (
+                    value * 1000.0
+                )
 
             elif unit == "mhz":
+
                 parameters["freq_mhz"] = value
 
             elif unit == "khz":
-                parameters["freq_mhz"] = value / 1000.0
+
+                parameters["freq_mhz"] = (
+                    value / 1000.0
+                )
 
             elif unit == "hz":
-                parameters["freq_mhz"] = value / 1_000_000.0
+
+                parameters["freq_mhz"] = (
+                    value / 1_000_000.0
+                )
 
         # --------------------------------------------------------
         # Duas antenas com mesma altura
@@ -577,82 +639,110 @@ class PlanAppAgentCommon:
         self,
     ):
 
+        """
+        Inicializa o acesso ao MCP.
+
+        IMPORTANTE:
+
+        Esta função NÃO mantém uma conexão persistente.
+
+        Ela abre uma conexão temporária apenas para:
+
+            1. inicializar ClientSession;
+            2. listar as ferramentas disponíveis;
+            3. fechar tudo na mesma task.
+
+        As chamadas reais são feitas por
+        execute_mcp_tool_raw(), que possui seu próprio lifecycle.
+
+        Isso evita o problema de AnyIO causado quando um
+        AsyncExitStack criado em uma task é fechado em outra.
+        """
+
         if self.connected:
+
             return
 
         self.log(
             "🔌 Conectando ao PlanApp MCP..."
         )
 
-        transport = await (
-            self.exit_stack
-            .enter_async_context(
-                streamable_http_client(
-                    MCP_URL
-                )
-            )
-        )
+        try:
 
-        if len(transport) == 2:
+            async with streamable_http_client(
+                MCP_URL
+            ) as transport:
 
-            (
-                read_stream,
-                write_stream,
-            ) = transport
+                if len(transport) == 2:
 
-        else:
+                    (
+                        read_stream,
+                        write_stream,
+                    ) = transport
 
-            (
-                read_stream,
-                write_stream,
-                _,
-            ) = transport
+                else:
 
-        self.mcp_session = await (
-            self.exit_stack
-            .enter_async_context(
-                ClientSession(
+                    (
+                        read_stream,
+                        write_stream,
+                        _,
+                    ) = transport
+
+                async with ClientSession(
                     read_stream,
                     write_stream,
-                )
+                ) as session:
+
+                    await session.initialize()
+
+                    tools_result = await (
+                        session.list_tools()
+                    )
+
+                    self.mcp_tools = (
+                        getattr(
+                            tools_result,
+                            "tools",
+                            [],
+                        )
+                        or []
+                    )
+
+            self.connected = True
+
+            self.log(
+                "🟢 MCP conectado — "
+                f"{len(self.mcp_tools)} "
+                "ferramentas disponíveis."
             )
-        )
 
-        await self.mcp_session.initialize()
-
-        tools_result = await (
-            self.mcp_session.list_tools()
-        )
-
-        self.mcp_tools = (
-            getattr(
-                tools_result,
-                "tools",
-                [],
+            self.log_detail(
+                "Ferramentas MCP disponíveis:"
             )
-            or []
-        )
 
-        self.connected = True
+            for tool in self.mcp_tools:
 
-        self.log(
-            "🟢 MCP conectado — "
-            f"{len(self.mcp_tools)} "
-            "ferramentas disponíveis."
-        )
+                try:
 
-        self.log_detail(
-            "Ferramentas MCP disponíveis:"
-        )
+                    self.log_detail(
+                        f"  - {tool.name}"
+                    )
 
-        for tool in self.mcp_tools:
+                except Exception:
 
-            try:
-                self.log_detail(
-                    f"  - {tool.name}"
-                )
-            except Exception:
-                pass
+                    pass
+
+        except Exception as exc:
+
+            self.connected = False
+            self.mcp_tools = []
+
+            self.log(
+                "❌ Falha ao conectar "
+                f"ao MCP: {exc}"
+            )
+
+            raise
 
     # ============================================================
     # PARSING MCP
@@ -761,6 +851,7 @@ class PlanAppAgentCommon:
                 "failed",
                 "failure",
             }:
+
                 return True
 
             if value.get("error"):
@@ -771,6 +862,7 @@ class PlanAppAgentCommon:
                 if self.contains_nested_error(
                     child
                 ):
+
                     return True
 
         elif isinstance(
@@ -783,6 +875,7 @@ class PlanAppAgentCommon:
                 if self.contains_nested_error(
                     child
                 ):
+
                     return True
 
         return False
@@ -946,23 +1039,6 @@ class PlanAppAgentCommon:
 
         # --------------------------------------------------------
         # PROTEÇÃO CONTRA DUPLICAÇÃO
-        #
-        # O LLM pode chamar geocode_place novamente para uma
-        # localidade já obtida.
-        #
-        # Não devemos transformar:
-        #
-        #   A, B
-        #
-        # em:
-        #
-        #   A, B, A, B
-        #
-        # A comparação é feita pelas coordenadas exatas
-        # retornadas pelo geocoder.
-        #
-        # Não usamos somente o nome porque o geocoder pode
-        # retornar nomes diferentes para o mesmo local.
         # --------------------------------------------------------
 
         for existing_point in self.geocoded_points:
@@ -1066,11 +1142,26 @@ class PlanAppAgentCommon:
         arguments,
     ):
 
-        if self.mcp_session is None:
+        """
+        Executa uma ferramenta MCP usando uma conexão temporária.
 
-            raise RuntimeError(
-                "Sessão MCP não conectada."
-            )
+        O ponto crítico desta implementação é:
+
+            async with streamable_http_client(...)
+                async with ClientSession(...)
+                    await session.call_tool(...)
+
+        A abertura e o fechamento do transporte acontecem na
+        MESMA task.
+
+        Não usamos mais AsyncExitStack persistente.
+
+        Isso elimina:
+
+            RuntimeError:
+            Attempted to exit cancel scope in a different task
+            than it was entered in
+        """
 
         self.tool_count += 1
 
@@ -1094,12 +1185,204 @@ class PlanAppAgentCommon:
 
         try:
 
-            result = await (
-                self.mcp_session.call_tool(
-                    tool_name,
-                    arguments or {},
-                )
-            )
+            async with streamable_http_client(
+                MCP_URL
+            ) as transport:
+
+                if len(transport) == 2:
+
+                    (
+                        read_stream,
+                        write_stream,
+                    ) = transport
+
+                else:
+
+                    (
+                        read_stream,
+                        write_stream,
+                        _,
+                    ) = transport
+
+                async with ClientSession(
+                    read_stream,
+                    write_stream,
+                ) as session:
+
+                    await session.initialize()
+
+                    # ------------------------------------------------
+                    # Mantemos a referência somente durante a
+                    # chamada. Ela nunca é utilizada depois do
+                    # contexto ser encerrado.
+                    # ------------------------------------------------
+
+                    self.mcp_session = session
+
+                    result = await session.call_tool(
+                        tool_name,
+                        arguments or {},
+                    )
+
+                    parsed = self.parse_mcp_result(
+                        result
+                    )
+
+                    mcp_error = self.is_mcp_error(
+                        result,
+                        parsed,
+                    )
+
+                    self.log_detail(
+                        "Resultado:"
+                    )
+
+                    self.log_detail(
+                        json.dumps(
+                            self.make_log_safe(
+                                parsed
+                            ),
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        )
+                    )
+
+                    if mcp_error:
+
+                        self.log_detail(
+                            "❌ MCP retornou erro."
+                        )
+
+                    # ------------------------------------------------
+                    # GEOCODE
+                    # ------------------------------------------------
+
+                    if tool_name == "geocode_place":
+
+                        if not mcp_error:
+
+                            before = len(
+                                self.geocoded_points
+                            )
+
+                            self.register_geocoded_point(
+                                parsed
+                            )
+
+                            after = len(
+                                self.geocoded_points
+                            )
+
+                            if (
+                                before < 2
+                                and after == 2
+                            ):
+
+                                try:
+
+                                    await (
+                                        self.mostrar_mapa_apos_geocodificacao()
+                                    )
+
+                                except Exception as exc:
+
+                                    self.log_detail(
+                                        "⚠️ Erro ao preparar "
+                                        f"mapa: {exc}"
+                                    )
+
+                        else:
+
+                            self.log(
+                                "❌ Falha na geocodificação."
+                            )
+
+                    # ------------------------------------------------
+                    # EVALUATE
+                    # ------------------------------------------------
+
+                    elif tool_name == "evaluate_link":
+
+                        self.evaluate_executed = True
+
+                        self.last_evaluate_result = (
+                            parsed
+                        )
+
+                        if mcp_error:
+
+                            self.evaluate_error = (
+                                parsed
+                            )
+
+                            self.log(
+                                "❌ A avaliação técnica "
+                                "retornou erro."
+                            )
+
+                            self.publish_technical_result(
+                                parsed
+                            )
+
+                        else:
+
+                            self.evaluate_error = None
+
+                            self.publish_technical_result(
+                                parsed
+                            )
+
+                            try:
+
+                                await (
+                                    self.gerar_visualizacoes()
+                                )
+
+                            except Exception as exc:
+
+                                self.log_detail(
+                                    "⚠️ Erro ao gerar "
+                                    f"visualizações: {exc}"
+                                )
+
+                            fspl = (
+                                self.summarize_evaluate(
+                                    parsed
+                                )
+                            )
+
+                            if fspl is not None:
+
+                                try:
+
+                                    self.log(
+                                        "📥 FSPL: "
+                                        f"{float(fspl):.2f}"
+                                    )
+
+                                except Exception:
+
+                                    self.log(
+                                        f"📥 FSPL: {fspl}"
+                                    )
+
+                            else:
+
+                                self.log(
+                                    "🟢 Avaliação técnica "
+                                    "concluída."
+                                )
+
+                    # ------------------------------------------------
+                    # PLANEJAMENTO
+                    #
+                    # planning_* não recebe tratamento especial
+                    # aqui. O resultado real do MCP é simplesmente
+                    # devolvido ao PlannerOrchestrator.
+                    # ------------------------------------------------
+
+                    return result
 
         except Exception as exc:
 
@@ -1142,157 +1425,13 @@ class PlanAppAgentCommon:
 
             return error_result
 
-        parsed = self.parse_mcp_result(
-            result
-        )
+        finally:
 
-        self.log_detail(
-            "Resultado:"
-        )
+            # --------------------------------------------------------
+            # Nunca mantemos uma ClientSession que já foi fechada.
+            # --------------------------------------------------------
 
-        self.log_detail(
-            json.dumps(
-                self.make_log_safe(
-                    parsed
-                ),
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            )
-        )
-
-        mcp_error = self.is_mcp_error(
-            result,
-            parsed,
-        )
-
-        if mcp_error:
-
-            self.log_detail(
-                "❌ MCP retornou erro."
-            )
-
-        # --------------------------------------------------------
-        # GEOCODE
-        # --------------------------------------------------------
-
-        if tool_name == "geocode_place":
-
-            if not mcp_error:
-
-                before = len(
-                    self.geocoded_points
-                )
-
-                self.register_geocoded_point(
-                    parsed
-                )
-
-                after = len(
-                    self.geocoded_points
-                )
-
-                if (
-                    before < 2
-                    and after == 2
-                ):
-
-                    try:
-
-                        await (
-                            self.mostrar_mapa_apos_geocodificacao()
-                        )
-
-                    except Exception as exc:
-
-                        self.log_detail(
-                            "⚠️ Erro ao preparar "
-                            f"mapa: {exc}"
-                        )
-
-            else:
-
-                self.log(
-                    "❌ Falha na geocodificação."
-                )
-
-        # --------------------------------------------------------
-        # EVALUATE
-        # --------------------------------------------------------
-
-        elif tool_name == "evaluate_link":
-
-            self.evaluate_executed = True
-
-            self.last_evaluate_result = (
-                parsed
-            )
-
-            if mcp_error:
-
-                self.evaluate_error = (
-                    parsed
-                )
-
-                self.log(
-                    "❌ A avaliação técnica "
-                    "retornou erro."
-                )
-
-                self.publish_technical_result(
-                    parsed
-                )
-
-            else:
-
-                self.evaluate_error = None
-
-                self.publish_technical_result(
-                    parsed
-                )
-
-                try:
-
-                    await (
-                        self.gerar_visualizacoes()
-                    )
-
-                except Exception as exc:
-
-                    self.log_detail(
-                        "⚠️ Erro ao gerar "
-                        f"visualizações: {exc}"
-                    )
-
-                fspl = (
-                    self.summarize_evaluate(
-                        parsed
-                    )
-                )
-
-                if fspl is not None:
-
-                    try:
-
-                        self.log(
-                            "📥 FSPL: "
-                            f"{float(fspl):.2f}"
-                        )
-
-                    except Exception:
-
-                        self.log(
-                            f"📥 FSPL: {fspl}"
-                        )
-
-                else:
-
-                    self.log(
-                        "🟢 Avaliação técnica "
-                        "concluída."
-                    )
-
-        return result
+            self.mcp_session = None
 
     # ============================================================
     # EXECUÇÃO MCP — PARSED
@@ -2420,36 +2559,40 @@ class PlanAppAgentCommon:
         self,
     ):
 
+        """
+        Fecha o recurso lógico do agente.
+
+        Não existe mais AsyncExitStack persistente para fechar.
+
+        As conexões MCP são abertas e fechadas dentro da própria
+        chamada execute_mcp_tool_raw().
+
+        Portanto, close() não tenta fechar uma sessão MCP criada
+        em outra task.
+        """
+
+        self.mcp_session = None
+
+        self.mcp_tools = []
+
+        self.connected = False
+
         try:
 
-            await (
-                self.exit_stack.aclose()
+            self.file_handler.flush()
+
+            self.file_handler.close()
+
+        except Exception:
+
+            pass
+
+        try:
+
+            self.logger.removeHandler(
+                self.file_handler
             )
 
-        finally:
+        except Exception:
 
-            self.mcp_session = None
-
-            self.mcp_tools = []
-
-            self.connected = False
-
-            try:
-
-                self.file_handler.flush()
-
-                self.file_handler.close()
-
-            except Exception:
-
-                pass
-
-            try:
-
-                self.logger.removeHandler(
-                    self.file_handler
-                )
-
-            except Exception:
-
-                pass
+            pass
