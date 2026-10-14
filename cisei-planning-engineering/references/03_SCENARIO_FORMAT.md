@@ -29,7 +29,7 @@ and should be introduced after this template/CSV model.
 
 ### `scenario`
 
-Optional. `working_crs` identifies the projected coordinate reference system,
+Required. `working_crs` identifies the projected coordinate reference system,
 for example `EPSG:31982`. Distance-based planning requires usable projected
 positions or a CRS from which positions can be resolved.
 

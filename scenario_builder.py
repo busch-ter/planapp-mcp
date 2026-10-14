@@ -125,7 +125,10 @@ class ScenarioBuilder:
         interfaces
         devices
         metrics
-        instances
+        instances (required): source, format, profile_column
+        net (optional; connectivity/candidate_edges)
+        sites (optional embedded concrete representation; does not replace
+              the required instances fields)
     """
 
     # ========================================================
@@ -139,12 +142,12 @@ class ScenarioBuilder:
         "devices",
         "metrics",
         "instances",
+        "net",
+        "sites",
     )
 
-    # ========================================================
-    # CAMPOS GLOBAIS OBRIGATÓRIOS
-    # ========================================================
-
+    # Campos obrigatórios do contrato POC-01.
+    # O Builder valida estes campos, mas nunca cria defaults.
     REQUIRED_FIELDS = (
         "scenario.working_crs",
         "instances.source",
@@ -167,30 +170,23 @@ class ScenarioBuilder:
     # ========================================================
 
     REQUIRED_SECTION_MAP = {
-        "antennas": (
-            "kind",
-            "model_id",
-            "description",
-            "height_m",
-            "azimuth_deg",
-            "downtilt_deg",
-        ),
+        # Antenna profile fields are optional according to the canonical
+        # contract. In particular model_id, azimuth_deg and downtilt_deg
+        # are not universally required. The SDK recognizes additional
+        # metadata and currently still recognizes the deprecated height_m.
+        "antennas": (),
         "interfaces": (
             "tech",
             "freq_mhz",
             "tx_power_dbm",
             "antenna_id",
-            "can_relay",
         ),
         "devices": (
-            "kind",
-            "connected",
-            "can_route",
             "interfaces",
         ),
-        "metrics": (
-            "spec",
-        ),
+        # Metric profiles may use a built-in spec, inline specification,
+        # or a local TOML source; do not require a literal `spec` key.
+        "metrics": (),
     }
 
     # ========================================================
@@ -335,39 +331,76 @@ class ScenarioBuilder:
         errors: list[str] = []
 
         # ====================================================
-        # CAMPOS GLOBAIS OBRIGATÓRIOS
+        # CONTRATO OBRIGATÓRIO: CENÁRIO E INSTÂNCIAS
         # ====================================================
 
-        for path in self.REQUIRED_FIELDS:
+        scenario = self.spec.get("scenario", {})
+        if not isinstance(scenario, dict):
+            errors.append("scenario must be a dictionary.")
+            scenario = {}
 
-            if self._get_path(
-                self.spec,
-                path,
-            ) is None:
-
-                missing.append(path)
-
-        # ====================================================
-        # COLEÇÕES OBRIGATÓRIAS
-        # ====================================================
-
-        for section in (
-            "antennas",
-            "interfaces",
-            "devices",
-            "metrics",
+        working_crs = scenario.get("working_crs")
+        if working_crs is None or (
+            isinstance(working_crs, str) and not working_crs.strip()
         ):
+            missing.append("scenario.working_crs")
+        elif not isinstance(working_crs, str):
+            errors.append("scenario.working_crs must be a non-empty string.")
 
+        instances = self.spec.get("instances", {})
+        if not isinstance(instances, dict):
+            errors.append("instances must be a dictionary.")
+            instances = {}
+
+        sites = self.spec.get("sites", [])
+        if sites is not None and not isinstance(sites, list):
+            errors.append("sites must be a list.")
+            sites = []
+
+        # Os campos abaixo são obrigatórios mesmo quando sites
+        # embutidos também são fornecidos.
+        source_value = instances.get("source")
+        if source_value is None or (
+            isinstance(source_value, str) and not source_value.strip()
+        ):
+            missing.append("instances.source")
+        elif not isinstance(source_value, str):
+            errors.append("instances.source must be a non-empty string.")
+
+        if "format" not in instances or instances.get("format") is None:
+            missing.append("instances.format")
+        elif instances["format"] != "csv":
+            errors.append("instances.format must currently be 'csv'.")
+
+        profile_column = instances.get("profile_column")
+        if profile_column is None or (
+            isinstance(profile_column, str) and not profile_column.strip()
+        ):
+            missing.append("instances.profile_column")
+        elif not isinstance(profile_column, str):
+            errors.append(
+                "instances.profile_column must be a non-empty string."
+            )
+
+        has_csv_instances = bool(instances)
+        has_embedded_sites = isinstance(sites, list) and bool(sites)
+
+        # ====================================================
+        # COLEÇÕES DE PERFIS
+        # ====================================================
+
+        # A representação CSV exige perfis reutilizáveis de antenas,
+        # interfaces e dispositivos. Sites embutidos podem conter dispositivos
+        # e interfaces concretos, dispensando os templates de interfaces e
+        # dispositivos. Em todos os modos, os quatro campos obrigatórios do
+        # contrato acima continuam sendo exigidos.
+        required_profile_sections = ["antennas", "metrics"]
+        if has_csv_instances or not has_embedded_sites:
+            required_profile_sections.extend(["interfaces", "devices"])
+        for section in required_profile_sections:
             value = self.spec.get(section)
-
-            if (
-                not isinstance(value, dict)
-                or not value
-            ):
-
-                missing.append(
-                    f"{section}.<at_least_one>"
-                )
+            if not isinstance(value, dict) or not value:
+                missing.append(f"{section}.<at_least_one>")
 
         # ====================================================
         # OBJETOS INTERNOS
@@ -425,6 +458,87 @@ class ScenarioBuilder:
                             f"{field_name}"
                         )
 
+        # `devices.<id>.interfaces` must be a non-empty list according
+        # to the canonical contract.
+        devices_for_shape = self.spec.get("devices", {})
+        if isinstance(devices_for_shape, dict):
+            for device_name, device in devices_for_shape.items():
+                if not isinstance(device, dict):
+                    continue
+                interface_ids = device.get("interfaces")
+                if isinstance(interface_ids, list) and not interface_ids:
+                    errors.append(f"devices.{device_name}.interfaces must be a non-empty list.")
+
+        # ====================================================
+        # NET RULES / EMBEDDED SITES
+        # ====================================================
+        net = self.spec.get("net", {})
+        if net is not None and not isinstance(net, dict):
+            errors.append("net must be a dictionary.")
+        elif isinstance(net, dict):
+            for key in ("connectivity", "candidate_edges"):
+                entries = net.get(key)
+                if entries is not None and not isinstance(entries, list):
+                    errors.append(f"net.{key} must be a list.")
+                    continue
+                if isinstance(entries, list):
+                    for index, entry in enumerate(entries):
+                        if not isinstance(entry, dict):
+                            errors.append(f"net.{key}[{index}] must be a dictionary.")
+                            continue
+                        if key == "connectivity":
+                            if entry.get("kind") == "rf" and not entry.get("tech"):
+                                missing.append(f"net.connectivity[{index}].tech")
+                        else:
+                            for required_edge_field in ("src", "dst"):
+                                if entry.get(required_edge_field) is None:
+                                    missing.append(f"net.candidate_edges[{index}].{required_edge_field}")
+
+        embedded_sites = self.spec.get("sites", [])
+        if isinstance(embedded_sites, list):
+            for index, site in enumerate(embedded_sites):
+                if not isinstance(site, dict):
+                    errors.append(f"sites[{index}] must be a dictionary.")
+                    continue
+                if not site.get("site_id"):
+                    missing.append(f"sites[{index}].site_id")
+                has_latlon = site.get("lat") is not None and site.get("lon") is not None
+                has_xy = site.get("x") is not None and site.get("y") is not None
+                if not (has_latlon or has_xy):
+                    missing.append(f"sites[{index}].(lat/lon or x/y)")
+                site_devices = site.get("devices", [])
+                if site_devices is not None and not isinstance(site_devices, list):
+                    errors.append(f"sites[{index}].devices must be a list when provided.")
+                    continue
+                for device_index, concrete_device in enumerate(site_devices or []):
+                    device_path = f"sites[{index}].devices[{device_index}]"
+                    if not isinstance(concrete_device, dict):
+                        errors.append(f"{device_path} must be a dictionary.")
+                        continue
+                    for field_name in ("device_id", "site_id"):
+                        if concrete_device.get(field_name) is None:
+                            missing.append(f"{device_path}.{field_name}")
+                    concrete_interfaces = concrete_device.get("interfaces", [])
+                    if not isinstance(concrete_interfaces, list):
+                        errors.append(f"{device_path}.interfaces must be a list when provided.")
+                        continue
+                    for interface_index, concrete_interface in enumerate(concrete_interfaces):
+                        interface_path = f"{device_path}.interfaces[{interface_index}]"
+                        if not isinstance(concrete_interface, dict):
+                            errors.append(f"{interface_path} must be a dictionary.")
+                            continue
+                        for field_name in ("interface_id", "device_id", "tech", "freq_mhz", "tx_power_dbm", "antenna_id"):
+                            if concrete_interface.get(field_name) is None:
+                                missing.append(f"{interface_path}.{field_name}")
+                        for field_name in ("freq_mhz", "tx_power_dbm"):
+                            self._check_number(concrete_interface.get(field_name), f"{interface_path}.{field_name}", errors)
+                        antenna_id = concrete_interface.get("antenna_id")
+                        if antenna_id is not None and antenna_id not in self.spec.get("antennas", {}):
+                            errors.append(f"{interface_path}.antenna_id references unknown antenna '{antenna_id}'.")
+                        # A correspondência entre tech e metrics é
+                        # validada centralmente após a construção das seções.
+                        # Não rejeitar interfaces durante a montagem incremental.
+
         # ====================================================
         # REGRAS CONDICIONAIS DE ANTENAS
         # ====================================================
@@ -464,18 +578,13 @@ class ScenarioBuilder:
                 #
                 # ------------------------------------------------
 
-                if kind == "sector":
-
-                    if (
-                        "beamwidth_deg" not in antenna
-                        or antenna["beamwidth_deg"] is None
-                    ):
-
-                        missing.append(
-                            f"antennas."
-                            f"{name}."
-                            f"beamwidth_deg"
-                        )
+                # The canonical schema recognizes beamwidth_deg but does
+                # not make it universally required. Fixed-sector orientation
+                # constraints belong to planner/domain validation.
+                if kind not in (None, "omni", "sector"):
+                    errors.append(
+                        f"antennas.{name}.kind must be 'omni' or 'sector' when provided."
+                    )
 
                 # ------------------------------------------------
                 # Omni
@@ -493,51 +602,8 @@ class ScenarioBuilder:
         # ====================================================
         # CRS
         # ====================================================
-
-        working_crs = (
-            self.spec
-            .get("scenario", {})
-            .get("working_crs")
-        )
-
-        if working_crs is not None:
-
-            if (
-                not isinstance(
-                    working_crs,
-                    str,
-                )
-                or not working_crs.strip()
-            ):
-
-                errors.append(
-                    "scenario.working_crs must be "
-                    "a non-empty string."
-                )
-
-        # ====================================================
-        # INSTANCES
-        # ====================================================
-
-        instances = self.spec.get(
-            "instances",
-            {},
-        )
-
-        if isinstance(
-            instances,
-            dict,
-        ):
-
-            if (
-                "format" in instances
-                and instances["format"] != "csv"
-            ):
-
-                errors.append(
-                    "instances.format must currently "
-                    "be 'csv' for POC-01."
-                )
+        # scenario.working_crs já é validado como obrigatório na seção
+        # CONTRATO OBRIGATÓRIO: CENÁRIO E INSTÂNCIAS.
 
         # ====================================================
         # REFERÊNCIAS
@@ -546,6 +612,24 @@ class ScenarioBuilder:
         self._validate_references(
             errors
         )
+
+        # Cada tecnologia usada por uma interface deve possuir uma
+        # entrada de métricas correspondente, conforme o contrato.
+        interfaces_for_metrics = self.spec.get("interfaces", {})
+        metrics_for_tech = self.spec.get("metrics", {})
+        if (
+            isinstance(interfaces_for_metrics, dict)
+            and isinstance(metrics_for_tech, dict)
+            and bool(metrics_for_tech)
+        ):
+            for interface_name, interface in interfaces_for_metrics.items():
+                if not isinstance(interface, dict):
+                    continue
+                tech = interface.get("tech")
+                if tech and tech not in metrics_for_tech:
+                    errors.append(
+                        f"interfaces.{interface_name}.tech '{tech}' has no matching metrics.{tech} entry."
+                    )
 
         # ====================================================
         # VALORES NUMÉRICOS
@@ -922,6 +1006,11 @@ class ScenarioBuilder:
                     f"antennas.{name}.height_m",
                     errors,
                 )
+                self._check_number(
+                    antenna.get("gain_dbi"),
+                    f"antennas.{name}.gain_dbi",
+                    errors,
+                )
 
                 self._check_number(
                     antenna.get(
@@ -1007,6 +1096,12 @@ class ScenarioBuilder:
                 ):
 
                     continue
+
+                self._check_number(
+                    device.get("mount_height_m"),
+                    f"devices.{name}.mount_height_m",
+                    errors,
+                )
 
                 # rank é opcional.
                 #
@@ -1181,6 +1276,37 @@ class ScenarioBuilder:
                 )
 
             lines.append("")
+
+        # ====================================================
+        # [net] — mantém connectivity e candidate_edges.
+        # Arrays de inline tables são TOML válido e preservam a
+        # mesma estrutura dict/list após o parse.
+        # ====================================================
+        net = spec.get("net", {})
+        if net:
+            if not isinstance(net, dict):
+                raise ValueError("net must be a dictionary for TOML generation.")
+            lines.append("[net]")
+            for key, value in net.items():
+                lines.append(f"{key} = {cls._toml_value(value)}")
+            lines.append("")
+
+        # ====================================================
+        # [[sites]] — representação concreta opcional embutida.
+        # Cada site é uma array-table TOML; campos aninhados, como
+        # devices/interfaces, são preservados como inline tables.
+        # ====================================================
+        sites = spec.get("sites", [])
+        if sites:
+            if not isinstance(sites, list):
+                raise ValueError("sites must be a list for TOML generation.")
+            for index, site in enumerate(sites):
+                if not isinstance(site, dict):
+                    raise ValueError(f"sites[{index}] must be a dictionary for TOML generation.")
+                lines.append("[[sites]]")
+                for key, value in site.items():
+                    lines.append(f"{key} = {cls._toml_value(value)}")
+                lines.append("")
 
         return (
             "\n".join(lines)
