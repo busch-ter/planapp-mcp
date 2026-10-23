@@ -22,6 +22,27 @@ MCP_PORT = 8010
 # SERVIDOR MCP
 # ============================================================
 
+
+# FIX_FEATURES_JSON_JOVYAN
+# Corrige proprietário e permissões após cada gravação do cache de features.
+import os as _features_os
+import cisei_planning_sdk.project as _features_project
+
+for _features_cls in vars(_features_project).values():
+    if isinstance(_features_cls, type) and callable(getattr(_features_cls, "save_features", None)):
+        _features_original = _features_cls.save_features
+        if not getattr(_features_original, "_jovyan_permissions_fix", False):
+            def _features_save_as_jovyan(self, document, _original=_features_original):
+                _path = _original(self, document)
+                _features_os.chown(_path, 1000, 100)
+                _features_os.chmod(_path, 0o664)
+                return _path
+            _features_save_as_jovyan._jovyan_permissions_fix = True
+            _features_cls.save_features = _features_save_as_jovyan
+        break
+else:
+    raise RuntimeError("Não foi encontrada a classe SDK com save_features().")
+
 mcp = MCPServer(
     name="PlanApp",
     version="1.0.0",
