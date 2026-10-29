@@ -1,4 +1,4 @@
-# ============================================================
+# ============================================================================
 # PLANAPP AI — OPENROUTER
 #
 # Arquitetura:
@@ -12,43 +12,45 @@
 #   geocode_place
 #      |
 #      v
-#   aplicação executa evaluate_link automaticamente
+#   APLICAÇÃO
 #      |
+#      +--> evaluate_link
 #      +--> mapa
-#      |
 #      +--> visualizações
-#      |
-#      +--> resposta final em português
-#      |
-#      v
-#   PlanApp MCP
+#      +--> relatório técnico
 #
-# ============================================================
+# IMPORTANTE:
+#
+#   O LLM NÃO executa evaluate_link.
+#   O LLM NÃO escolhe visualizações.
+#   A aplicação controla evaluate_link, mapa e visualizações.
+#
+# ============================================================================
 
 import asyncio
 import base64
 import json
 import os
 import re
-from contextlib import AsyncExitStack
-from datetime import datetime
-
-from openai import AsyncOpenAI
-
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
 
 import ipywidgets as widgets
 
-from ipyleaflet import Map, Marker, Polyline
+from openai import AsyncOpenAI
+
+from agent_common import (
+    PlanAppAgentCommon,
+    APPLICATION_CONTROLLED_TOOLS,
+)
+
+from report_generator import ReportGenerator
 
 
-# ============================================================
-# CONFIGURAÇÕES
-# ============================================================
+# ============================================================================
+# CONFIGURAÇÃO
+# ============================================================================
 
 MCP_URL = os.getenv(
-    "PLANAPP_MCP_URL",
+    "MCP_URL",
     "http://172.17.0.1:8010/mcp",
 )
 
@@ -64,59 +66,64 @@ OPENROUTER_MODEL = os.getenv(
 
 OPENROUTER_API_KEY = os.getenv(
     "OPENROUTER_API_KEY",
+    "",
 )
 
 USER_ID = os.getenv(
-    "PLANAPP_USER_ID",
+    "USER_ID",
     "jupyter-user",
 )
 
+DEFAULT_FREQ_MHZ = float(
+    os.getenv(
+        "DEFAULT_FREQ_MHZ",
+        "900",
+    )
+)
 
-# ============================================================
-# PARÂMETROS PADRÃO DO PLANAPP
-# ============================================================
+DEFAULT_TX_HA = float(
+    os.getenv(
+        "DEFAULT_TX_HA",
+        "7",
+    )
+)
 
-DEFAULT_FREQ_MHZ = 900
-DEFAULT_TX_HA = 7
-DEFAULT_RX_HA = 7
+DEFAULT_RX_HA = float(
+    os.getenv(
+        "DEFAULT_RX_HA",
+        "7",
+    )
+)
+
 DEFAULT_ON_ROOFTOP = False
-
 
 MAX_AGENT_ITERATIONS = 8
 
 
-# ============================================================
-# FERRAMENTAS CONTROLADAS PELA APLICAÇÃO
+# ============================================================================
+# FERRAMENTAS DISPONÍVEIS AO LLM
 #
-# O modelo NÃO executa estas ferramentas.
-# ============================================================
-
-APPLICATION_CONTROLLED_TOOLS = {
-    "register",
-    "evaluate_link",
-    "link_area",
-    "link_profile",
-    "lulc_fresnel",
-    "bldg_prepare",
-    "bldg_fresnel",
-    "bldg_profile",
-}
-
-
-# ============================================================
-# FERRAMENTAS QUE O MODELO PODE UTILIZAR
-# ============================================================
+# O LLM pode usar geocode_place.
+#
+# Ferramentas controladas pela aplicação ficam fora daqui.
+# ============================================================================
 
 MODEL_ALLOWED_TOOLS = {
     "geocode_place",
 }
 
 
-# ============================================================
+# ============================================================================
 # AGENTE
-# ============================================================
+# ============================================================================
 
-class PlanAppAgent:
+class PlanAppAgentOpenRouter(PlanAppAgentCommon):
+
+    AGENT_NAME = "PLANAPP AI — OPENROUTER"
+
+    # ========================================================================
+    # INIT
+    # ========================================================================
 
     def __init__(
         self,
@@ -126,442 +133,536 @@ class PlanAppAgent:
         result_callback=None,
         visualization_callback=None,
     ):
-        self.progress_callback = progress_callback
-        self.map_callback = map_callback
-        self.log_callback = log_callback
-        self.result_callback = result_callback
-        self.visualization_callback = visualization_callback
 
-        self.exit_stack = AsyncExitStack()
+        super().__init__(
+            progress_callback=progress_callback,
+            map_callback=map_callback,
+            log_callback=log_callback,
+            result_callback=result_callback,
+            visualization_callback=visualization_callback,
+        )
 
-        self.mcp_session = None
-        self.mcp_tools = []
-        self.connected = False
+        # --------------------------------------------------------------------
+        # ESTADO
+        # --------------------------------------------------------------------
 
-        self.messages = []
+        self.registered = False
 
-        self.geocoded_points = []
+        self.technical_context_added = False
 
-        self.evaluate_executed = False
-        self.last_evaluate_result = None
-        self.evaluate_error = None
+        self.last_agent_text = ""
 
-        self.visualizations = []
+        # Texto da análise técnica final produzida pelo OpenRouter.
+        #
+        # Esse texto pode ser utilizado pelo ReportGenerator como
+        # conteúdo principal do relatório.
+        self.technical_report = ""
+
+        self.user_request = ""
+
+        # ETAPA 2 — MULTI-HOP
+        self.multi_hop_requested = False
+        self.geocoding_followup_sent = False
+        self.visualizations_generated_hops = set()
+
+        self.report_pdf_path = None
+
+        # --------------------------------------------------------------------
+        # MAPA
+        # --------------------------------------------------------------------
 
         self.map = None
 
-        self.tool_count = 0
-        self.current_stage = 0
+        self.map_image_bytes = None
 
-        self.link_parameters = {
-            "freq_mhz": DEFAULT_FREQ_MHZ,
-            "tx_ha": DEFAULT_TX_HA,
-            "rx_ha": DEFAULT_RX_HA,
-            "on_rooftop": DEFAULT_ON_ROOFTOP,
-        }
+        # --------------------------------------------------------------------
+        # VISUALIZAÇÕES
+        # --------------------------------------------------------------------
 
-        # --------------------------------------------------------
-        # Parâmetros solicitados pelo usuário
-        # --------------------------------------------------------
+        self.visualizations = []
 
-        self.requested_frequency = None
-        self.requested_frequency_unit = None
-        self.requested_frequency_text = None
+        self.visualization_images = []
 
-        self.requested_tx_ha = None
-        self.requested_rx_ha = None
-
-
-        # --------------------------------------------------------
-        # Cliente OpenRouter
-        # --------------------------------------------------------
+        # --------------------------------------------------------------------
+        # OPENROUTER
+        # --------------------------------------------------------------------
 
         self.client = None
 
-        if OPENROUTER_API_KEY:
-            self.client = AsyncOpenAI(
-                api_key=OPENROUTER_API_KEY,
-                base_url=OPENROUTER_URL,
-                default_headers={
-                    "HTTP-Referer": "https://planapp.cisei.pucpr.br",
-                    "X-Title": "PlanApp AI",
-                },
+        # --------------------------------------------------------------------
+        # LOGGER
+        # --------------------------------------------------------------------
+
+        self._configure_logger()
+
+        self.logger.info(
+            "============================================================"
+        )
+
+        self.logger.info(
+            "PLANAPP AI — OPENROUTER"
+        )
+
+        self.logger.info(
+            f"Modelo: {OPENROUTER_MODEL}"
+        )
+
+        self.logger.info(
+            f"OpenRouter URL: {OPENROUTER_URL}"
+        )
+
+        self.logger.info(
+            f"MCP URL: {MCP_URL}"
+        )
+
+        self.logger.info(
+            f"USER_ID: {USER_ID}"
+        )
+
+        self.logger.info(
+            "============================================================"
+        )
+
+    # ========================================================================
+    # ETAPA 2 — DETECÇÃO DE SOLICITAÇÃO MULTI-HOP
+    # ========================================================================
+
+    def detect_multi_hop_request(
+        self,
+        text,
+    ):
+        """
+        Detecta se a solicitação do usuário aparenta descrever
+        uma rota com três ou mais pontos.
+
+        Esta função NÃO identifica as localidades.
+        A identificação das localidades continua sendo responsabilidade
+        do LLM através de geocode_place.
+        """
+
+        if not text:
+            return False
+
+        normalized = (
+            str(text)
+            .strip()
+            .lower()
+        )
+
+        explicit_patterns = [
+            r"\bmulti[\s-]?hop\b",
+            r"\bmulti[\s-]?enlace\b",
+            r"\bmulti[\s-]?link\b",
+            r"\bpor\s+.+\s+passando\s+por\b",
+            r"\bpassando\s+por\b",
+            r"\batrav[eé]s\s+de\b",
+            r"\bvia\b",
+            r"\brota\b",
+            r"\btrajeto\b",
+            r"\bsequ[eê]ncia\s+de\s+enlaces\b",
+            r"\bv[aá]rios\s+enlaces\b",
+            r"\bv[aá]rios\s+saltos\b",
+            r"\bsaltos\b",
+            r"\bhops?\b",
+        ]
+
+        for pattern in explicit_patterns:
+            if re.search(pattern, normalized):
+                return True
+
+        arrow_count = len(
+            re.findall(r"(?:->|→|⇒|⟶)", normalized)
+        )
+
+        if arrow_count >= 2:
+            return True
+
+        multi_point_patterns = [
+            r"\bentre\s+.+,\s*.+\s+e\s+.+",
+            r"\bentre\s+.+,\s*.+,\s*.+",
+            r"\bde\s+.+\s+até\s+.+\s+passando\s+por\s+.+",
+            r"\banalise\s+.+,\s*.+\s+e\s+.+",
+            r"\banalisar\s+.+,\s*.+\s+e\s+.+",
+            r"\bavalie\s+.+,\s*.+\s+e\s+.+",
+            r"\bavaliar\s+.+,\s*.+\s+e\s+.+",
+            r"\bfa[cç]a\s+(?:uma\s+)?an[aá]lise\b.+,\s*.+\s+e\s+.+",
+            r"\ban[aá]lise\s+(?:dos\s+enlaces\s+)?entre\s+.+,\s*.+\s+e\s+.+",
+            r"\banalis[ea]\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
+            r"\bavalie\s+.+\bentre\s+.+,\s*.+\s+e\s+.+",
+        ]
+
+        for pattern in multi_point_patterns:
+            if re.search(pattern, normalized):
+                return True
+
+        comma_count = normalized.count(",")
+
+        route_context = re.search(
+            r"\b("
+            r"analise|analisar|análise|avalie|avaliar|enlace|enlaces|"
+            r"link|links|rota|trajeto|pontos?|localidades?"
+            r")\b",
+            normalized,
+        )
+
+        if (
+            comma_count >= 2
+            and re.search(r"\be\b", normalized)
+            and route_context
+        ):
+            return True
+
+        # ------------------------------------------------------------
+        # Rotas descritas como sequência de transições
+        #
+        # Exemplos:
+        # "A e B, desse para C, desse para D e desse de volta para A"
+        # "A para B, de B para C, de C para D"
+        #
+        # Nessas formulações o usuário pode não usar a estrutura
+        # "A, B e C". A repetição de transições "para" / "desse para"
+        # junto com contexto de enlaces caracteriza multi-hop.
+        # ------------------------------------------------------------
+
+        transition_count = len(
+            re.findall(
+                r"\b(?:desse|dessa|deste|desta|de)\s+para\b",
+                normalized,
+            )
+        )
+
+        para_count = len(
+            re.findall(
+                r"\bpara\b",
+                normalized,
+            )
+        )
+
+        if (
+            transition_count >= 2
+            and re.search(
+                r"\b(enlace|enlaces|link|links|rota|trajeto)\b",
+                normalized,
+            )
+        ):
+            return True
+
+        if (
+            para_count >= 3
+            and re.search(
+                r"\b(enlace|enlaces|link|links|rota|trajeto|analise|análise|avaliar|avalie)\b",
+                normalized,
+            )
+        ):
+            return True
+
+        return False
+
+    # ========================================================================
+    # ETAPA 2 — DECISÃO DO TIPO DE AVALIAÇÃO
+    # ========================================================================
+
+    async def ensure_application_evaluation(
+        self,
+    ):
+        """
+        Decide qual avaliação deve ser executada pela aplicação.
+
+        2 pontos:
+            ensure_evaluate_link()
+
+        3+ pontos:
+            ensure_multi_hop_evaluation()
+
+        A função nunca transforma evaluate_link em super-tool.
+        """
+
+        point_count = len(
+            self.geocoded_points
+        )
+
+        # --------------------------------------------------------
+        # Proteção: três ou mais pontos significam multi-hop.
+        # --------------------------------------------------------
+
+        if (
+            point_count >= 3
+            and not self.multi_hop_requested
+        ):
+
+            self.multi_hop_requested = True
+
+            self.log_detail(
+                "🔗 Três ou mais pontos geocodificados; "
+                "solicitação promovida automaticamente "
+                "para multi-hop."
             )
 
+        # --------------------------------------------------------
+        # MULTI-HOP
+        # --------------------------------------------------------
 
-    # ============================================================
-    # STATUS
-    # ============================================================
+        if self.multi_hop_requested:
 
-    def log(self, message):
+            if point_count < 3:
 
-        if self.progress_callback:
+                self.log_detail(
+                    "⏳ Solicitação multi-hop detectada. "
+                    f"Aguardando pontos adicionais "
+                    f"(atualmente {point_count})."
+                )
 
-            try:
-                self.progress_callback(message)
+                return None
 
-            except Exception:
-                pass
+            if getattr(
+                self,
+                "multi_hop_executed",
+                False,
+            ):
 
+                return self.global_result
 
-    # ============================================================
-    # LOG TÉCNICO
-    # ============================================================
+            return await (
+                self.ensure_multi_hop_evaluation(
+                    route_points=self.geocoded_points,
+                    parameters=self.link_parameters,
+                )
+            )
 
-    def log_detail(self, message):
+        # --------------------------------------------------------
+        # ETAPA 1 — SINGLE LINK
+        # --------------------------------------------------------
 
-        if self.log_callback:
+        if point_count >= 2:
 
-            try:
-                self.log_callback(message)
+            if self.evaluate_executed:
 
-            except Exception:
-                pass
+                return self.last_evaluate_result
 
+            return await (
+                self.ensure_evaluate_link()
+            )
 
-    # ============================================================
-    # RESULTADO TÉCNICO
-    # ============================================================
-
-    def publish_technical_result(self, result):
-
-        if self.result_callback:
-
-            try:
-                self.result_callback(result)
-
-            except Exception:
-                pass
+        return None
 
 
-    # ============================================================
+    # ========================================================================
+    # LOGGER
+    # ========================================================================
+
+    def _configure_logger(self):
+
+        # O logger já é configurado pelo PlanAppAgentCommon.
+        pass
+
+    # ========================================================================
     # SYSTEM PROMPT
-    # ============================================================
+    # ========================================================================
 
     def system_prompt(self):
 
         return """
-Você é o analista técnico do PlanApp AI.
+Você é o PlanApp AI, assistente técnico especializado em
+planejamento e avaliação de enlaces de rádio.
 
-Sua tarefa é produzir uma análise técnica clara, útil e objetiva do enlace avaliado pelo PlanApp, usando exclusivamente os dados retornados pela aplicação como fonte de verdade.
+O PlanApp é a fonte oficial dos resultados técnicos.
 
-REGRA PRINCIPAL:
-Interprete o que é claramente sustentado pelos dados, mas não invente critérios, unidades, limites, fórmulas, margens ou conclusões que não estejam disponíveis nos resultados do PlanApp.
+Seu papel é interpretar tecnicamente os dados retornados pelo
+PlanApp sem inventar informações que não estejam presentes.
 
-A resposta deve:
+REGRAS FUNDAMENTAIS:
 
-1. Identificar os dois pontos do enlace e informar as coordenadas obtidas pelo geocoder quando disponíveis.
+1. Nunca invente valores.
 
-2. Informar os parâmetros efetivamente utilizados na avaliação:
+2. Nunca invente unidades.
 
-   * frequência;
-   * altura da antena TX;
-   * altura da antena RX;
-   * condição de instalação em telhado.
+3. Nunca altere resultados retornados pelo PlanApp.
 
-3. Apresentar os principais resultados técnicos retornados pelo PlanApp, priorizando:
+4. Não recalcule valores técnicos quando o PlanApp já os forneceu.
 
-   * distância;
-   * FSPL;
-   * delta de difração;
-   * informações de terreno;
-   * informações de vegetação;
-   * informações de edificações;
-   * picos de terreno;
-   * ângulos;
-   * clearances.
+5. Quando o usuário fornecer duas localidades, utilize
+   geocode_place para obter suas coordenadas.
 
-4. Fazer uma interpretação técnica dos dados quando ela for diretamente sustentada pelos próprios valores.
+6. Depois de obtidos os dois pontos, a aplicação executará
+   automaticamente evaluate_link.
 
-   Exemplos de interpretações permitidas:
+7. NÃO execute evaluate_link diretamente.
 
-   * informar que o enlace possui aproximadamente determinada distância;
-   * destacar que determinados indicadores possuem valores não nulos;
-   * destacar que determinados indicadores são zero;
-   * comparar os valores TX e RX;
-   * apontar quais elementos aparecem nos resultados do perfil;
-   * destacar valores particularmente relevantes ou extremos dentro dos próprios dados;
-   * relacionar informações diretamente evidentes entre os campos retornados.
+8. evaluate_link é controlado pela aplicação.
 
-5. NÃO atribuir significado técnico específico a campos cuja definição não esteja disponível nos dados fornecidos.
+9. Mapa e visualizações também são controlados pela aplicação.
 
-   Por exemplo, não afirmar que "core", "fresnel", "boundary", "v_v" ou "d_norm" representam determinada grandeza física específica se isso não estiver explicitamente definido pelo PlanApp.
+10. Não peça ao usuário para executar ferramentas.
 
-6. NÃO inventar unidades.
+11. Preserve frequência, TX, RX e rooftop solicitados.
 
-   Se o PlanApp fornecer um valor sem unidade, apresente o valor sem acrescentar uma unidade por conta própria.
+12. Frequências podem ser informadas em GHz, MHz, kHz ou Hz.
 
-7. NÃO inventar critérios de engenharia.
+13. Padrões:
 
-   Não afirmar que um valor é "bom", "ruim", "aceitável", "crítico", "seguro", "insuficiente" ou semelhante sem que exista no contexto um critério explícito para essa avaliação.
+       900 MHz
+       TX 7 m
+       RX 7 m
+       rooftop=false
 
-8. NÃO transformar o status "OK" em uma conclusão de engenharia.
+14. FSPL significa perda de percurso em espaço livre.
 
-   "OK" significa que a avaliação foi executada com sucesso. Não significa, por si só, que o enlace seja viável, aprovado ou tenha margem adequada.
+15. FSPL não significa interferência.
 
-9. Quando os dados permitirem uma observação técnica objetiva, FAÇA essa observação. Não se limite a simplesmente copiar os valores em formato de lista.
+16. Não conclua viabilidade do enlace sem um critério técnico
+    explícito e sustentado pelos dados disponíveis.
 
-10. Organize a resposta de forma natural, utilizando títulos e listas apenas quando ajudarem a compreensão.
+17. Não invente potência TX.
 
-11. Evite linguagem burocrática ou frases como:
+18. Não invente ganho de antena.
 
-* "Todos os valores foram apresentados exatamente como fornecidos";
-* "Não foi realizada nenhuma interpretação";
-* "Não é possível fazer qualquer conclusão".
+19. Não invente sensibilidade do receptor.
 
-12. A resposta deve ser escrita em português do Brasil.
+20. Não invente margem de enlace.
 
-13. Seja conciso, mas tecnicamente informativo. O objetivo é que o usuário compreenda o que aconteceu no enlace sem precisar interpretar sozinho todos os números.
+21. Não atribua significado físico a campos cuja definição não
+    esteja explicitamente documentada pelo PlanApp.
 
-14. Termine, quando apropriado, indicando quais aspectos merecem atenção na análise, mas sem declarar aprovação ou reprovação do enlace caso os critérios necessários não estejam disponíveis.
+22. Não atribua significado próprio a:
 
-DADOS DO PLANAPP:
-Use exclusivamente os resultados técnicos, parâmetros e coordenadas fornecidos pela aplicação nesta execução como base factual da análise.
+       core
+       fresnel
+       boundary
+       delta_diffra
+       VV
+       v_v
+       d_norm
+
+23. Não converta radianos para graus.
+
+24. status=OK significa somente que a operação foi executada
+    com sucesso.
+
+25. O resultado fornecido pela aplicação é a fonte de verdade.
+
+26. O relatório técnico fornecido pela aplicação, quando existir,
+    é apenas uma apresentação estruturada dos dados reais do
+    PlanApp.
+
+27. Não altere, recalcule ou contradiga os valores presentes
+    nos resultados do PlanApp.
+
+28. Diferencie claramente:
+
+       - parâmetros solicitados pelo usuário;
+       - parâmetros efetivamente utilizados;
+       - resultados retornados pelo PlanApp;
+       - interpretação técnica;
+       - limitações da análise.
+
+29. Se um campo técnico não tiver definição explícita, apresente
+    o valor somente como resultado retornado pelo PlanApp,
+    sem atribuir significado adicional.
+
+30. A resposta técnica NÃO deve ser apenas uma reprodução
+    do JSON.
+
+31. Organize os resultados em seções claras.
+
+32. Faça uma síntese objetiva dos resultados efetivamente
+    retornados.
+
+33. Pode comparar numericamente valores que já foram retornados
+    pelo PlanApp.
+
+34. Pode destacar diferenças entre parâmetros solicitados e
+    parâmetros efetivamente utilizados.
+
+35. Pode destacar distância, FSPL, delta_diffra, resultados
+    de terreno, vegetação, edificações e resultados geométricos
+    quando esses valores estiverem presentes.
+
+36. Ao apresentar conjuntos como terreno, vegetação ou
+    edificações, deixe claro que são resultados retornados
+    pelo PlanApp.
+
+37. Não atribua interpretação física adicional aos nomes dos
+    campos quando sua definição não estiver documentada.
+
+38. Informe quais etapas foram efetivamente executadas quando
+    essa informação estiver disponível.
+
+39. Diferencie claramente dados fornecidos pelo usuário,
+    parâmetros utilizados, resultados calculados e limitações.
+
+40. Não declare o enlace como viável ou inviável sem um
+    critério técnico explícito.
+
+41. Não invente uma margem, limiar, classificação ou conclusão
+    de engenharia que não esteja presente nos dados.
+
+42. A resposta final deve ser em português do Brasil.
+
+43. Seja técnico, claro, objetivo e informativo.
+
+44. Prefira uma análise estruturada a uma simples listagem
+    de campos.
+
+45. A análise deve considerar conjuntamente os dados disponíveis
+    de propagação, geometria, terreno, vegetação, edificações
+    e demais resultados fornecidos pelo PlanApp.
+
+46. Não trate um único indicador isoladamente como suficiente
+    para determinar a qualidade do enlace.
+
+47. Quando houver dados suficientes e um critério técnico
+    documentado pelo PlanApp, apresente claramente a conclusão
+    correspondente.
+
+48. Quando não houver critério suficiente para uma conclusão de
+    viabilidade, declare explicitamente essa limitação.
+
+49. Sugestões de alteração de frequência, altura de antena,
+    posicionamento ou outras alternativas devem ser apresentadas
+    como sugestões, e não como soluções comprovadas.
+
+50. Não diga que uma alternativa resolve o problema se ela não
+    tiver sido efetivamente testada pelo PlanApp.
+
+51. Diferencie claramente:
+
+       - alternativa sugerida;
+       - alternativa efetivamente testada pelo PlanApp.
+
+52. A análise deve procurar relações entre os diferentes
+    resultados retornados, mas sem inventar significado para
+    campos cuja semântica não esteja documentada.
 """
 
+    # ========================================================================
+    # CRIA CLIENTE OPENROUTER
+    # ========================================================================
 
-    # ============================================================
-    # EXTRAÇÃO DOS PARÂMETROS
-    # ============================================================
+    async def create_client(self):
 
-    def extract_link_parameters(self, text):
+        if not OPENROUTER_API_KEY:
 
-        parameters = {
-            "freq_mhz": DEFAULT_FREQ_MHZ,
-            "tx_ha": DEFAULT_TX_HA,
-            "rx_ha": DEFAULT_RX_HA,
-            "on_rooftop": DEFAULT_ON_ROOFTOP,
-        }
-
-        self.requested_frequency = None
-        self.requested_frequency_unit = None
-        self.requested_frequency_text = None
-
-        self.requested_tx_ha = None
-        self.requested_rx_ha = None
-
-
-        # --------------------------------------------------------
-        # Frequência
-        # --------------------------------------------------------
-
-        freq_pattern = re.compile(
-            r"(\d+(?:[.,]\d+)?)\s*"
-            r"(ghz|mhz|khz|hz)\b",
-            re.IGNORECASE,
-        )
-
-        freq_match = freq_pattern.search(text)
-
-        if freq_match:
-
-            value_text = freq_match.group(1)
-
-            unit = freq_match.group(2).lower()
-
-            value = float(
-                value_text.replace(",", ".")
+            raise RuntimeError(
+                "OPENROUTER_API_KEY não está configurada."
             )
 
-            self.requested_frequency = value
-            self.requested_frequency_unit = unit
-            self.requested_frequency_text = freq_match.group(0)
-
-            if unit == "ghz":
-
-                parameters["freq_mhz"] = value * 1000.0
-
-            elif unit == "mhz":
-
-                parameters["freq_mhz"] = value
-
-            elif unit == "khz":
-
-                parameters["freq_mhz"] = value / 1000.0
-
-            elif unit == "hz":
-
-                parameters["freq_mhz"] = value / 1_000_000.0
-
-
-        # --------------------------------------------------------
-        # Duas antenas com mesma altura
-        # --------------------------------------------------------
-
-        same_height_patterns = [
-
-            r"duas\s+antenas?\s+de\s+"
-            r"(\d+(?:[.,]\d+)?)\s*(?:m|metros?)",
-
-            r"antenas?\s+de\s+"
-            r"(\d+(?:[.,]\d+)?)\s*(?:m|metros?)",
-        ]
-
-        same_height_match = None
-
-        for pattern in same_height_patterns:
-
-            same_height_match = re.search(
-                pattern,
-                text,
-                re.IGNORECASE,
-            )
-
-            if same_height_match:
-                break
-
-
-        if same_height_match:
-
-            height = float(
-                same_height_match.group(1)
-                .replace(",", ".")
-            )
-
-            parameters["tx_ha"] = height
-            parameters["rx_ha"] = height
-
-            self.requested_tx_ha = height
-            self.requested_rx_ha = height
-
-        else:
-
-            # ----------------------------------------------------
-            # TX separado
-            # ----------------------------------------------------
-
-            tx_match = re.search(
-                r"(?:tx|transmissora?|transmissor)"
-                r".{0,30}?"
-                r"(\d+(?:[.,]\d+)?)\s*(?:m|metros?)",
-                text,
-                re.IGNORECASE,
-            )
-
-            # ----------------------------------------------------
-            # RX separado
-            # ----------------------------------------------------
-
-            rx_match = re.search(
-                r"(?:rx|receptora?|receptor)"
-                r".{0,30}?"
-                r"(\d+(?:[.,]\d+)?)\s*(?:m|metros?)",
-                text,
-                re.IGNORECASE,
-            )
-
-
-            if tx_match:
-
-                height = float(
-                    tx_match.group(1)
-                    .replace(",", ".")
-                )
-
-                parameters["tx_ha"] = height
-                self.requested_tx_ha = height
-
-
-            if rx_match:
-
-                height = float(
-                    rx_match.group(1)
-                    .replace(",", ".")
-                )
-
-                parameters["rx_ha"] = height
-                self.requested_rx_ha = height
-
-
-        # --------------------------------------------------------
-        # Rooftop
-        # --------------------------------------------------------
-
-        rooftop_patterns = [
-
-            r"\bno\s+telhado\b",
-
-            r"\bem\s+cima\s+do\s+telhado\b",
-
-            r"\bsobre\s+o\s+telhado\b",
-
-            r"\brooftop\b",
-        ]
-
-        for pattern in rooftop_patterns:
-
-            if re.search(
-                pattern,
-                text,
-                re.IGNORECASE,
-            ):
-
-                parameters["on_rooftop"] = True
-
-                break
-
-
-        self.link_parameters = parameters
-
-        return parameters
-
-
-    # ============================================================
-    # CONEXÃO MCP
-    # ============================================================
-
-    async def connect(self):
-
-        self.log(
-            "🔌 Conectando ao PlanApp MCP..."
-        )
-
-        transport = await (
-            self.exit_stack.enter_async_context(
-                streamable_http_client(MCP_URL)
-            )
-        )
-
-        read_stream, write_stream = transport
-
-        self.mcp_session = await (
-            self.exit_stack.enter_async_context(
-                ClientSession(
-                    read_stream,
-                    write_stream,
-                )
-            )
-        )
-
-        await self.mcp_session.initialize()
-
-        tools_result = await (
-            self.mcp_session.list_tools()
-        )
-
-        self.mcp_tools = tools_result.tools
-
-        self.connected = True
-
-        self.log(
-            f"🟢 MCP conectado — "
-            f"{len(self.mcp_tools)} ferramentas disponíveis."
+        self.client = AsyncOpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url=OPENROUTER_URL,
+            default_headers={
+                "HTTP-Referer": "https://planapp.pucpr.br",
+                "X-Title": "PlanApp AI",
+            },
         )
 
         self.log_detail(
-            "Ferramentas MCP disponíveis:"
+            f"OpenRouter client criado — "
+            f"modelo: {OPENROUTER_MODEL}"
         )
 
-        for tool in self.mcp_tools:
-
-            self.log_detail(
-                f"  - {tool.name}"
-            )
-
-
-    # ============================================================
-    # TOOLS PARA OPENROUTER
-    # ============================================================
+    # ========================================================================
+    # CONSTRÓI TOOLS PARA OPENROUTER
+    # ========================================================================
 
     def build_openrouter_tools(self):
 
@@ -569,12 +670,32 @@ Use exclusivamente os resultados técnicos, parâmetros e coordenadas fornecidos
 
         for tool in self.mcp_tools:
 
-            if tool.name not in MODEL_ALLOWED_TOOLS:
+            name = getattr(
+                tool,
+                "name",
+                None,
+            )
+
+            if not name:
+                continue
+
+            # ---------------------------------------------------------------
+            # SOMENTE FERRAMENTAS PERMITIDAS AO LLM
+            # ---------------------------------------------------------------
+
+            if name not in MODEL_ALLOWED_TOOLS:
+                continue
+
+            # ---------------------------------------------------------------
+            # SEGURANÇA EXTRA
+            # ---------------------------------------------------------------
+
+            if name in APPLICATION_CONTROLLED_TOOLS:
                 continue
 
             schema = getattr(
                 tool,
-                "inputSchema",
+                "input_schema",
                 None,
             )
 
@@ -582,1524 +703,224 @@ Use exclusivamente os resultados técnicos, parâmetros e coordenadas fornecidos
 
                 schema = getattr(
                     tool,
-                    "input_schema",
+                    "inputSchema",
                     None,
                 )
+
+            if schema is None:
+
+                schema = {
+                    "type": "object",
+                    "properties": {},
+                }
+
+            description = getattr(
+                tool,
+                "description",
+                "",
+            )
 
             tools.append(
                 {
                     "type": "function",
                     "function": {
-                        "name": tool.name,
+                        "name": name,
                         "description": (
-                            getattr(
-                                tool,
-                                "description",
-                                None,
-                            )
-                            or ""
+                            description or ""
                         ),
-                        "parameters": schema or {
-                            "type": "object",
-                            "properties": {},
-                        },
+                        "parameters": schema,
                     },
                 }
             )
 
         return tools
 
-
-    # ============================================================
-    # RESULTADO MCP
-    # ============================================================
-
-    def parse_mcp_result(self, result):
-
-        # --------------------------------------------------------
-        # Conteúdo estruturado
-        # --------------------------------------------------------
-
-        structured = getattr(
-            result,
-            "structuredContent",
-            None,
-        )
-
-        if structured is None:
-
-            structured = getattr(
-                result,
-                "structured_content",
-                None,
-            )
-
-        if structured is not None:
-
-            return structured
-
-
-        # --------------------------------------------------------
-        # Conteúdo textual
-        # --------------------------------------------------------
-
-        content = getattr(
-            result,
-            "content",
-            None,
-        )
-
-        if content:
-
-            parsed_items = []
-
-            for item in content:
-
-                text = getattr(
-                    item,
-                    "text",
-                    None,
-                )
-
-                if text is None:
-                    continue
-
-                try:
-
-                    parsed_items.append(
-                        json.loads(text)
-                    )
-
-                except Exception:
-
-                    parsed_items.append(
-                        text
-                    )
-
-
-            if len(parsed_items) == 1:
-
-                return parsed_items[0]
-
-
-            if parsed_items:
-
-                return parsed_items
-
-
-        return result
-
-
-    # ============================================================
-    # ERRO MCP
-    # ============================================================
-
-    def contains_nested_error(self, value):
-
-        if isinstance(value, dict):
-
-            status = str(
-                value.get(
-                    "status",
-                    "",
-                )
-            ).lower()
-
-            if status in {
-                "error",
-                "failed",
-                "failure",
-            }:
-
-                return True
-
-
-            if value.get("error"):
-
-                return True
-
-
-            for child in value.values():
-
-                if self.contains_nested_error(child):
-
-                    return True
-
-
-        elif isinstance(value, list):
-
-            for child in value:
-
-                if self.contains_nested_error(child):
-
-                    return True
-
-
-        return False
-
-
-    def is_mcp_error(
-        self,
-        result,
-        parsed,
-    ):
-
-        is_error = getattr(
-            result,
-            "isError",
-            None,
-        )
-
-        if is_error is None:
-
-            is_error = getattr(
-                result,
-                "is_error",
-                False,
-            )
-
-        if is_error:
-
-            return True
-
-        return self.contains_nested_error(
-            parsed
-        )
-
-
-    # ============================================================
-    # LOG SEGURO
-    # ============================================================
-
-    def make_log_safe(self, value):
-
-        if isinstance(value, dict):
-
-            safe = {}
-
-            for key, child in value.items():
-
-                if (
-                    key == "data"
-                    and isinstance(child, str)
-                    and value.get("kind") == "image"
-                ):
-
-                    safe[key] = (
-                        "<base64 image: "
-                        f"{len(child)} chars>"
-                    )
-
-                else:
-
-                    safe[key] = (
-                        self.make_log_safe(child)
-                    )
-
-            return safe
-
-
-        if isinstance(value, list):
-
-            return [
-                self.make_log_safe(child)
-                for child in value
-            ]
-
-
-        return value
-
-
-    # ============================================================
-    # EXTRAÇÃO DE IMAGENS DOS RESULTADOS MCP
-    #
-    # Importante:
-    # Não transformar ImageContent em texto.
-    # ============================================================
-
-    def extract_images_from_mcp_result(
-        self,
-        raw_result,
-        parsed_result,
-    ):
-
-        images = []
-
-
-        # --------------------------------------------------------
-        # Procura ImageContent diretamente no content do MCP
-        # --------------------------------------------------------
-
-        content = getattr(
-            raw_result,
-            "content",
-            None,
-        )
-
-        if content:
-
-            for item in content:
-
-                item_type = getattr(
-                    item,
-                    "type",
-                    None,
-                )
-
-                data = getattr(
-                    item,
-                    "data",
-                    None,
-                )
-
-                mime_type = getattr(
-                    item,
-                    "mimeType",
-                    None,
-                )
-
-                if (
-                    item_type == "image"
-                    and data
-                ):
-
-                    images.append(
-                        {
-                            "kind": "image",
-                            "encoding": "base64",
-                            "data": data,
-                            "mimeType": (
-                                mime_type
-                                or "image/png"
-                            ),
-                            "type": "image",
-                        }
-                    )
-
-
-        # --------------------------------------------------------
-        # Alguns resultados podem chegar como JSON estruturado
-        # --------------------------------------------------------
-
-        def recursive_extract(value):
-
-            if isinstance(value, dict):
-
-                kind = value.get(
-                    "kind"
-                )
-
-                data = value.get(
-                    "data"
-                )
-
-                if (
-                    kind == "image"
-                    and isinstance(data, str)
-                    and data
-                ):
-
-                    images.append(
-                        {
-                            "kind": "image",
-                            "encoding": (
-                                value.get(
-                                    "encoding",
-                                    "base64",
-                                )
-                            ),
-                            "data": data,
-                            "mimeType": (
-                                value.get(
-                                    "mimeType",
-                                    "image/png",
-                                )
-                            ),
-                            "type": "image",
-                        }
-                    )
-
-                    return
-
-
-                for child in value.values():
-
-                    recursive_extract(child)
-
-
-            elif isinstance(value, list):
-
-                for child in value:
-
-                    recursive_extract(child)
-
-
-        recursive_extract(
-            parsed_result
-        )
-
-
-        # --------------------------------------------------------
-        # Remove duplicatas
-        # --------------------------------------------------------
-
-        unique = []
-
-        seen = set()
-
-        for image in images:
-
-            key = (
-                image.get("data"),
-                image.get("mimeType"),
-            )
-
-            if key in seen:
-                continue
-
-            seen.add(key)
-
-            unique.append(image)
-
-
-        return unique
-
-
-    # ============================================================
-    # MAPA
-    # ============================================================
-
-    async def mostrar_mapa_apos_geocodificacao(
-        self
-    ):
-
-        if len(self.geocoded_points) < 2:
-            return
-
-
-        self.log(
-            "🗺️ Preparando enlace no mapa..."
-        )
-
-
-        try:
-
-            p1 = self.geocoded_points[0]
-            p2 = self.geocoded_points[1]
-
-
-            center_lat = (
-                p1["lat"] + p2["lat"]
-            ) / 2.0
-
-            center_lon = (
-                p1["lon"] + p2["lon"]
-            ) / 2.0
-
-
-            mapa = Map(
-                center=(
-                    center_lat,
-                    center_lon,
-                ),
-                zoom=14,
-                scroll_wheel_zoom=True,
-            )
-
-
-            marker_tx = Marker(
-                location=(
-                    p1["lat"],
-                    p1["lon"],
-                ),
-                title=(
-                    p1.get("name")
-                    or "TX"
-                ),
-            )
-
-
-            marker_rx = Marker(
-                location=(
-                    p2["lat"],
-                    p2["lon"],
-                ),
-                title=(
-                    p2.get("name")
-                    or "RX"
-                ),
-            )
-
-
-            linha = Polyline(
-                locations=[
-                    (
-                        p1["lat"],
-                        p1["lon"],
-                    ),
-                    (
-                        p2["lat"],
-                        p2["lon"],
-                    ),
-                ],
-                weight=4,
-            )
-
-
-            mapa.add_layer(
-                marker_tx
-            )
-
-            mapa.add_layer(
-                marker_rx
-            )
-
-            mapa.add_layer(
-                linha
-            )
-
-
-            self.map = mapa
-
-
-            if self.map_callback:
-
-                try:
-
-                    self.map_callback(
-                        self.map
-                    )
-
-                except Exception as exc:
-
-                    self.log(
-                        "⚠️ Erro ao atualizar mapa: "
-                        f"{exc}"
-                    )
-
-
-            self.log(
-                "🟢 Mapa preparado."
-            )
-
-
-        except Exception as exc:
-
-            self.log(
-                "❌ Erro ao preparar mapa: "
-                f"{exc}"
-            )
-
-            self.log_detail(
-                f"Erro detalhado ao preparar mapa: "
-                f"{exc}"
-            )
-
-
-    # ============================================================
-    # GEOCODE SUMMARY
-    # ============================================================
-
-    def summarize_geocode(
-        self,
-        parsed,
-    ):
-
-        if not isinstance(
-            parsed,
-            dict,
-        ):
-
-            return None
-
-
-        results = parsed.get(
-            "results"
-        )
-
-        if not results:
-            return None
-
-
-        first = results[0]
-
-        if not isinstance(
-            first,
-            dict,
-        ):
-
-            return None
-
-
-        lat = first.get(
-            "lat"
-        )
-
-        lon = first.get(
-            "lon"
-        )
-
-
-        if lat is None or lon is None:
-
-            return None
-
-
-        return {
-            "name": first.get(
-                "name"
-            ),
-            "lat": float(lat),
-            "lon": float(lon),
-        }
-
-
-    # ============================================================
-    # REGISTRA PONTO GEOCODIFICADO
-    # ============================================================
-
-    def register_geocoded_point(
-        self,
-        parsed,
-    ):
-
-        point = self.summarize_geocode(
-            parsed
-        )
-
-
-        if point is None:
-
-            self.log(
-                "⚠️ Não foi possível extrair "
-                "coordenadas do resultado da geocodificação."
-            )
-
-            return
-
-
-        self.geocoded_points.append(
-            point
-        )
-
-
-        self.log(
-            "📍 "
-            f"{point['name']} — "
-            f"{point['lat']:.6f}, "
-            f"{point['lon']:.6f}"
-        )
-
-
-    # ============================================================
-    # RESUMO EVALUATE
-    # ============================================================
-
-    def summarize_evaluate(
-        self,
-        parsed,
-    ):
-
-        if not isinstance(
-            parsed,
-            dict,
-        ):
-
-            return None
-
-
-        if "fspl" in parsed:
-
-            return parsed["fspl"]
-
-
-        technical = parsed.get(
-            "technical"
-        )
-
-        if isinstance(
-            technical,
-            dict,
-        ):
-
-            if "fspl" in technical:
-
-                return technical["fspl"]
-
-
-        data = parsed.get(
-            "data"
-        )
-
-        if isinstance(
-            data,
-            dict,
-        ):
-
-            if "fspl" in data:
-
-                return data["fspl"]
-
-
-        return None
-
-
-    # ============================================================
-    # VISUALIZAÇÕES AUTOMÁTICAS
-    # ============================================================
-
-    async def gerar_visualizacoes(
-        self
-    ):
-
-        if not self.evaluate_executed:
-            return
-
-
-        if self.evaluate_error is not None:
-            return
-
-
-        if self.mcp_session is None:
-
-            self.log_detail(
-                "⚠️ Não é possível gerar visualizações: "
-                "sessão MCP inexistente."
-            )
-
-            return
-
-
-        self.log(
-            "📊 Gerando visualizações do enlace..."
-        )
-
-
-        self.visualizations = []
-
-
-        # --------------------------------------------------------
-        # IMPORTANTE:
-        # O modelo NÃO escolhe essas ferramentas.
-        #
-        # Os parâmetros abaixo correspondem aos schemas reais.
-        #
-        # link_area exige ds_string.
-        # --------------------------------------------------------
-
-        etapas = [
-
-            (
-                "DTM",
-                "link_area",
-                {
-                    "ds_string": "DTM",
-                },
-            ),
-
-            (
-                "DSM",
-                "link_area",
-                {
-                    "ds_string": "DSM",
-                },
-            ),
-
-            (
-                "COVER",
-                "link_area",
-                {
-                    "ds_string": "COVER",
-                },
-            ),
-
-            (
-                "Perfil do enlace",
-                "link_profile",
-                {},
-            ),
-
-            (
-                "LULC / Fresnel",
-                "lulc_fresnel",
-                {},
-            ),
-
-            (
-                "Preparação das edificações",
-                "bldg_prepare",
-                {},
-            ),
-
-            (
-                "Edificações / Fresnel",
-                "bldg_fresnel",
-                {},
-            ),
-
-            (
-                "Edificações / Perfil",
-                "bldg_profile",
-                {},
-            ),
-        ]
-
-
-        for titulo, tool_name, arguments in etapas:
-
-            self.log_detail("")
-
-            self.log_detail(
-                f"📊 Visualização: {titulo}"
-            )
-
-
-            try:
-
-                raw_result = (
-                    await self.execute_mcp_tool_raw(
-                        tool_name,
-                        arguments,
-                    )
-                )
-
-
-            except Exception as exc:
-
-                self.log_detail(
-                    f"❌ Exceção em {titulo}: "
-                    f"{exc}"
-                )
-
-                continue
-
-
-            parsed = self.parse_mcp_result(
-                raw_result
-            )
-
-
-            if self.is_mcp_error(
-                raw_result,
-                parsed,
-            ):
-
-                self.log_detail(
-                    f"⚠️ Falha na visualização: "
-                    f"{titulo}"
-                )
-
-                continue
-
-
-            # ----------------------------------------------------
-            # Extrai imagens sem perder ImageContent
-            # ----------------------------------------------------
-
-            images = (
-                self.extract_images_from_mcp_result(
-                    raw_result,
-                    parsed,
-                )
-            )
-
-
-            if not images:
-
-                self.log_detail(
-                    f"ℹ️ {titulo}: "
-                    "resultado não visualizável."
-                )
-
-                continue
-
-
-            for image in images:
-
-                try:
-
-                    data = image.get(
-                        "data"
-                    )
-
-                    if not data:
-                        continue
-
-
-                    image_bytes = (
-                        base64.b64decode(
-                            data,
-                            validate=True,
-                        )
-                    )
-
-
-                    if not image_bytes:
-                        continue
-
-
-                    mime_type = (
-                        image.get(
-                            "mimeType",
-                            "image/png",
-                        )
-                        or "image/png"
-                    )
-
-
-                    image_format = (
-                        mime_type
-                        .split("/")[-1]
-                        .lower()
-                    )
-
-
-                    if image_format == "jpeg":
-
-                        image_format = "jpg"
-
-
-                    widget = widgets.Image(
-                        value=image_bytes,
-                        format=image_format,
-                        layout=widgets.Layout(
-                            width="100%",
-                            max_width="1200px",
-                            height="auto",
-                        ),
-                    )
-
-
-                    self.visualizations.append(
-                        widget
-                    )
-
-
-                    self.log_detail(
-                        f"✅ {titulo}: "
-                        "imagem recebida."
-                    )
-
-
-                except Exception as exc:
-
-                    self.log_detail(
-                        f"❌ Erro ao decodificar "
-                        f"{titulo}: {exc}"
-                    )
-
-
-        # --------------------------------------------------------
-        # Publica lista completa para a UI
-        # --------------------------------------------------------
-
-        if self.visualization_callback:
-
-            try:
-
-                self.visualization_callback(
-                    self.visualizations
-                )
-
-            except Exception as exc:
-
-                self.log_detail(
-                    "❌ Erro ao atualizar "
-                    f"visualizações: {exc}"
-                )
-
-
-        self.log(
-            f"📊 {len(self.visualizations)} "
-            "visualizações geradas."
-        )
-
-
-    # ============================================================
-    # EXECUÇÃO MCP — RAW
-    #
-    # Mantém ImageContent.
-    # ============================================================
-
-    async def execute_mcp_tool_raw(
-        self,
-        tool_name,
-        arguments,
-    ):
-
-        self.tool_count += 1
-
-
-        self.log_detail("")
-
-        self.log_detail(
-            f"🔧 MCP TOOL: {tool_name}"
-        )
-
-        self.log_detail(
-            "Argumentos:"
-        )
-
-        self.log_detail(
-            json.dumps(
-                arguments or {},
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            )
-        )
-
-
-        try:
-
-            result = await (
-                self.mcp_session.call_tool(
-                    tool_name,
-                    arguments or {},
-                )
-            )
-
-
-        except Exception as exc:
-
-            error_result = {
-                "status": "error",
-                "kind": "mcp_exception",
-                "tool": tool_name,
-                "error": str(exc),
-            }
-
-
-            self.log_detail(
-                "❌ Exceção durante chamada MCP:"
-            )
-
-            self.log_detail(
-                json.dumps(
-                    error_result,
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
-                )
-            )
-
-
-            if tool_name == "evaluate_link":
-
-                self.evaluate_executed = True
-
-                self.evaluate_error = (
-                    error_result
-                )
-
-                self.last_evaluate_result = (
-                    error_result
-                )
-
-                self.publish_technical_result(
-                    error_result
-                )
-
-
-            return error_result
-
-
-        parsed = self.parse_mcp_result(
-            result
-        )
-
-
-        self.log_detail(
-            "Resultado:"
-        )
-
-
-        self.log_detail(
-            json.dumps(
-                self.make_log_safe(
-                    parsed
-                ),
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            )
-        )
-
-
-        mcp_error = self.is_mcp_error(
-            result,
-            parsed,
-        )
-
-
-        if mcp_error:
-
-            self.log_detail(
-                "❌ MCP retornou erro."
-            )
-
-
-        # --------------------------------------------------------
-        # GEOCODE
-        # --------------------------------------------------------
-
-        if tool_name == "geocode_place":
-
-            if not mcp_error:
-
-                before = len(
-                    self.geocoded_points
-                )
-
-                self.register_geocoded_point(
-                    parsed
-                )
-
-                after = len(
-                    self.geocoded_points
-                )
-
-
-                if (
-                    before < 2
-                    and after == 2
-                ):
-
-                    await (
-                        self.mostrar_mapa_apos_geocodificacao()
-                    )
-
-
-            else:
-
-                self.log(
-                    "❌ Falha na geocodificação."
-                )
-
-
-        # --------------------------------------------------------
-        # EVALUATE
-        # --------------------------------------------------------
-
-        elif tool_name == "evaluate_link":
-
-            self.evaluate_executed = True
-
-            self.last_evaluate_result = (
-                parsed
-            )
-
-
-            if mcp_error:
-
-                self.evaluate_error = (
-                    parsed
-                )
-
-                self.log(
-                    "❌ A avaliação técnica "
-                    "retornou erro."
-                )
-
-                self.publish_technical_result(
-                    parsed
-                )
-
-
-            else:
-
-                self.evaluate_error = None
-
-                # ----------------------------------------------
-                # Resultado técnico REAL
-                # ----------------------------------------------
-
-                self.publish_technical_result(
-                    parsed
-                )
-
-
-                # ----------------------------------------------
-                # Visualizações
-                # ----------------------------------------------
-
-                await (
-                    self.gerar_visualizacoes()
-                )
-
-
-                fspl = (
-                    self.summarize_evaluate(
-                        parsed
-                    )
-                )
-
-
-                if fspl is not None:
-
-                    try:
-
-                        self.log(
-                            f"📥 FSPL: "
-                            f"{float(fspl):.2f}"
-                        )
-
-                    except Exception:
-
-                        self.log(
-                            f"📥 FSPL: {fspl}"
-                        )
-
-                else:
-
-                    self.log(
-                        "🟢 Avaliação técnica concluída."
-                    )
-
-
-        return result
-
-
-    # ============================================================
-    # EXECUÇÃO MCP — PARSED
-    # ============================================================
-
-    async def execute_mcp_tool(
-        self,
-        tool_name,
-        arguments,
-    ):
-
-        raw = await (
-            self.execute_mcp_tool_raw(
-                tool_name,
-                arguments,
-            )
-        )
-
-        return self.parse_mcp_result(
-            raw
-        )
-
-
-    # ============================================================
-    # REGISTER
-    # ============================================================
-
-    async def register(self):
-
-        self.log(
-            "👤 Registrando usuário no PlanApp..."
-        )
-
-
-        result = await (
-            self.execute_mcp_tool(
-                "register",
-                {
-                    "user_id": USER_ID,
-                },
-            )
-        )
-
-
-        if isinstance(
-            result,
-            dict,
-        ):
-
-            status = str(
-                result.get(
-                    "status",
-                    "",
-                )
-            ).lower()
-
-
-            if status == "error":
-
-                self.log(
-                    "❌ Falha no registro do usuário."
-                )
-
-                return result
-
-
-        self.log(
-            "🟢 Usuário registrado."
-        )
-
-
-        return result
-
-
-    # ============================================================
-    # EVALUATE AUTOMÁTICO
-    # ============================================================
-
-    async def ensure_evaluate_link(
-        self,
-        parameters=None,
-    ):
-
-        if self.evaluate_executed:
-
-            return self.last_evaluate_result
-
-
-        if len(
-            self.geocoded_points
-        ) < 2:
-
-            return None
-
-
-        if parameters is None:
-
-            parameters = (
-                self.link_parameters
-            )
-
-
-        tx = self.geocoded_points[0]
-        rx = self.geocoded_points[1]
-
-
-        arguments = {
-
-            "tx_lat": tx["lat"],
-
-            "tx_lon": tx["lon"],
-
-            "rx_lat": rx["lat"],
-
-            "rx_lon": rx["lon"],
-
-            "tx_ha": parameters.get(
-                "tx_ha",
-                DEFAULT_TX_HA,
-            ),
-
-            "rx_ha": parameters.get(
-                "rx_ha",
-                DEFAULT_RX_HA,
-            ),
-
-            "freq_mhz": parameters.get(
-                "freq_mhz",
-                DEFAULT_FREQ_MHZ,
-            ),
-
-            "on_rooftop": parameters.get(
-                "on_rooftop",
-                DEFAULT_ON_ROOFTOP,
-            ),
-        }
-
-
-        self.log(
-            "📡 Executando avaliação técnica "
-            "do enlace..."
-        )
-
-
-        self.log_detail(
-            "Parâmetros enviados ao PlanApp:"
-        )
-
-
-        self.log_detail(
-            json.dumps(
-                arguments,
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            )
-        )
-
-
-        return await (
-            self.execute_mcp_tool(
-                "evaluate_link",
-                arguments,
-            )
-        )
-
-
-    # ============================================================
-    # CONTEXTO TÉCNICO PARA O MODELO
-    # ============================================================
-
-    def build_technical_context(
-        self,
-        technical_result,
-    ):
-
-        effective = {
-            "freq_mhz": (
-                self.link_parameters.get(
-                    "freq_mhz"
-                )
-            ),
-            "tx_ha": (
-                self.link_parameters.get(
-                    "tx_ha"
-                )
-            ),
-            "rx_ha": (
-                self.link_parameters.get(
-                    "rx_ha"
-                )
-            ),
-            "on_rooftop": (
-                self.link_parameters.get(
-                    "on_rooftop"
-                )
-            ),
-        }
-
-
-        requested = {
-            "frequency": (
-                self.requested_frequency
-            ),
-            "frequency_unit": (
-                self.requested_frequency_unit
-            ),
-            "frequency_text": (
-                self.requested_frequency_text
-            ),
-            "tx_ha": (
-                self.requested_tx_ha
-            ),
-            "rx_ha": (
-                self.requested_rx_ha
-            ),
-        }
-
-
-        conversion_text = ""
-
-
-        if (
-            self.requested_frequency is not None
-            and self.requested_frequency_unit is not None
-        ):
-
-            conversion_text = (
-                "A frequência foi informada pelo "
-                f"usuário como "
-                f"{self.requested_frequency_text}. "
-                "A conversão para MHz foi usada "
-                "somente internamente no parâmetro "
-                "freq_mhz enviado ao PlanApp."
-            )
-
-
-        return {
-
-            "parametros_solicitados_pelo_usuario":
-                requested,
-
-            "parametros_efetivos_enviados_ao_planapp":
-                effective,
-
-            "conversao_de_frequencia":
-                conversion_text,
-
-            "pontos_geocodificados":
-                self.geocoded_points,
-
-            "resultado_tecnico_real_do_planapp":
-                technical_result,
-
-            "regras_criticas": [
-
-                "Responder somente em português "
-                "do Brasil.",
-
-                "Não mostrar raciocínio interno.",
-
-                "Não inventar valores.",
-
-                "Não inventar unidades.",
-
-                "Não alterar valores do PlanApp.",
-
-                "Não converter radianos para graus.",
-
-                "Não interpretar core, fresnel, "
-                "boundary, delta_diffra, VV, "
-                "v_v ou d_norm sem definição "
-                "explícita.",
-
-                "Não concluir viabilidade apenas "
-                "com status OK.",
-
-                "Não transformar core, fresnel "
-                "ou boundary em dB.",
-
-                "Se houver erro, informar o erro "
-                "real retornado pelo PlanApp.",
-
-            ],
-        }
-
-
-    # ============================================================
+    # ========================================================================
     # CHAMADA OPENROUTER
-    # ============================================================
+    # ========================================================================
 
     async def openrouter_chat(
         self,
-        messages,
-        tools=None,
+        messages=None,
+        use_tools=True,
     ):
 
         if self.client is None:
 
             raise RuntimeError(
-                "OPENROUTER_API_KEY não está "
-                "configurada no ambiente."
+                "Cliente OpenRouter não foi criado."
             )
 
+        if messages is None:
+
+            messages = self.messages
 
         kwargs = {
             "model": OPENROUTER_MODEL,
             "messages": messages,
         }
 
+        if use_tools:
 
-        if tools:
+            tools = (
+                self.build_openrouter_tools()
+            )
 
-            kwargs["tools"] = tools
+            if tools:
 
-            kwargs["tool_choice"] = "auto"
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
 
+        self.log_detail(
+            f"OpenRouter request — "
+            f"model={OPENROUTER_MODEL}"
+        )
 
-        else:
-
-            # ----------------------------------------------------
-            # IMPORTANTE:
-            # A resposta final NÃO recebe ferramentas.
-            # ----------------------------------------------------
-
-            kwargs["tools"] = []
-
-
-        response = await (
-            self.client.chat.completions.create(
+        response = (
+            await self.client.chat.completions.create(
                 **kwargs
             )
         )
 
-
         return response
 
+    # ========================================================================
+    # OBTÉM MESSAGE
+    # ========================================================================
 
-    # ============================================================
-    # LIMPEZA DA RESPOSTA FINAL
-    # ============================================================
+    def response_message(
+        self,
+        response,
+    ):
+
+        if response is None:
+            return None
+
+        choices = getattr(
+            response,
+            "choices",
+            None,
+        )
+
+        if not choices:
+            return None
+
+        return getattr(
+            choices[0],
+            "message",
+            None,
+        )
+
+    # ========================================================================
+    # OBTÉM TEXTO
+    # ========================================================================
+
+    def response_text(
+        self,
+        response,
+    ):
+
+        message = (
+            self.response_message(
+                response
+            )
+        )
+
+        if message is None:
+            return ""
+
+        content = getattr(
+            message,
+            "content",
+            None,
+        )
+
+        if content is None:
+            return ""
+
+        if isinstance(
+            content,
+            str,
+        ):
+
+            return content.strip()
+
+        if isinstance(
+            content,
+            list,
+        ):
+
+            parts = []
+
+            for item in content:
+
+                if isinstance(
+                    item,
+                    dict,
+                ):
+
+                    value = item.get(
+                        "text"
+                    )
+
+                    if value:
+                        parts.append(
+                            str(value)
+                        )
+
+                else:
+
+                    value = getattr(
+                        item,
+                        "text",
+                        None,
+                    )
+
+                    if value:
+                        parts.append(
+                            str(value)
+                        )
+
+            return "\n".join(
+                parts
+            ).strip()
+
+        return str(
+            content
+        ).strip()
+
+    # ========================================================================
+    # OBTÉM TOOL CALLS
+    # ========================================================================
+
+    def response_tool_calls(
+        self,
+        response,
+    ):
+
+        message = (
+            self.response_message(
+                response
+            )
+        )
+
+        if message is None:
+            return []
+
+        calls = getattr(
+            message,
+            "tool_calls",
+            None,
+        )
+
+        if not calls:
+            return []
+
+        return calls
+
+    # ========================================================================
+    # LIMPA RESPOSTAS DE RACIOCÍNIO
+    # ========================================================================
 
     def clean_final_response(
         self,
@@ -2107,126 +928,969 @@ Use exclusivamente os resultados técnicos, parâmetros e coordenadas fornecidos
     ):
 
         if not text:
-
             return ""
 
-
-        text = text.strip()
-
-
-        # --------------------------------------------------------
-        # Remove blocos <think>...</think>
-        # --------------------------------------------------------
+        text = str(
+            text
+        )
 
         text = re.sub(
             r"<think>.*?</think>",
             "",
             text,
-            flags=re.IGNORECASE | re.DOTALL,
+            flags=re.DOTALL | re.IGNORECASE,
         )
-
-
-        # --------------------------------------------------------
-        # Remove tags de raciocínio
-        # --------------------------------------------------------
 
         text = re.sub(
             r"<reasoning>.*?</reasoning>",
             "",
             text,
-            flags=re.IGNORECASE | re.DOTALL,
+            flags=re.DOTALL | re.IGNORECASE,
         )
 
-
-        text = text.strip()
-
-
-        # --------------------------------------------------------
-        # Caso o modelo tenha começado a expor o raciocínio.
-        #
-        # Tentamos localizar uma seção de resposta final.
-        # --------------------------------------------------------
-
-        lower = text.lower()
-
-
-        thinking_markers = [
-            "here's a thinking process:",
-            "here is a thinking process:",
-            "thinking process:",
-            "raciocínio:",
-            "processo de pensamento:",
-            "let's analyze:",
-            "let me analyze:",
-        ]
-
-
-        found_marker = None
-
-        for marker in thinking_markers:
-
-            if marker in lower:
-
-                found_marker = marker
-
-                break
-
-
-        if found_marker:
-
-            # ----------------------------------------------
-            # Se houver uma resposta final explícita,
-            # preserva somente essa parte.
-            # ----------------------------------------------
-
-            final_markers = [
-                "final answer:",
-                "resposta final:",
-                "resposta:",
-            ]
-
-
-            for final_marker in final_markers:
-
-                index = lower.find(
-                    final_marker,
-                    lower.find(found_marker),
-                )
-
-                if index >= 0:
-
-                    text = text[
-                        index
-                        + len(final_marker):
-                    ].strip()
-
-                    break
-
-            else:
-
-                # ------------------------------------------
-                # Não mostrar raciocínio interno.
-                # ------------------------------------------
-
-                return (
-                    "A avaliação técnica foi executada "
-                    "pelo PlanApp. Os resultados técnicos "
-                    "detalhados estão disponíveis no "
-                    "painel de resultados."
-                )
-
+        text = re.sub(
+            r"<analysis>.*?</analysis>",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
 
         return text.strip()
 
+    # ========================================================================
+    # CONTEXTO TÉCNICO
+    # ========================================================================
 
-    # ============================================================
+    def append_technical_context(
+        self,
+        result,
+    ):
+
+        context = (
+            self.build_technical_context(
+                result
+            )
+        )
+
+        self.messages.append(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    context,
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            }
+        )
+
+        self.technical_context_added = True
+
+        self.log_detail(
+            "Contexto técnico enviado ao OpenRouter."
+        )
+
+    # ========================================================================
+    # MAPA
+    # ========================================================================
+
+    async def mostrar_mapa_apos_geocodificacao(
+        self,
+    ):
+
+        if len(
+            self.geocoded_points
+        ) < 2:
+
+            return
+
+        try:
+
+            from map_utils import (
+                mostrar_mapa_enlace,
+                gerar_imagem_mapa_enlace,
+            )
+
+            p1 = (
+                self.geocoded_points[0]
+            )
+
+            p2 = (
+                self.geocoded_points[1]
+            )
+
+            tx_lat = p1["lat"]
+            tx_lon = p1["lon"]
+
+            rx_lat = p2["lat"]
+            rx_lon = p2["lon"]
+
+            # ---------------------------------------------------------------
+            # MAPA INTERATIVO
+            # ---------------------------------------------------------------
+
+            self.map = (
+                mostrar_mapa_enlace(
+                    tx_lat,
+                    tx_lon,
+                    rx_lat,
+                    rx_lon,
+                )
+            )
+
+            if self.map_callback:
+
+                self.map_callback(
+                    self.map
+                )
+
+            # ---------------------------------------------------------------
+            # IMAGEM ESTÁTICA
+            # ---------------------------------------------------------------
+
+            self.map_image_bytes = (
+                gerar_imagem_mapa_enlace(
+                    tx_lat,
+                    tx_lon,
+                    rx_lat,
+                    rx_lon,
+                )
+            )
+
+            self.log_detail(
+                "Mapa preparado."
+            )
+
+        except Exception as exc:
+
+            self.log_detail(
+                f"⚠️ Erro ao preparar mapa: {exc}"
+            )
+
+    # ========================================================================
+    # VISUALIZAÇÕES
+    # ========================================================================
+
+    async def gerar_visualizacoes(
+        self,
+    ):
+
+        if not self.evaluate_executed:
+
+            self.log_detail(
+                "Visualizações não executadas: "
+                "evaluate_link não foi executado."
+            )
+
+            return
+
+        if self.evaluate_error:
+
+            self.log_detail(
+                "Visualizações não executadas: "
+                "evaluate_link apresentou erro."
+            )
+
+            return
+
+        visualizations = [
+
+            (
+                "link_area",
+                {
+                    "ds_string": "DTM"
+                },
+                "DTM",
+            ),
+
+            (
+                "link_area",
+                {
+                    "ds_string": "DSM"
+                },
+                "DSM",
+            ),
+
+            (
+                "link_area",
+                {
+                    "ds_string": "COVER"
+                },
+                "COVER",
+            ),
+
+            (
+                "link_profile",
+                {},
+                "Perfil do enlace",
+            ),
+
+            (
+                "lulc_fresnel",
+                {},
+                "LULC / Fresnel",
+            ),
+
+            (
+                "bldg_prepare",
+                {},
+                "Buildings / Prepare",
+            ),
+
+            (
+                "bldg_fresnel",
+                {},
+                "Buildings / Fresnel",
+            ),
+
+            (
+                "bldg_profile",
+                {},
+                "Buildings / Profile",
+            ),
+        ]
+
+        self.visualizations = []
+
+        self.visualization_images = []
+
+        for (
+            tool_name,
+            arguments,
+            title,
+        ) in visualizations:
+
+            try:
+
+                self.log_detail(
+                    f"Executando visualização: "
+                    f"{title}"
+                )
+
+                raw = (
+                    await self.execute_mcp_tool_raw(
+                        tool_name,
+                        arguments,
+                    )
+                )
+
+                parsed = (
+                    self.parse_mcp_result(
+                        raw
+                    )
+                )
+
+                if not isinstance(
+                    parsed,
+                    dict,
+                ):
+
+                    self.log_detail(
+                        f"⚠️ {title}: "
+                        "resultado inválido."
+                    )
+
+                    continue
+
+                if parsed.get(
+                    "kind"
+                ) != "image":
+
+                    self.log_detail(
+                        f"⚠️ {title}: "
+                        "resultado não contém imagem."
+                    )
+
+                    continue
+
+                data = parsed.get(
+                    "data"
+                )
+
+                if not data:
+
+                    self.log_detail(
+                        f"⚠️ {title}: "
+                        "dados da imagem ausentes."
+                    )
+
+                    continue
+
+                image_bytes = (
+                    base64.b64decode(
+                        data
+                    )
+                )
+
+                image = widgets.Image(
+                    value=image_bytes,
+                    format="png",
+                    layout=widgets.Layout(
+                        width="100%",
+                        height="auto",
+                    ),
+                )
+
+                self.visualizations.append(
+                    image
+                )
+
+                self.visualization_images.append(
+                    {
+                        "title": title,
+                        "data": image_bytes,
+                        "mime_type": "image/png",
+                    }
+                )
+
+                if self.visualization_callback:
+
+                    self.visualization_callback(
+                        image,
+                        title,
+                    )
+
+                self.log_detail(
+                    f"Visualização concluída: "
+                    f"{title}"
+                )
+
+            except Exception as exc:
+
+                self.log_detail(
+                    f"⚠️ Erro na visualização "
+                    f"{title}: {exc}"
+                )
+
+        self.log_detail(
+            "Total de visualizações: "
+            f"{len(self.visualization_images)}"
+        )
+
+    # ========================================================================
+    # RELATÓRIO
+    #
+    # A análise final do OpenRouter pode ser passada para o
+    # ReportGenerator como conteúdo principal do relatório.
+    #
+    # A geração automática do PDF continua fora do ask(),
+    # preservando o fluxo atual da interface.
+    # ========================================================================
+
+    def build_report(
+        self,
+        technical_result,
+        analysis_text=None,
+    ):
+
+        requested_parameters = {
+
+            "frequency": getattr(
+                self,
+                "requested_frequency",
+                None,
+            ),
+
+            "frequency_unit": getattr(
+                self,
+                "requested_frequency_unit",
+                None,
+            ),
+
+            "frequency_text": getattr(
+                self,
+                "requested_frequency_text",
+                None,
+            ),
+
+            "tx_ha": getattr(
+                self,
+                "requested_tx_ha",
+                None,
+            ),
+
+            "rx_ha": getattr(
+                self,
+                "requested_rx_ha",
+                None,
+            ),
+
+            "on_rooftop": getattr(
+                self,
+                "requested_on_rooftop",
+                None,
+            ),
+        }
+
+        link_parameters = getattr(
+            self,
+            "link_parameters",
+            {},
+        )
+
+        if not isinstance(
+            link_parameters,
+            dict,
+        ):
+
+            link_parameters = {}
+
+        effective_parameters = {
+
+            "freq_mhz": link_parameters.get(
+                "freq_mhz",
+                DEFAULT_FREQ_MHZ,
+            ),
+
+            "tx_ha": link_parameters.get(
+                "tx_ha",
+                DEFAULT_TX_HA,
+            ),
+
+            "rx_ha": link_parameters.get(
+                "rx_ha",
+                DEFAULT_RX_HA,
+            ),
+
+            "on_rooftop": link_parameters.get(
+                "on_rooftop",
+                DEFAULT_ON_ROOFTOP,
+            ),
+        }
+
+        # --------------------------------------------------------------------
+        # GARANTIR IMAGEM DO MAPA
+        # --------------------------------------------------------------------
+
+        if (
+            self.map_image_bytes is None
+            and len(
+                self.geocoded_points
+            ) >= 2
+        ):
+
+            try:
+
+                from map_utils import (
+                    gerar_imagem_mapa_enlace
+                )
+
+                p1 = (
+                    self.geocoded_points[0]
+                )
+
+                p2 = (
+                    self.geocoded_points[1]
+                )
+
+                self.map_image_bytes = (
+                    gerar_imagem_mapa_enlace(
+                        p1["lat"],
+                        p1["lon"],
+                        p2["lat"],
+                        p2["lon"],
+                    )
+                )
+
+            except Exception as exc:
+
+                self.log_detail(
+                    f"⚠️ Erro ao gerar imagem "
+                    f"do mapa: {exc}"
+                )
+
+        # --------------------------------------------------------------------
+        # GERADOR
+        # --------------------------------------------------------------------
+
+        generator = ReportGenerator(
+
+            requested_params=(
+                requested_parameters
+            ),
+
+            effective_params=(
+                effective_parameters
+            ),
+
+            technical_result=(
+                technical_result
+            ),
+
+            geocoded_points=(
+                self.geocoded_points
+            ),
+
+            map_image=(
+                self.map_image_bytes
+            ),
+
+            visualization_images=(
+                self.visualization_images
+            ),
+
+            user_request=(
+                self.user_request
+            ),
+
+            # ---------------------------------------------------------------
+            # NOVO:
+            # análise final do OpenRouter
+            # ---------------------------------------------------------------
+
+            analysis_text=(
+                analysis_text
+                if analysis_text
+                else None
+            ),
+        )
+
+        # --------------------------------------------------------------------
+        # TEXTO DO RELATÓRIO
+        # --------------------------------------------------------------------
+
+        report = (
+            generator.generate_report(
+                include_raw_result=False
+            )
+        )
+
+        self.technical_report = report
+
+        pdf_path = generator.generate_pdf(
+            report_text=report,
+            include_raw_result=False,
+        )
+
+        self.report_pdf_path = pdf_path
+
+        self.log_detail(
+            "Relatório PDF gerado: "
+            f"{pdf_path}"
+        )
+
+        self.log_detail(
+            "Mapa no relatório: "
+            + (
+                "SIM"
+                if self.map_image_bytes
+                else "NÃO"
+            )
+        )
+
+        self.log_detail(
+            "Visualizações no relatório: "
+            f"{len(self.visualization_images)}"
+        )
+
+        return report
+
+    # ========================================================================
+    # ASSISTANT MESSAGE PARA CHAT COMPLETIONS
+    # ========================================================================
+
+    def _assistant_message_to_dict(
+        self,
+        message,
+    ):
+
+        try:
+
+            data = message.model_dump(
+                exclude_none=True
+            )
+
+            return data
+
+        except Exception:
+
+            data = {
+                "role": "assistant",
+                "content": getattr(
+                    message,
+                    "content",
+                    None,
+                ),
+            }
+
+            tool_calls = getattr(
+                message,
+                "tool_calls",
+                None,
+            )
+
+            if tool_calls:
+
+                converted = []
+
+                for call in tool_calls:
+
+                    function = getattr(
+                        call,
+                        "function",
+                        None,
+                    )
+
+                    if function is None:
+                        continue
+
+                    converted.append(
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": function.name,
+                                "arguments": function.arguments,
+                            },
+                        }
+                    )
+
+                if converted:
+
+                    data["tool_calls"] = converted
+
+            return data
+
+    # ========================================================================
+    # AGENT TURN
+    # ========================================================================
+
+    async def agent_turn(
+        self,
+    ):
+
+        for iteration in range(MAX_AGENT_ITERATIONS):
+
+            self.log_detail(
+                f"OpenRouter — iteração {iteration + 1}/{MAX_AGENT_ITERATIONS}"
+            )
+
+            try:
+                response = await self.openrouter_chat(
+                    messages=self.messages,
+                    use_tools=True,
+                )
+            except Exception as exc:
+                self.log_detail(f"❌ Erro OpenRouter: {exc}")
+                return ""
+
+            message = self.response_message(response)
+            if message is None:
+                self.log_detail("⚠️ OpenRouter não retornou uma mensagem.")
+                continue
+
+            text = self.clean_final_response(
+                self.response_text(response)
+            )
+            if text:
+                self.last_agent_text = text
+
+            tool_calls = self.response_tool_calls(response)
+            self.messages.append(
+                self._assistant_message_to_dict(message)
+            )
+
+            if not tool_calls:
+                result = await self.ensure_application_evaluation()
+
+                if result is not None:
+                    if not self.technical_context_added:
+                        self.append_technical_context(result)
+
+                    # Em multi-hop, a aplicação já executou todos os hops.
+                    # NÃO voltar ao OpenRouter: devolver o controle ao ask().
+                    if (
+                        self.multi_hop_requested
+                        and getattr(self, "multi_hop_executed", False)
+                    ):
+                        self.log_detail(
+                            "🟢 Multi-hop concluído após a geocodificação."
+                        )
+                        self.log_detail("Encerrando agent_turn().")
+                        return text
+
+                    continue
+
+                if (
+                    self.multi_hop_requested
+                    and len(self.geocoded_points) < 3
+                    and not self.geocoding_followup_sent
+                ):
+                    self.geocoding_followup_sent = True
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "A solicitação atual descreve uma rota multi-hop. "
+                            "Ainda existem menos de três pontos geocodificados. "
+                            "Continue identificando e geocodificando, na ordem "
+                            "solicitada pelo usuário, todas as localidades restantes. "
+                            "Não execute avaliação técnica."
+                        ),
+                    })
+                    continue
+
+                return text
+
+            # O único tool permitido ao modelo é geocode_place.
+            for call in tool_calls:
+                function = getattr(call, "function", None)
+                if function is None:
+                    continue
+
+                tool_name = getattr(function, "name", "")
+                arguments_text = getattr(function, "arguments", "{}")
+
+                try:
+                    arguments = json.loads(arguments_text)
+                except Exception:
+                    arguments = {}
+
+                if not isinstance(arguments, dict):
+                    arguments = {}
+
+                if tool_name in APPLICATION_CONTROLLED_TOOLS:
+                    self.log_detail(
+                        f"⚠️ OpenRouter tentou executar {tool_name}, "
+                        "mas esta ferramenta é controlada pela aplicação."
+                    )
+                    tool_result = {
+                        "error": (
+                            f"A ferramenta {tool_name} é controlada pela "
+                            "aplicação e não deve ser executada pelo LLM."
+                        )
+                    }
+                elif tool_name not in MODEL_ALLOWED_TOOLS:
+                    self.log_detail(
+                        f"⚠️ Ferramenta não permitida ao OpenRouter: {tool_name}"
+                    )
+                    tool_result = {
+                        "error": f"A ferramenta {tool_name} não está disponível ao modelo."
+                    }
+                else:
+                    self.log_detail(f"MCP TOOL: {tool_name}")
+                    self.log_detail(
+                        "Argumentos: "
+                        + json.dumps(arguments, ensure_ascii=False)
+                    )
+                    try:
+                        tool_result = await self.execute_mcp_tool(
+                            tool_name, arguments
+                        )
+                    except Exception as exc:
+                        self.log_detail(f"❌ Erro MCP: {exc}")
+                        tool_result = {"error": str(exc)}
+
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(
+                        tool_result,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                })
+
+            # Depois das tools, a aplicação decide se já há pontos suficientes
+            # para executar a avaliação. Em multi-hop, ela aguarda todos os pontos.
+            result = await self.ensure_application_evaluation()
+
+            if result is not None:
+                if not self.technical_context_added:
+                    self.append_technical_context(result)
+
+                if (
+                    self.multi_hop_requested
+                    and getattr(self, "multi_hop_executed", False)
+                ):
+                    self.log_detail(
+                        "🟢 Multi-hop concluído após a execução das ferramentas."
+                    )
+                    self.log_detail("Encerrando agent_turn().")
+                    return text
+
+                continue
+
+            if (
+                self.multi_hop_requested
+                and len(self.geocoded_points) < 3
+                and not self.geocoding_followup_sent
+            ):
+                self.geocoding_followup_sent = True
+                self.messages.append({
+                    "role": "user",
+                    "content": (
+                        "Continue a geocodificação da rota multi-hop solicitada. "
+                        "Use geocode_place para os pontos restantes na ordem original. "
+                        "Não execute avaliação técnica."
+                    ),
+                })
+                continue
+
+            continue
+
+        self.log_detail("⚠️ Limite máximo de iterações atingido.")
+        return self.last_agent_text
+
+    # ========================================================================
+    # FALLBACK DETERMINÍSTICO
+    # ========================================================================
+
+    def _fallback_final_response(
+        self,
+    ):
+
+        result = getattr(
+            self,
+            "last_evaluate_result",
+            None,
+        )
+
+        if not result:
+
+            return (
+                "A avaliação técnica foi executada, "
+                "mas o modelo não retornou uma "
+                "resposta textual final."
+            )
+
+        try:
+
+            context = (
+                self.build_technical_context(
+                    result
+                )
+            )
+
+            lines = []
+
+            lines.append(
+                "## Análise técnica do enlace"
+            )
+
+            if self.geocoded_points:
+
+                lines.append(
+                    "\n### Pontos geográficos"
+                )
+
+                for index, point in enumerate(
+                    self.geocoded_points,
+                    start=1,
+                ):
+
+                    label = (
+                        "TX"
+                        if index == 1
+                        else "RX"
+                    )
+
+                    name = point.get(
+                        "name",
+                        point.get(
+                            "query",
+                            "",
+                        ),
+                    )
+
+                    lines.append(
+                        f"- {label}: {name}"
+                    )
+
+                    if point.get(
+                        "lat"
+                    ) is not None:
+
+                        lines.append(
+                            f"  - latitude: "
+                            f"{point['lat']}"
+                        )
+
+                    if point.get(
+                        "lon"
+                    ) is not None:
+
+                        lines.append(
+                            f"  - longitude: "
+                            f"{point['lon']}"
+                        )
+
+            lines.append(
+                "\n### Resultado retornado pelo PlanApp"
+            )
+
+            if isinstance(
+                context,
+                dict,
+            ):
+
+                for key, value in context.items():
+
+                    if isinstance(
+                        value,
+                        (dict, list),
+                    ):
+
+                        value_text = json.dumps(
+                            value,
+                            ensure_ascii=False,
+                            default=str,
+                        )
+
+                    else:
+
+                        value_text = str(
+                            value
+                        )
+
+                    lines.append(
+                        f"- {key}: {value_text}"
+                    )
+
+            else:
+
+                lines.append(
+                    str(context)
+                )
+
+            lines.append(
+                "\n### Limitação"
+            )
+
+            lines.append(
+                "- A avaliação apresenta os dados "
+                "retornados pelo PlanApp."
+            )
+
+            lines.append(
+                "- Não foi aplicado um critério adicional "
+                "de viabilidade que não estivesse "
+                "documentado nos resultados."
+            )
+
+            return "\n".join(
+                lines
+            )
+
+        except Exception as exc:
+
+            self.log_detail(
+                f"⚠️ Erro no fallback final: {exc}"
+            )
+
+            return (
+                "A avaliação técnica foi executada, "
+                "mas não foi possível gerar a "
+                "resposta textual final."
+            )
+
+    # ========================================================================
     # RESPOSTA FINAL
-    # ============================================================
+    # ========================================================================
 
     async def generate_final_response(
         self,
         original_text,
         technical_result,
+        technical_report=None,
     ):
 
         context = (
@@ -2234,7 +1898,6 @@ Use exclusivamente os resultados técnicos, parâmetros e coordenadas fornecidos
                 technical_result
             )
         )
-
 
         final_messages = [
 
@@ -2251,752 +1914,550 @@ Use exclusivamente os resultados técnicos, parâmetros e coordenadas fornecidos
             {
                 "role": "user",
                 "content": (
-                    "DADOS TÉCNICOS FINAIS DO PLANAPP.\n\n"
+                    "RESULTADO TÉCNICO DO PLANAPP:\n\n"
                     + json.dumps(
                         context,
                         ensure_ascii=False,
-                        indent=2,
                         default=str,
                     )
                 ),
             },
-
-            {
-                "role": "user",
-                "content": """
-Produza agora SOMENTE a resposta final destinada ao usuário.
-
-REGRAS ABSOLUTAS PARA ESTA RESPOSTA:
-
-- Português do Brasil.
-- Não mostre raciocínio.
-- Não mostre processo de pensamento.
-- Não escreva "Here's a thinking process".
-- Não escreva "Thinking process".
-- Não escreva "Let's analyze".
-- Não escreva "Step 1", "Step 2" etc.
-- Não explique o que você está fazendo.
-- Não fale sobre as instruções recebidas.
-- Não faça chamadas de ferramentas.
-- Não invente valores.
-- Não invente unidades.
-- Não transforme campos técnicos desconhecidos em conceitos conhecidos.
-- Use somente os dados reais fornecidos pelo PlanApp.
-- Seja objetivo.
-
-Apresente os principais resultados técnicos de forma legível.
-""",
-            },
         ]
 
+        if technical_report:
 
-        response = await (
-            self.openrouter_chat(
-                final_messages,
-                tools=None,
-            )
-        )
-
-
-        message = response.choices[0].message
-
-
-        content = (
-            getattr(
-                message,
-                "content",
-                None,
-            )
-            or ""
-        )
-
-
-        cleaned = (
-            self.clean_final_response(
-                content
-            )
-        )
-
-
-        # --------------------------------------------------------
-        # Se ainda houver sinais de raciocínio exposto,
-        # fazemos uma segunda chamada específica de correção.
-        # --------------------------------------------------------
-
-        lower = cleaned.lower()
-
-
-        suspicious = any(
-            marker in lower
-            for marker in [
-                "here's a thinking process",
-                "thinking process:",
-                "raciocínio:",
-                "processo de pensamento:",
-                "let's analyze:",
-                "step 1:",
-                "step 2:",
-            ]
-        )
-
-
-        if suspicious:
-
-            repair_messages = [
-
-                {
-                    "role": "system",
-                    "content": (
-                        "Você é o PlanApp AI. "
-                        "Responda exclusivamente em "
-                        "português do Brasil. "
-                        "Nunca revele raciocínio interno."
-                    ),
-                },
-
+            final_messages.append(
                 {
                     "role": "user",
                     "content": (
-                        "Gere somente uma resposta final "
-                        "objetiva ao usuário usando os "
-                        "dados técnicos abaixo.\n\n"
-                        + json.dumps(
-                            context,
-                            ensure_ascii=False,
-                            indent=2,
-                            default=str,
-                        )
+                        "RELATÓRIO TÉCNICO:\n\n"
+                        + technical_report
                     ),
-                },
-            ]
-
-
-            repair_response = await (
-                self.openrouter_chat(
-                    repair_messages,
-                    tools=None,
-                )
+                }
             )
 
+        final_messages.append(
+            {
+                "role": "user",
+                "content": """
+Produza agora a análise técnica final do enlace.
 
-            repaired_content = (
-                getattr(
-                    repair_response.choices[0].message,
-                    "content",
-                    None,
-                )
-                or ""
-            )
+A resposta deve ser em português do Brasil.
 
+A análise deve interpretar os dados do PlanApp e NÃO apenas
+reproduzir o JSON.
 
-            cleaned = (
-                self.clean_final_response(
-                    repaired_content
-                )
-            )
+Considere conjuntamente, quando disponíveis:
 
+- geometria do enlace;
+- distância;
+- frequência;
+- alturas das antenas;
+- FSPL;
+- resultados de terreno;
+- resultados de vegetação/COVER;
+- resultados de edificações;
+- resultados de Fresnel;
+- resultados geométricos;
+- demais indicadores retornados pelo PlanApp.
 
-        return cleaned
+Não atribua significado físico a campos cuja definição não esteja
+documentada.
 
+Use exatamente a estrutura abaixo, adaptando o conteúdo aos dados
+realmente disponíveis.
 
-    # ============================================================
-    # TURNO DO AGENTE
-    # ============================================================
+## 1. RESUMO EXECUTIVO
 
-    async def agent_turn(
-        self,
-        original_text,
-    ):
+Apresente uma síntese técnica objetiva do resultado.
 
-        tools = (
-            self.build_openrouter_tools()
+Se houver dados suficientes e critério técnico explícito para uma
+classificação, apresente a conclusão correspondente.
+
+Se não houver critério suficiente, informe claramente que a
+viabilidade não pode ser determinada a partir dos dados
+disponíveis.
+
+## 2. IDENTIFICAÇÃO DO ENLACE
+
+Apresente:
+
+- localidade TX;
+- coordenadas TX;
+- localidade RX;
+- coordenadas RX;
+- distância, quando retornada.
+
+## 3. PARÂMETROS UTILIZADOS
+
+Diferencie:
+
+- parâmetros solicitados pelo usuário;
+- parâmetros efetivamente utilizados pelo PlanApp.
+
+Apresente:
+
+- frequência;
+- altura TX;
+- altura RX;
+- rooftop;
+- demais parâmetros relevantes.
+
+## 4. ANÁLISE DE PROPAGAÇÃO
+
+Apresente os resultados de propagação retornados pelo PlanApp.
+
+Inclua, quando disponíveis:
+
+- FSPL;
+- delta_diffra;
+- outros indicadores de propagação.
+
+Não invente significado para campos não documentados.
+
+## 5. ANÁLISE DO TERRENO
+
+Apresente os resultados de terreno retornados pelo PlanApp.
+
+Pode comparar numericamente valores retornados.
+
+Não atribua significado adicional a core, fresnel, boundary,
+v_v, VV ou d_norm sem documentação explícita.
+
+## 6. ANÁLISE DA FRESNEL
+
+Apresente os resultados relacionados à Fresnel que estejam
+disponíveis.
+
+Não invente critérios de obstrução ou margens.
+
+## 7. VEGETAÇÃO / COBERTURA
+
+Apresente os resultados de COVER/LULC retornados pelo PlanApp.
+
+Não invente classificação adicional.
+
+## 8. EDIFICAÇÕES
+
+Apresente os resultados relacionados a edificações.
+
+Destaque os valores disponíveis sem atribuir significado físico
+não documentado.
+
+## 9. GEOMETRIA E OBSTÁCULOS
+
+Apresente os resultados geométricos retornados pelo PlanApp.
+
+Inclua, quando presentes:
+
+- ângulos;
+- clearance;
+- obstáculos;
+- outros valores geométricos.
+
+Não converta radianos para graus.
+
+## 10. PRINCIPAIS FATORES LIMITANTES
+
+Identifique os resultados que merecem atenção técnica.
+
+Não invente fatores que não estejam sustentados pelos dados.
+
+## 11. DIAGNÓSTICO TÉCNICO
+
+Faça uma síntese integrada.
+
+Relacione, quando possível:
+
+- propagação;
+- terreno;
+- vegetação;
+- edificações;
+- geometria.
+
+Não trate um único indicador isoladamente como suficiente.
+
+## 12. CONCLUSÃO DE VIABILIDADE
+
+Utilize uma classificação SOMENTE quando houver critério técnico
+explícito e suficiente nos dados:
+
+- VIÁVEL
+- NÃO VIÁVEL
+- VIÁVEL COM RESSALVAS
+- INDETERMINADO
+
+Na ausência de critério suficiente, utilize:
+
+INDETERMINADO
+
+e explique objetivamente a limitação.
+
+Não invente limiares de engenharia.
+
+## 13. ALTERNATIVAS
+
+Quando apropriado, sugira:
+
+- alteração de altura;
+- alteração de frequência;
+- alteração de posicionamento;
+- alteração de parâmetros.
+
+Mas diferencie:
+
+- alternativa sugerida;
+- alternativa efetivamente testada pelo PlanApp.
+
+Não diga que uma alternativa resolve o problema se ela não foi
+efetivamente testada.
+
+## 14. RECOMENDAÇÕES
+
+Apresente recomendações técnicas baseadas exclusivamente nos
+dados disponíveis.
+
+Diferencie recomendações de resultados efetivamente testados.
+
+## 15. LIMITAÇÕES
+
+Liste as limitações da análise.
+
+Inclua critérios ou informações necessários para uma conclusão
+definitiva que não estejam presentes nos dados.
+
+REGRAS ABSOLUTAS:
+
+- Não invente valores.
+- Não altere valores.
+- Não altere unidades.
+- Não faça cálculos técnicos adicionais.
+- Não converta radianos para graus.
+- Não invente potência.
+- Não invente ganho.
+- Não invente sensibilidade.
+- Não invente margem.
+- Não invente limiares.
+- Não invente critérios de viabilidade.
+- Não atribua significado próprio a core.
+- Não atribua significado próprio a fresnel.
+- Não atribua significado próprio a boundary.
+- Não atribua significado próprio a delta_diffra.
+- Não atribua significado próprio a VV.
+- Não atribua significado próprio a v_v.
+- Não atribua significado próprio a d_norm.
+- Não confunda status OK com viabilidade.
+- Não apresente uma sugestão como resultado testado.
+- Não diga que uma alternativa resolve o problema sem teste.
+- Seja técnico, objetivo e claro.
+""",
+            }
         )
 
+        old_messages = self.messages
 
-        for iteration in range(
-            MAX_AGENT_ITERATIONS
-        ):
+        try:
+
+            self.messages = final_messages
+
+            # ----------------------------------------------------------------
+            # PRIMEIRA TENTATIVA
+            # ----------------------------------------------------------------
+
+            response = (
+                await self.openrouter_chat(
+                    messages=final_messages,
+                    use_tools=False,
+                )
+            )
+
+            answer = (
+                self.clean_final_response(
+                    self.response_text(
+                        response
+                    )
+                )
+            )
+
+            if answer:
+
+                self.last_agent_text = answer
+
+                # ------------------------------------------------------------
+                # NOVO:
+                # guarda a análise final para que a UI possa utilizá-la
+                # na geração do relatório.
+                # ------------------------------------------------------------
+
+                self.technical_report = answer
+
+                return answer
 
             self.log_detail(
-                f"🤖 Iteração do agente: "
-                f"{iteration + 1}/"
-                f"{MAX_AGENT_ITERATIONS}"
+                "⚠️ OpenRouter retornou resposta "
+                "final vazia."
             )
 
+            # ----------------------------------------------------------------
+            # SEGUNDA TENTATIVA
+            # ----------------------------------------------------------------
 
-            response = await (
-                self.openrouter_chat(
-                    self.messages,
-                    tools=tools,
+            retry_messages = list(
+                final_messages
+            )
+
+            retry_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "A resposta anterior veio vazia. "
+                        "Retorne somente a análise técnica "
+                        "final, em português do Brasil, "
+                        "usando os dados do PlanApp já "
+                        "fornecidos nesta conversa. "
+                        "Não retorne JSON e não inclua "
+                        "raciocínio interno."
+                    ),
+                }
+            )
+
+            response = (
+                await self.openrouter_chat(
+                    messages=retry_messages,
+                    use_tools=False,
                 )
             )
 
-
-            message = response.choices[0].message
-
-
-            content = (
-                getattr(
-                    message,
-                    "content",
-                    None,
-                )
-                or ""
-            )
-
-
-            tool_calls = (
-                getattr(
-                    message,
-                    "tool_calls",
-                    None,
-                )
-                or []
-            )
-
-
-            # ----------------------------------------------------
-            # Nenhuma ferramenta solicitada
-            # ----------------------------------------------------
-
-            if not tool_calls:
-
-                # ----------------------------------------------
-                # Se já temos dois pontos e ainda não avaliamos,
-                # a aplicação executa evaluate_link.
-                # ----------------------------------------------
-
-                if (
-                    len(
-                        self.geocoded_points
-                    ) >= 2
-                    and not self.evaluate_executed
-                ):
-
-                    technical_result = (
-                        await self.ensure_evaluate_link(
-                            self.link_parameters
-                        )
-                    )
-
-
-                    self.messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "CONTEXTO TÉCNICO DO PLANAPP:\n"
-                                + json.dumps(
-                                    self.build_technical_context(
-                                        technical_result
-                                    ),
-                                    ensure_ascii=False,
-                                    indent=2,
-                                    default=str,
-                                )
-                            ),
-                        }
-                    )
-
-
-                    continue
-
-
-                return content
-
-
-            # ----------------------------------------------------
-            # Mensagem do assistant com tool_calls
-            # ----------------------------------------------------
-
-            assistant_message = {
-                "role": "assistant",
-                "content": content or None,
-                "tool_calls": [],
-            }
-
-
-            for tool_call in tool_calls:
-
-                function = getattr(
-                    tool_call,
-                    "function",
-                    None,
-                )
-
-
-                if function is None:
-                    continue
-
-
-                name = getattr(
-                    function,
-                    "name",
-                    None,
-                )
-
-
-                arguments = getattr(
-                    function,
-                    "arguments",
-                    "{}",
-                )
-
-
-                assistant_message[
-                    "tool_calls"
-                ].append(
-                    {
-                        "id": tool_call.id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": arguments,
-                        },
-                    }
-                )
-
-
-            self.messages.append(
-                assistant_message
-            )
-
-
-            # ----------------------------------------------------
-            # Executa cada tool call
-            # ----------------------------------------------------
-
-            for tool_call in tool_calls:
-
-                function = getattr(
-                    tool_call,
-                    "function",
-                    None,
-                )
-
-
-                if function is None:
-                    continue
-
-
-                tool_name = getattr(
-                    function,
-                    "name",
-                    None,
-                )
-
-
-                arguments = getattr(
-                    function,
-                    "arguments",
-                    "{}",
-                )
-
-
-                if isinstance(
-                    arguments,
-                    str,
-                ):
-
-                    try:
-
-                        arguments = json.loads(
-                            arguments
-                        )
-
-                    except Exception:
-
-                        arguments = {}
-
-
-                # ----------------------------------------------
-                # Segurança:
-                # somente geocode_place pode ser chamado
-                # pelo modelo.
-                # ----------------------------------------------
-
-                if (
-                    tool_name
-                    not in MODEL_ALLOWED_TOOLS
-                ):
-
-                    result = {
-                        "status": "error",
-                        "error": (
-                            "Ferramenta não permitida "
-                            "para execução pelo modelo."
-                        ),
-                        "tool": tool_name,
-                    }
-
-                else:
-
-                    result = (
-                        await self.execute_mcp_tool(
-                            tool_name,
-                            arguments,
-                        )
-                    )
-
-
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": (
-                            tool_call.id
-                        ),
-                        "content": json.dumps(
-                            result,
-                            ensure_ascii=False,
-                            default=str,
-                        ),
-                    }
-                )
-
-
-            # ----------------------------------------------------
-            # Se já temos os dois pontos,
-            # execute evaluate_link automaticamente.
-            # ----------------------------------------------------
-
-            if (
-                len(
-                    self.geocoded_points
-                ) >= 2
-                and not self.evaluate_executed
-            ):
-
-                technical_result = (
-                    await self.ensure_evaluate_link(
-                        self.link_parameters
+            answer = (
+                self.clean_final_response(
+                    self.response_text(
+                        response
                     )
                 )
+            )
 
+            if answer:
 
-                self.messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "A geocodificação foi concluída. "
-                            "A aplicação executou automaticamente "
-                            "evaluate_link. "
-                            "Use exclusivamente os dados técnicos "
-                            "abaixo para a resposta final.\n\n"
-                            + json.dumps(
-                                self.build_technical_context(
-                                    technical_result
-                                ),
-                                ensure_ascii=False,
-                                indent=2,
-                                default=str,
-                            )
-                        ),
-                    }
-                )
+                self.last_agent_text = answer
 
+                # ------------------------------------------------------------
+                # NOVO:
+                # também guarda a resposta da segunda tentativa.
+                # ------------------------------------------------------------
 
-                # ----------------------------------------------
-                # A próxima iteração será a resposta final.
-                # ----------------------------------------------
+                self.technical_report = answer
 
-                continue
+                return answer
 
+            self.log_detail(
+                "⚠️ Segunda tentativa também retornou "
+                "resposta vazia."
+            )
 
-        return (
-            "A análise foi executada, mas o modelo "
-            "atingiu o limite de processamento da resposta."
-        )
+            return ""
 
+        except Exception as exc:
 
-    # ============================================================
+            self.log_detail(
+                f"⚠️ Erro na resposta final: {exc}"
+            )
+
+            return ""
+
+        finally:
+
+            self.messages = old_messages
+
+    # ========================================================================
     # ASK
-    # ============================================================
+    # ========================================================================
 
     async def ask(
         self,
         text,
     ):
 
-        # --------------------------------------------------------
-        # Verificação da API key
-        # --------------------------------------------------------
+        self.reset_common_state()
 
-        if not OPENROUTER_API_KEY:
+        self.registered = False
+        self.technical_context_added = False
+        self.last_agent_text = ""
+        self.technical_report = ""
+        self.report_pdf_path = None
+        self.user_request = text
 
-            error_message = (
-                "OPENROUTER_API_KEY não está configurada "
-                "no ambiente do Jupyter."
-            )
+        # ETAPA 2 — MULTI-HOP
+        self.multi_hop_requested = self.detect_multi_hop_request(text)
+        self.geocoding_followup_sent = False
+        self.visualizations_generated_hops = set()
 
-            self.log(
-                "❌ " + error_message
-            )
-
-            return error_message
-
-
-        # --------------------------------------------------------
-        # Reset
-        # --------------------------------------------------------
-
-        self.messages = []
-
-        self.geocoded_points = []
-
-        self.evaluate_executed = False
-
-        self.last_evaluate_result = None
-
-        self.evaluate_error = None
-
-        self.visualizations = []
+        self.log_detail(
+            "🔗 Solicitação multi-hop detectada."
+            if self.multi_hop_requested
+            else "🔗 Solicitação de enlace único."
+        )
 
         self.map = None
+        self.map_image_bytes = None
+        self.visualizations = []
+        self.visualization_images = []
 
-        self.tool_count = 0
+        try:
+            self.extract_link_parameters(text)
+        except Exception as exc:
+            self.log_detail(f"⚠️ Erro ao extrair parâmetros: {exc}")
 
-        self.current_stage = 0
+        try:
+            await self.create_client()
+        except Exception as exc:
+            self.log_detail(f"❌ Erro ao criar cliente OpenRouter: {exc}")
+            return "Não foi possível conectar ao OpenRouter. Verifique a OPENROUTER_API_KEY."
 
+        try:
+            await self.connect()
+        except Exception as exc:
+            self.log_detail(f"❌ Erro ao conectar ao MCP: {exc}")
+            return "Não foi possível conectar ao serviço PlanApp."
 
-        # --------------------------------------------------------
-        # Limpa visualizações da UI
-        # --------------------------------------------------------
-
-        if self.visualization_callback:
-
-            try:
-
-                self.visualization_callback(
-                    []
-                )
-
-            except Exception:
-                pass
-
-
-        # --------------------------------------------------------
-        # Parâmetros
-        # --------------------------------------------------------
-
-        parameters = (
-            self.extract_link_parameters(
-                text
-            )
-        )
-
-
-        self.log(
-            "🟡 Etapa 1 — Processando solicitação"
-        )
-
-
-        self.log_detail(
-            "Parâmetros detectados:"
-        )
-
-
-        self.log_detail(
-            json.dumps(
-                parameters,
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            )
-        )
-
-
-        # --------------------------------------------------------
-        # MCP
-        # --------------------------------------------------------
-
-        await self.connect()
-
-
-        register_result = (
+        try:
             await self.register()
-        )
-
-
-        if (
-            isinstance(
-                register_result,
-                dict,
-            )
-            and str(
-                register_result.get(
-                    "status",
-                    "",
-                )
-            ).lower()
-            == "error"
-        ):
-
-            return (
-                "Não foi possível registrar o usuário "
-                "no PlanApp."
-            )
-
-
-        # --------------------------------------------------------
-        # Mensagens iniciais
-        # --------------------------------------------------------
+            self.registered = True
+        except Exception as exc:
+            self.log_detail(f"❌ Erro no registro do usuário: {exc}")
+            return "Não foi possível registrar o usuário no serviço PlanApp."
 
         self.messages = [
-
-            {
-                "role": "system",
-                "content": self.system_prompt(),
-            },
-
-            {
-                "role": "user",
-                "content": text,
-            },
+            {"role": "system", "content": self.system_prompt()},
+            {"role": "user", "content": text},
         ]
 
+        try:
+            await self.agent_turn()
+        except Exception as exc:
+            self.log_detail(f"❌ Erro no agent_turn: {exc}")
 
-        # --------------------------------------------------------
-        # Agente
-        # --------------------------------------------------------
+        # APLICAÇÃO — avaliação final
+        try:
+            result = await self.ensure_application_evaluation()
+        except Exception as exc:
+            self.log_detail(f"❌ Erro na avaliação da aplicação: {exc}")
+            result = None
 
-        resultado = await (
-            self.agent_turn(
-                text
+        if result is not None:
+            if not self.technical_context_added:
+                self.append_technical_context(result)
+
+            final_result = (
+                getattr(self, "global_result", result)
+                if self.multi_hop_requested
+                else self.last_evaluate_result
             )
-        )
-
-
-        # --------------------------------------------------------
-        # Garantia final:
-        # se temos dois pontos mas evaluate não foi executado,
-        # executamos diretamente pela aplicação.
-        # --------------------------------------------------------
-
-        if (
-            len(
-                self.geocoded_points
-            ) >= 2
-            and not self.evaluate_executed
-        ):
-
-            technical_result = (
-                await self.ensure_evaluate_link(
-                    parameters
-                )
-            )
-
-            # ----------------------------------------------
-            # Gera resposta final diretamente.
-            # ----------------------------------------------
-
-            resultado = (
-                await self.generate_final_response(
-                    text,
-                    technical_result,
-                )
-            )
-
-
-        # --------------------------------------------------------
-        # Se evaluate já ocorreu, sempre gera resposta final
-        # baseada nos dados reais do PlanApp.
-        # --------------------------------------------------------
-
-        elif self.evaluate_executed:
-
-            resultado = (
-                await self.generate_final_response(
-                    text,
-                    self.last_evaluate_result,
-                )
-            )
-
-
-        # --------------------------------------------------------
-        # Garantia final do mapa
-        # --------------------------------------------------------
-
-        if (
-            len(
-                self.geocoded_points
-            ) >= 2
-            and self.map is None
-        ):
-
-            await (
-                self.mostrar_mapa_apos_geocodificacao()
-            )
-
-
-        if self.map is not None:
-
-            self.log(
-                "🗺️ Mapa disponível."
-            )
-
-
-        # --------------------------------------------------------
-        # Estado final
-        # --------------------------------------------------------
-
-        if self.evaluate_error is not None:
-
-            self.current_stage = 3
-
-            self.log(
-                "🔴 Etapa 3 — Avaliação técnica "
-                "não concluída"
-            )
-
-            self.log(
-                "❌ A análise técnica retornou erro."
-            )
-
-
-        elif self.evaluate_executed:
-
-            self.current_stage = 3
-
-            self.log(
-                "🔵 Etapa 3 — Interpretando resultados"
-            )
-
-            self.log(
-                "🟢 Resultado técnico recebido "
-                "do PlanApp."
-            )
-
-            self.log(
-                "🟢 Análise concluída."
-            )
-
-
         else:
+            final_result = None
 
-            self.current_stage = 3
+        # MAPA
+        if self.multi_hop_requested:
+            if (
+                getattr(self, "multi_hop_executed", False)
+                and getattr(self, "hops", None)
+            ):
+                try:
+                    from map_utils import (
+                        mostrar_mapa_multihop,
+                        gerar_imagem_mapa_multihop,
+                    )
 
-            self.log(
-                "🟡 Análise concluída sem "
-                "avaliação técnica."
+                    self.map = mostrar_mapa_multihop(self.hops)
+                    if self.map_callback:
+                        self.map_callback(self.map)
+
+                    self.log_detail(
+                        "Mapa multi-hop preparado "
+                        f"com {len(self.hops)} hops."
+                    )
+                    self.log_detail(
+                        "Mapa interativo contém "
+                        f"{len(self.geocoded_points)} pontos da rota."
+                    )
+
+                    self.map_image_bytes = gerar_imagem_mapa_multihop(
+                        self.hops
+                    )
+                    self.log_detail(
+                        "Imagem estática do mapa multi-hop preparada para o relatório."
+                    )
+                except Exception as exc:
+                    self.log_detail(f"⚠️ Erro no mapa multi-hop: {exc}")
+        elif len(self.geocoded_points) >= 2:
+            await self.mostrar_mapa_apos_geocodificacao()
+
+        # VISUALIZAÇÕES
+        # Em multi-hop elas já são geradas pela orquestração da aplicação.
+        if (
+            not self.multi_hop_requested
+            and self.evaluate_executed
+            and not self.evaluate_error
+        ):
+            await self.gerar_visualizacoes()
+
+        # RESPOSTA FINAL
+        if final_result is not None:
+            self.log_detail(
+                "🧠 Iniciando análise técnica final do OpenRouter."
             )
 
+            answer = await self.generate_final_response(
+                text,
+                final_result,
+                technical_report=None,
+            )
 
-        return resultado
+            if not answer:
+                self.log_detail(
+                    "⚠️ OpenRouter não retornou texto final. Usando fallback."
+                )
+                answer = self._fallback_final_response()
+
+            self.technical_report = answer
+
+            self.build_report(
+                final_result,
+                analysis_text=answer,
+            )
+        else:
+            answer = self.last_agent_text
+
+        return answer
 
 
-    # ============================================================
+    # ========================================================================
     # CLOSE
-    # ============================================================
+    # ========================================================================
 
-    async def close(self):
+    async def close(
+        self,
+    ):
 
         try:
 
-            await self.exit_stack.aclose()
+            if self.client is not None:
 
-        finally:
+                await self.client.close()
 
-            self.mcp_session = None
+        except Exception as exc:
 
-            self.mcp_tools = []
+            self.log_detail(
+                f"⚠️ Erro ao fechar OpenRouter: "
+                f"{exc}"
+            )
 
-            self.connected = False
+        self.client = None
+
+        await super().close()
+
+
+# ============================================================================
+# COMPATIBILIDADE COM notebook_ui.py
+# ============================================================================
+
+PlanAppAgent = PlanAppAgentOpenRouter

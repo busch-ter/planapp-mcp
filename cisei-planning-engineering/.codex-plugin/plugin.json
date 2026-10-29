@@ -1,0 +1,25 @@
+{
+  "interface": {
+    "displayName": "CISEI Planning Engineering",
+    "shortDescription": "Review CISEI planning architecture and contracts",
+    "longDescription": "Use the reviewed CISEI engineering snapshot to explain planning architecture and usage, review project results and revisions, and define assistant SDK and API contracts while distinguishing implemented behavior from decisions and gaps.",
+    "developerName": "CISEI",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Start the CISEI exploration workflow",
+      "Explain the current planning architecture and its boundaries.",
+      "Review the assistant SDK validation and revision workflow."
+    ]
+  },
+  "name": "cisei-planning-engineering",
+  "version": "0.4.0",
+  "description": "Engineering design assistant for CISEI network planning SDK and service integration.",
+  "author": {
+    "name": "CISEI"
+  },
+  "keywords": [],
+  "skills": "./skills"
+}
