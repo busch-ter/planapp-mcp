@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cisei-scenario-sdk"
-version = "0.1.0"
+version = "0.1.1"
 description = "CISEI Scenario Builder SDK"
 requires-python = ">=3.10"
 dependencies = [
@@ -20,7 +20,7 @@ notebook = [
     "ipython",
     "ipywidgets",
     "pandas",
-    "cisei-planning-sdk==0.1.18",
+    "cisei-planning-sdk>=0.1.36,<0.2.0",
 ]
 
 [tool.setuptools.packages.find]
