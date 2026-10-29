@@ -1,0 +1,46 @@
+name: Build CISEI Scenario SDK
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "packages/cisei-scenario-sdk/**"
+      - ".github/workflows/build-scenario-sdk.yml"
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build
+
+      - name: Build wheel
+        run: |
+          python -m build \
+            packages/cisei-scenario-sdk \
+            --wheel \
+            --outdir dist
+
+      - name: Verify wheel
+        run: |
+          ls -lh dist/*.whl
+          python -m zipfile -t dist/*.whl
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: cisei-scenario-sdk-wheel
+          path: dist/*.whl
+          if-no-files-found: error
