@@ -23,13 +23,31 @@ class ScenarioConfirmationRequiredError(ScenarioConversationError):
 
 
 class ScenarioConversation:
-    """Camada de conversação que encaminha dados estruturados à sessão."""
+    """Camada conversacional; avisos de compatibilidade não bloqueiam autoria."""
 
-    def __init__(self, project: PlanningProject, *, session: ScenarioSession | None = None):
+    def __init__(
+        self,
+        project: PlanningProject,
+        *,
+        session: ScenarioSession | None = None,
+        nodes_source: str | None = None,
+        prepare_nodes: bool = False,
+    ):
         if not isinstance(project, PlanningProject):
             raise TypeError("project must be an instance of PlanningProject")
         self.project = project
-        self.session = session if session is not None else ScenarioSession(project)
+        if session is not None:
+            if nodes_source is not None and session.nodes_source != nodes_source:
+                raise ValueError(
+                    "nodes_source diverge da origem configurada na ScenarioSession."
+                )
+            self.session = session
+        else:
+            self.session = ScenarioSession(
+                project,
+                nodes_source=nodes_source,
+                prepare_nodes=prepare_nodes,
+            )
 
     @property
     def project_path(self) -> Path:
@@ -59,6 +77,7 @@ class ScenarioConversation:
             "confirmed": self.session.confirmed,
             "missing": list(validation.missing),
             "errors": list(validation.errors),
+            "warnings": self.session.compatibility_warnings(),
             "project_path": str(self.project.path),
             "scenario_path": str(self.project.scenario_path),
         }
@@ -76,6 +95,7 @@ class ScenarioConversation:
             "confirmed": self.session.confirmed,
             "missing": list(validation.missing),
             "errors": list(validation.errors),
+            "warnings": self.session.compatibility_warnings(),
         }
 
     def replace(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -88,6 +108,7 @@ class ScenarioConversation:
             "confirmed": self.session.confirmed,
             "missing": list(validation.missing),
             "errors": list(validation.errors),
+            "warnings": self.session.compatibility_warnings(),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -107,16 +128,21 @@ class ScenarioConversation:
             "confirmed": self.session.confirmed,
             "missing": list(validation.missing),
             "errors": list(validation.errors),
+            "warnings": self.session.compatibility_warnings(),
         }
 
     def generate_toml(self) -> str:
         if not self.session.confirmed:
-            raise ScenarioConfirmationRequiredError("Scenario must be explicitly confirmed before generating TOML.")
+            raise ScenarioConfirmationRequiredError(
+                "Scenario must be explicitly confirmed before generating TOML."
+            )
         return self.session.generate_toml()
 
     def save(self) -> Path:
         if not self.session.confirmed:
-            raise ScenarioConfirmationRequiredError("Scenario must be explicitly confirmed before saving the project.")
+            raise ScenarioConfirmationRequiredError(
+                "Scenario must be explicitly confirmed before saving the project."
+            )
         return self.session.save()
 
     def finalize(self) -> Path:
@@ -126,7 +152,10 @@ class ScenarioConversation:
         if not validation.complete:
             raise ScenarioNotReadyError("Scenario is incomplete. Missing fields: " + ", ".join(validation.missing))
         if not self.session.confirmed:
-            raise ScenarioConfirmationRequiredError("Scenario must be explicitly confirmed before finalization.")
+            raise ScenarioConfirmationRequiredError(
+                "Scenario must be explicitly confirmed before finalization."
+            )
+        # Session.save() writes only scenario.toml. It does not execute planning.
         return self.session.save()
 
     def conversation_state(self) -> dict[str, Any]:
@@ -137,6 +166,7 @@ class ScenarioConversation:
             "confirmed": status["confirmed"],
             "missing": status["missing"],
             "errors": status["errors"],
+            "warnings": status["warnings"],
         }
         if status["complete"] and status["valid"] and status["confirmed"]:
             state["next_action"] = "finalize"
@@ -149,8 +179,22 @@ class ScenarioConversation:
         return state
 
     def __repr__(self) -> str:
-        return ("ScenarioConversation(" f"project={self.project.path!s}, " f"valid={self.valid}, " f"complete={self.complete}, " f"confirmed={self.confirmed}" ")")
+        return (
+            "ScenarioConversation("
+            f"project={self.project.path!s}, "
+            f"valid={self.valid}, complete={self.complete}, confirmed={self.confirmed}"
+            ")"
+        )
 
 
-def create_scenario_conversation(project_path: str | Path) -> ScenarioConversation:
-    return ScenarioConversation(PlanningProject(project_path))
+def create_scenario_conversation(
+    project_path: str | Path,
+    *,
+    nodes_source: str | None = None,
+    prepare_nodes: bool = False,
+) -> ScenarioConversation:
+    return ScenarioConversation(
+        PlanningProject(project_path),
+        nodes_source=nodes_source,
+        prepare_nodes=prepare_nodes,
+    )

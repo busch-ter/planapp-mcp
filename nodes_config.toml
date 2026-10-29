@@ -1,0 +1,31 @@
+# CONFIGURAÇÃO DE TESTE ESTRUTURAL — NÃO APROVADA PARA PLANEJAMENTO RF.
+# Copie para projects/<nome_do_projeto>/nodes_config.toml.
+# Perfis e flags abaixo são PROVISÓRIOS para testar a geração do CSV.
+# Antes de construir scenario.toml e planejar, revise TODOS os perfis/flags.
+[compiler]
+adapter = "copel"
+output = "nodes.csv"
+source_crs = "EPSG:31982"
+allow_synthetic_site_ids = true
+use_structure_height_as_mount_height = true
+substation_zero_height_m = 10.0 # provisório
+
+[substations]
+kind = "cell"
+device_profile = "copel_substation_test"
+connected = true # PROVISÓRIO; NÃO inferido do CSV
+can_route = true # PROVISÓRIO; NÃO inferido do CSV
+
+[external_towers]
+kind = "cell"
+device_profile = "copel_tower_test"
+connected = true # PROVISÓRIO; NÃO inferido do CSV
+can_route = true # PROVISÓRIO; NÃO inferido do CSV
+
+[automation]
+kind = "leaf"
+device_profile = "copel_automation_test"
+connected = false # PROVISÓRIO; NÃO inferido do CSV
+can_route = false # PROVISÓRIO; NÃO inferido do CSV
+mount_height_m = 7.0 # provisório
+types = ["RA", "GM", "BRT_A", "GA", "RA_NOVO", "CO", "TS_A_SG", "OR", "OM", "FS_A_SG"]

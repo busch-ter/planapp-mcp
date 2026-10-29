@@ -1,6 +1,5 @@
 # ============================================================
-# PLANAPP / VIBEPLANNER AI
-# SCENARIO AGENT — POC-07a
+# PLANAPP / VIBEPLANNER AI — SCENARIO AGENT
 # ============================================================
 from __future__ import annotations
 
@@ -18,11 +17,29 @@ class ScenarioAgentError(RuntimeError):
 class ScenarioAgent:
     """Orquestra o fluxo collect -> validate -> confirm -> finalize."""
 
-    def __init__(self, project: PlanningProject, *, conversation: ScenarioConversation | None = None):
+    def __init__(
+        self,
+        project: PlanningProject,
+        *,
+        conversation: ScenarioConversation | None = None,
+        nodes_source: str | None = None,
+        prepare_nodes: bool = False,
+    ):
         if not isinstance(project, PlanningProject):
             raise TypeError("project must be an instance of PlanningProject")
         self.project = project
-        self.conversation = conversation if conversation is not None else ScenarioConversation(project)
+        if conversation is not None:
+            if nodes_source is not None and conversation.session.nodes_source != nodes_source:
+                raise ValueError(
+                    "nodes_source diverge da origem configurada na ScenarioConversation."
+                )
+            self.conversation = conversation
+        else:
+            self.conversation = ScenarioConversation(
+                project,
+                nodes_source=nodes_source,
+                prepare_nodes=prepare_nodes,
+            )
 
     @property
     def project_path(self) -> Path:
@@ -98,6 +115,7 @@ class ScenarioAgent:
             "confirmed": state["confirmed"],
             "missing": list(state["missing"]),
             "errors": list(state["errors"]),
+            "warnings": list(state.get("warnings", [])),
             "scenario": self.snapshot(),
             "project_path": str(self.project_path),
             "scenario_path": str(self.scenario_path),
@@ -114,23 +132,22 @@ class ScenarioAgent:
             "confirmed": state["confirmed"],
             "missing": list(state["missing"]),
             "errors": list(state["errors"]),
+            "warnings": list(state.get("warnings", [])),
         }
         if state["next_action"] == "collect_missing_fields":
             result["request"] = {"type": "missing_fields", "fields": list(state["missing"])}
         elif state["next_action"] == "resolve_validation_errors":
             result["request"] = {"type": "validation_errors", "errors": list(state["errors"])}
         elif state["next_action"] == "confirm":
-            result["request"] = {"type": "confirmation", "scenario": self.snapshot()}
+            result["request"] = {"type": "confirmation", "scenario": self.snapshot(), "warnings": list(state.get("warnings", []))}
         elif state["next_action"] == "finalize":
-            result["request"] = {"type": "finalization_ready", "scenario": self.snapshot()}
+            result["request"] = {"type": "finalization_ready", "scenario": self.snapshot(), "warnings": list(state.get("warnings", []))}
         return result
 
     def process_confirmation(self, confirmed: bool) -> dict[str, Any]:
         if not isinstance(confirmed, bool):
             raise TypeError("confirmed must be a boolean")
         if not confirmed:
-            # Rejeitar a confirmação não significa que faltam campos.
-            # O cenário permanece intacto e volta para revisão/edição.
             return {
                 "action": "review_scenario",
                 "confirmed": False,
@@ -138,32 +155,56 @@ class ScenarioAgent:
                 "valid": self.valid,
                 "missing": self.missing_fields(),
                 "errors": list(self.conversation_state()["errors"]),
+                "warnings": list(self.conversation_state().get("warnings", [])),
                 "message": "Scenario remains unconfirmed. Ask what the user wants to change.",
             }
         result = self.confirm()
+        accepted = bool(result.get("confirmed"))
         return {
-            "action": "finalize",
+            "action": "finalize" if accepted and result.get("valid") and result.get("complete") else "review_scenario",
             "valid": result["valid"],
             "complete": result["complete"],
-            "confirmed": result["confirmed"],
+            "confirmed": accepted,
             "missing": list(result["missing"]),
             "errors": list(result["errors"]),
+            "warnings": list(result.get("warnings", [])),
         }
 
     def process_finalize(self) -> dict[str, Any]:
+        state = self.conversation_state()
+        if not (state["valid"] and state["complete"] and state["confirmed"] and state["next_action"] == "finalize"):
+            raise ScenarioAgentError(
+                "Finalização bloqueada: cenário precisa estar válido, completo e confirmado. "
+                f"Estado atual: valid={state['valid']}, complete={state['complete']}, confirmed={state['confirmed']}."
+            )
         path = self.finalize()
         return {
             "action": "completed",
             "valid": True,
             "complete": True,
             "confirmed": True,
+            "warnings": list(state.get("warnings", [])),
             "scenario_path": str(path),
             "project_path": str(self.project_path),
         }
 
     def __repr__(self) -> str:
-        return ("ScenarioAgent(" f"project={self.project.path!s}, " f"valid={self.valid}, " f"complete={self.complete}, " f"confirmed={self.confirmed}" ")")
+        return (
+            "ScenarioAgent("
+            f"project={self.project.path!s}, valid={self.valid}, "
+            f"complete={self.complete}, confirmed={self.confirmed}"
+            ")"
+        )
 
 
-def create_scenario_agent(project_path: str | Path) -> ScenarioAgent:
-    return ScenarioAgent(PlanningProject(project_path))
+def create_scenario_agent(
+    project_path: str | Path,
+    *,
+    nodes_source: str | None = None,
+    prepare_nodes: bool = False,
+) -> ScenarioAgent:
+    return ScenarioAgent(
+        PlanningProject(project_path),
+        nodes_source=nodes_source,
+        prepare_nodes=prepare_nodes,
+    )

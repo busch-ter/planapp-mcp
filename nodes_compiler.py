@@ -44,6 +44,7 @@ class _TableSource:
     path: Path
     headers: tuple[str, ...]
     rows: list[dict[str, str]]
+    errors: tuple[str, ...] = ()
 
     @property
     def canonical_headers(self) -> set[str]:
@@ -99,11 +100,13 @@ class NodesCompiler:
     BOOLEANS = {"true", "false"}
     MAX_COMBINATIONS_TO_TEST = 20_000
 
-    def __init__(self, project_path: str | Path) -> None:
+    def __init__(self, project_path: str | Path, *, copel_config=None) -> None:
         self.project_path = Path(project_path).resolve()
         self.data_path = self.project_path / "data"
         self.default_output = self.project_path / "nodes.csv"
         self.last_report: CompilationReport | None = None
+        self.copel_config = copel_config
+        self.nodes_config_path = self.project_path / "nodes_config.toml"
 
     def inspect_sources(self) -> list[Path]:
         """Lista arquivos regulares encontrados recursivamente em data/."""
@@ -213,15 +216,32 @@ class NodesCompiler:
 
     @classmethod
     def read_csv(cls, source_path: str | Path) -> list[dict[str, str]]:
-        """Lê um CSV canônico; x, y e rank podem estar ausentes no cabeçalho."""
+        """Lê CSV canônico e rejeita cabeçalhos/linhas estruturalmente inválidos."""
         source = cls._read_table(Path(source_path))
         if source is None:
-            raise NodesValidationError(f"Não foi possível ler um CSV tabular: {source_path}")
+            raise NodesValidationError(
+                f"Não foi possível ler um CSV tabular: {source_path}"
+            )
+
+        if source.errors:
+            raise NodesValidationError(
+                f"{source_path}: " + "; ".join(source.errors)
+            )
+
+        allowed = set(cls.COLUMNS)
+        unknown = set(source.headers) - allowed
+        if unknown:
+            raise NodesValidationError(
+                f"{source_path}: colunas fora do esquema canônico: "
+                f"{sorted(unknown)}"
+            )
+
         missing = set(cls.REQUIRED) - set(source.headers)
         if missing:
             raise NodesValidationError(
                 f"{source_path}: faltam colunas obrigatórias: {sorted(missing)}"
             )
+
         return cls.validate_rows(source.rows)
 
     @staticmethod
@@ -230,34 +250,74 @@ class NodesCompiler:
 
     @classmethod
     def _read_table(cls, path: Path) -> _TableSource | None:
-        """Tenta ler arquivo texto como tabela delimitada sem confiar no nome."""
+        """Lê tabela delimitada e registra problemas estruturais para validação."""
         try:
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
                 sample = handle.read(65_536)
+
             if not sample.strip():
                 return None
+
             try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\\t|")
             except csv.Error:
                 dialect = csv.excel
+
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
                 reader = csv.DictReader(handle, dialect=dialect)
                 if not reader.fieldnames:
                     return None
-                headers = tuple((name or "").strip().lstrip("\ufeff") for name in reader.fieldnames)
+
+                headers = tuple(
+                    (name or "").strip().lstrip("\\ufeff")
+                    for name in reader.fieldnames
+                )
+                errors: list[str] = []
+
+                duplicates = sorted({
+                    name for name in headers
+                    if name and headers.count(name) > 1
+                })
+                if duplicates:
+                    errors.append(
+                        f"colunas duplicadas no cabeçalho: {duplicates}"
+                    )
+
+                if any(not name for name in headers):
+                    errors.append("há coluna com cabeçalho vazio")
+
                 normalized_rows: list[dict[str, str]] = []
                 for raw in reader:
-                    if raw is None or cls._is_empty_row(raw):
+                    if raw is None:
                         continue
+
+                    # DictReader usa a chave None para campos além do cabeçalho.
+                    extra = raw.get(None)
+                    if extra and any(str(value or "").strip() for value in extra):
+                        errors.append(
+                            f"quantidade de campos excede o cabeçalho "
+                            f"na linha {reader.line_num}"
+                        )
+
+                    if cls._is_empty_row(raw):
+                        continue
+
                     row: dict[str, str] = {}
                     for key, value in raw.items():
                         if key is None:
-                            # Campos excedentes costumam indicar um formato malformado.
                             continue
-                        clean_key = key.strip().lstrip("\ufeff")
-                        row[clean_key] = "" if value is None else str(value).strip()
+                        clean_key = key.strip().lstrip("\\ufeff")
+                        row[clean_key] = (
+                            "" if value is None else str(value).strip()
+                        )
                     normalized_rows.append(row)
-                return _TableSource(path=path, headers=headers, rows=normalized_rows)
+
+                return _TableSource(
+                    path=path,
+                    headers=headers,
+                    rows=normalized_rows,
+                    errors=tuple(dict.fromkeys(errors)),
+                )
         except (OSError, UnicodeError, csv.Error):
             return None
 
@@ -322,6 +382,20 @@ class NodesCompiler:
                 if missing else "Cabeçalho contém todos os campos obrigatórios."
             )
             preliminary.append(SourceAssessment(rel, recognized, len(table.rows), True, reason))
+
+        if not tables and (self.copel_config is not None or self.nodes_config_path.is_file()):
+            from nodes_source_copel import compile_copel
+            config = self.copel_config
+            if config is None:
+                from nodes_config_loader import load_nodes_config
+                config = load_nodes_config(self.nodes_config_path)
+            records, paths = compile_copel(self.data_path, config)
+            validated = self.validate_rows(records)
+            source_tables = [_TableSource(path=p, headers=(), rows=[]) for p in paths]
+            return self._write_result(
+                validated, source_tables, output_path, overwrite,
+                "copel_adapter", preliminary,
+            )
 
         if not tables:
             self.last_report = CompilationReport(
@@ -671,6 +745,7 @@ def prepare_project_nodes(
     project_path: str | Path,
     *,
     overwrite_existing: bool = False,
+    copel_config=None,
 ) -> tuple[Path, CompilationReport]:
     """Prepara nodes.csv antes da inicialização do agente/LLM.
 
@@ -678,7 +753,7 @@ def prepare_project_nodes(
     e gera nodes.csv. Se nodes.csv já existir, valida e reutiliza sem sobrescrever.
     Para reconstruí-lo explicitamente, use overwrite_existing=True.
     """
-    compiler = NodesCompiler(project_path)
+    compiler = NodesCompiler(project_path, copel_config=copel_config)
     output = compiler.prepare_output(overwrite_existing=overwrite_existing)
     if compiler.last_report is None:  # proteção defensiva
         raise RuntimeError("O compilador não produziu relatório de preparação.")
