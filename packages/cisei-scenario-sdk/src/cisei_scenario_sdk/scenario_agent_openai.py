@@ -12,7 +12,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from cisei_planning_sdk.project import PlanningProject
+from cisei_scenario_sdk.scenario_project import ScenarioProject, normalize_project
 from cisei_scenario_sdk.scenario_agent import ScenarioAgent
 from cisei_scenario_sdk.scenario_domain.provider import DomainContextProvider
 
@@ -59,15 +59,14 @@ class ScenarioAgentOpenAI:
 
     def __init__(
         self,
-        project: PlanningProject,
+        project: ScenarioProject | Path | str,
         *,
         model: str | None = None,
         client: OpenAI | None = None,
         domain_context_provider: DomainContextProvider | None = None,
         domain_context_sections: tuple[str, ...] | None = None,
     ):
-        if not isinstance(project, PlanningProject):
-            raise TypeError("project must be an instance of PlanningProject")
+        project = normalize_project(project)
 
         if domain_context_sections is not None:
             if not isinstance(domain_context_sections, tuple):
@@ -1132,7 +1131,7 @@ def create_scenario_agent_openai(
     domain_context_provider: DomainContextProvider | None = None,
     domain_context_sections: tuple[str, ...] | None = None,
 ) -> ScenarioAgentOpenAI:
-    project = PlanningProject(project_path)
+    project = ScenarioProject(project_path)
 
     return ScenarioAgentOpenAI(
         project,

@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import os
+import importlib.util
 import shutil
 import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any
 
-from cisei_planning_sdk.project import PlanningProject
+from cisei_scenario_sdk.scenario_project import ScenarioProject, normalize_project
 from cisei_scenario_sdk.nodes_compiler import CompilationReport, NodesCompiler
 from cisei_scenario_sdk.scenario_builder import ScenarioBuilder, ValidationResult
 
@@ -24,22 +25,20 @@ class ScenarioSession:
 
     def __init__(
         self,
-        project: PlanningProject,
+        project: ScenarioProject | Path | str,
         *,
         builder: ScenarioBuilder | None = None,
         nodes_compiler: NodesCompiler | None = None,
         nodes_source: str | None = None,
         prepare_nodes: bool = False,
     ) -> None:
-        if not isinstance(project, PlanningProject):
-            raise TypeError("project must be an instance of PlanningProject")
-        self.project = project
+        self.project = normalize_project(project)
         if nodes_source is None:
             nodes_source = "nodes.csv"
 
         self._nodes_source = self._normalize_nodes_source(nodes_source)
         self.builder = builder or ScenarioBuilder()
-        self.nodes_compiler = nodes_compiler or NodesCompiler(project.path)
+        self.nodes_compiler = nodes_compiler or NodesCompiler(self.project.path)
         self._confirmed = False
         self._nodes_report: CompilationReport | None = None
 
@@ -195,7 +194,13 @@ class ScenarioSession:
         )
 
     def compatibility_warnings(self) -> list[str]:
-        """Avisos não bloqueantes; incompatibilidades de perfil são erros."""
+        """Informa quando a validação adicional do planejador não está disponível."""
+        if importlib.util.find_spec("cisei_planning_sdk") is None:
+            return [
+                "cisei_planning_sdk não está instalado. "
+                "A validação adicional de compatibilidade com o planejador "
+                "não foi executada."
+            ]
         return []
 
     @staticmethod
@@ -279,11 +284,22 @@ class ScenarioSession:
         # Validação local pelo SDK. O TOML e o CSV são copiados para um diretório
         # temporário, pois o loader resolve instances.source relativamente ao TOML.
         # Nenhum MCP/Planning Service é chamado e nenhum artefato do projeto é criado.
+        if importlib.util.find_spec("cisei_planning_sdk") is None:
+            import warnings
+            warnings.warn(
+                "scenario.toml gerado sem validação adicional do "
+                "cisei_planning_sdk, pois o pacote não está instalado.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return parsed
+
         try:
             from cisei_planning_sdk.local_io import load_scenario_bundle
         except Exception as exc:
             raise RuntimeError(
-                "Não foi possível importar cisei_planning_sdk.local_io.load_scenario_bundle: "
+                "cisei_planning_sdk está instalado, mas a validação local "
+                "não pôde ser carregada: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 

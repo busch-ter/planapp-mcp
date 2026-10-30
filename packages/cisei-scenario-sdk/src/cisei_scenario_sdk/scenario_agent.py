@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from cisei_planning_sdk.project import PlanningProject
+from cisei_scenario_sdk.scenario_project import ScenarioProject, normalize_project
 from cisei_scenario_sdk.scenario_conversation import ScenarioConversation
 
 
@@ -19,14 +19,13 @@ class ScenarioAgent:
 
     def __init__(
         self,
-        project: PlanningProject,
+        project: ScenarioProject | Path | str,
         *,
         conversation: ScenarioConversation | None = None,
         nodes_source: str | None = None,
         prepare_nodes: bool = False,
     ):
-        if not isinstance(project, PlanningProject):
-            raise TypeError("project must be an instance of PlanningProject")
+        project = normalize_project(project)
         self.project = project
         if conversation is not None:
             if nodes_source is not None and conversation.session.nodes_source != nodes_source:
@@ -204,7 +203,7 @@ def create_scenario_agent(
     prepare_nodes: bool = False,
 ) -> ScenarioAgent:
     return ScenarioAgent(
-        PlanningProject(project_path),
+        ScenarioProject(project_path),
         nodes_source=nodes_source,
         prepare_nodes=prepare_nodes,
     )
