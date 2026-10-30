@@ -79,20 +79,11 @@ def validate_with_planning_sdk(
 
     finally:
         if definition_attempted:
-            url = (
-                base_url.rstrip("/")
-                + "/planning/scenarios/"
-                + quote(validation_id, safe="")
-            )
-
             try:
-                response = requests.delete(
-                    url,
-                    timeout=timeout,
+                payload = client._request(
+                    "DELETE",
+                    f"/planning/scenarios/{quote(validation_id, safe='')}",
                 )
-                response.raise_for_status()
-
-                payload = response.json()
                 report["cleanup_ok"] = True
                 report["cleanup_result"] = payload
 
