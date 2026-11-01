@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cisei-scenario-sdk"
-version = "0.1.3.dev3"
+version = "0.1.3.dev8"
 description = "CISEI Scenario Builder SDK"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,18 +12,18 @@ dependencies = [
     "tomlkit>=0.12",
     "PyYAML>=6.0",
     "pyproj",
-]
-
-[project.optional-dependencies]
-openai = [
     "openai",
-]
-notebook = [
     "ipython",
     "ipywidgets",
     "pandas",
-    "cisei-planning-sdk>=0.1.36,<0.2.0",
 ]
+
+
+[project.scripts]
+cisei-scenario-install-notebooks = "cisei_scenario_sdk.install_notebooks:main"
+
+[project.optional-dependencies]
+planning = ["cisei-planning-sdk>=0.1.36,<0.2.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -32,4 +32,8 @@ where = ["src"]
 cisei_scenario_sdk = [
     "resources/references/*.md",
     "resources/notebooks/*.ipynb",
+    "resources/examples/copel_palmeira/*.toml",
+    "resources/examples/copel_palmeira/*.csv",
+    "resources/examples/copel_palmeira/*.txt",
+    "resources/examples/copel_palmeira/data/*.CSV",
 ]

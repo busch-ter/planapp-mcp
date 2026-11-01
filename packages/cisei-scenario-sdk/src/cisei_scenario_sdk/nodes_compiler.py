@@ -106,7 +106,14 @@ class NodesCompiler:
         self.default_output = self.project_path / "nodes.csv"
         self.last_report: CompilationReport | None = None
         self.copel_config = copel_config
-        self.nodes_config_path = self.project_path / "nodes_config.toml"
+        config_in_data = self.data_path / "nodes_config.toml"
+        config_in_root = self.project_path / "nodes_config.toml"
+
+        self.nodes_config_path = (
+            config_in_data
+            if config_in_data.is_file()
+            else config_in_root
+        )
 
     def inspect_sources(self) -> list[Path]:
         """Lista arquivos regulares encontrados recursivamente em data/."""

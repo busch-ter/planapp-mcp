@@ -1,3 +1,4 @@
+from cisei_scenario_sdk.example_projects import install_example_projects
 import json
 from pathlib import Path
 import ipywidgets as widgets
@@ -12,6 +13,7 @@ class ScenarioBuilderApp:
     """Controlador de widgets; nenhuma chamada ao LLM é feita na construção."""
 
     def __init__(self, project_name, *, workspace, code_root, sdk_base_url):
+        install_example_projects(workspace)
         self.state = create_state(project_name, Path(workspace), Path(code_root))
         self.sdk_base_url = sdk_base_url
         self.upload = widgets.FileUpload(accept="", multiple=True, description="Selecionar arquivos",
