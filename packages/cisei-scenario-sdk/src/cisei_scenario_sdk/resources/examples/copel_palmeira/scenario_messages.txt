@@ -1,0 +1,113 @@
+Mensagem 1 — Objetivo e fonte de dados
+
+Quero construir um cenário de planejamento de rede LTE na faixa de 450 MHz para a COPEL, no projeto copel_novo.
+
+Utilize exclusivamente o nodes.csv já preparado e validado no diretório do projeto como fonte das instâncias.
+
+O sistema de coordenadas de trabalho é EPSG:31982.
+
+Não execute o planejamento nesta etapa e não crie ou altere o nodes.csv. Quero apenas construir, validar e confirmar o scenario.toml.
+
+
+
+
+
+Mensagem 2 — Perfis existentes no inventário
+O nodes.csv contém 1.033 instalações:
+- 46 subestações COPEL com device_profile = lte_cell e kind = cell.
+- 12 torres externas com device_profile = lte_cell e kind = cell.
+- 975 equipamentos de automação com device_profile = lte_leaf e kind = leaf.
+As 58 instalações lte_cell estão marcadas com connected = TRUE e can_route = TRUE.
+
+Os 975 clientes lte_leaf estão marcados com connected = FALSE e can_route = FALSE.
+
+Os valores individuais de mount_height_m, coordenadas e identificadores estão no CSV e devem ser preservados. A coluna rank está vazia no inventário.
+
+Defina exatamente os dois perfis de dispositivos lte_cell e lte_leaf. Não crie perfis adicionais sem necessidade.
+
+
+
+
+
+Mensagem 3 — Antenas setoriais das estações
+Cada instalação lte_cell, seja subestação ou torre externa, deverá utilizar três antenas setoriais LTE 450 MHz, com os seguintes parâmetros:
+- lte_sector_0: kind = sector, model_id = commscope_rv_65s_fvb, height_m = 7.0, azimuth_deg = 0.0, downtilt_deg = 0.0, beamwidth_deg = 120.0.
+- lte_sector_120: mesmo modelo, height_m = 7.0, azimuth_deg = 120.0, downtilt_deg = 0.0, beamwidth_deg = 120.0.
+- lte_sector_240: mesmo modelo, height_m = 7.0, azimuth_deg = 240.0, downtilt_deg = 0.0, beamwidth_deg = 120.0.
+As descrições devem indicar que são configurações PROVISÓRIAS de setores LTE 450, com seus respectivos azimutes.
+
+Mantenha esses valores explicitamente; não escolha orientações automaticamente com base na distribuição geográfica dos clientes.
+
+
+
+
+
+Mensagem 4 — Antena dos clientes
+Os equipamentos de automação lte_leaf utilizarão uma antena omnidirecional identificada como lte_client_omni, com:
+- kind = omni
+- model_id = pctel_boa9028
+- description = PROVISÓRIO: antena omni dos nós clientes
+- height_m = 7.0
+- azimuth_deg = 0.0
+- downtilt_deg = 0.0
+Não defina beamwidth_deg para essa antena omnidirecional.
+
+
+
+
+
+Mensagem 5 — Interfaces LTE
+Defina quatro interfaces de rádio LTE:
+1. lte_sector_0: tech = lte, freq_mhz = 450.0, tx_power_dbm = 43.0, antenna_id = lte_sector_0, can_relay = false.
+2. lte_sector_120: tech = lte, freq_mhz = 450.0, tx_power_dbm = 43.0, antenna_id = lte_sector_120, can_relay = false.
+3. lte_sector_240: tech = lte, freq_mhz = 450.0, tx_power_dbm = 43.0, antenna_id = lte_sector_240, can_relay = false.
+4. lte_client: tech = lte, freq_mhz = 450.0, tx_power_dbm = 20.0, antenna_id = lte_client_omni, can_relay = false.
+Cada interface deve referenciar exatamente uma das antenas anteriormente definidas.
+
+
+
+
+
+Mensagem 6 — Dispositivos e métrica
+Defina os dispositivos da seguinte forma:
+
+devices.lte_cell:
+- kind = tower
+- connected = true
+- can_route = true
+- rank = 0.0
+- interfaces = ["lte_sector_0", "lte_sector_120", "lte_sector_240"]
+devices.lte_leaf:
+- kind = field
+- connected = false
+- can_route = false
+- interfaces = ["lte_client"]
+Para o planejamento LTE, defina a métrica:
+
+metrics.lte = {spec = "lte_tower_node"}
+
+Não atribua rank ao perfil lte_leaf sem necessidade, nem crie dispositivos como cell_sector_3x120 ou cell_sector_2x120.
+
+
+
+
+
+Mensagem 7 — Vinculação ao CSV e validação
+A seção instances deve conter exatamente:
+- source = "nodes.csv"
+- format = "csv"
+- profile_column = "device_profile"
+Antes da confirmação, valide a completude e a consistência estrutural do cenário: referências de antenas e interfaces, tecnologia LTE, métrica, tipos e valores numéricos, além da existência dos perfis lte_cell e lte_leaf utilizados pelo CSV.
+
+Não gere o TOML enquanto houver erros ou campos obrigatórios ausentes. Apresente o resultado da validação e aguarde minha confirmação.
+
+
+
+
+
+Mensagem 8 — Confirmação final
+Enviar somente se a LLM informar que o cenário está válido e completo.Confirmo os parâmetros apresentados para este cenário experimental COPEL LTE 450.
+
+Finalize e salve o arquivo scenario.toml no projeto copel_novo, mantendo o nodes.csv existente inalterado.
+
+Não execute build_candidate_edges, cálculo de métricas, solução ou qualquer operação do serviço de planejamento.
