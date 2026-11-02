@@ -91,6 +91,10 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      - name: Clean artifact download directory
+        shell: bash
+        run: rm -rf wheel-artifact
+
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
         with:
@@ -207,6 +211,10 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      - name: Clean artifact download directory
+        shell: bash
+        run: rm -rf wheel-artifact
+
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
         with:
