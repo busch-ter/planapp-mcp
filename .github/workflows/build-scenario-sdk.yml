@@ -3,6 +3,8 @@ name: Build CISEI Scenario SDK
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     paths:
       - "packages/cisei-scenario-sdk/**"
       - ".github/workflows/build-scenario-sdk.yml"
@@ -77,7 +79,7 @@ jobs:
     if: >-
       github.repository == 'busch-ter/planapp-mcp' &&
       github.ref == 'refs/heads/main' &&
-      github.event_name == 'workflow_dispatch'
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, linux, x64, cisei-wheel-sync]
     permissions:
       actions: read
