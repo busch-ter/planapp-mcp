@@ -9,6 +9,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'cisei-pid/planapp-mcp'
     runs-on: ubuntu-latest
 
     steps:
