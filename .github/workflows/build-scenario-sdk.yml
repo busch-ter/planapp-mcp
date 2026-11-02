@@ -187,3 +187,119 @@ jobs:
 
           print("Índice atualizado:", index)
           PUBLISH_PY
+
+  publish_prod:
+    name: Publish wheel to PROD
+    needs: build
+    if: >-
+      github.repository == 'busch-ter/planapp-mcp' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, x64, cisei-wheel-sync-prod]
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+    concurrency:
+      group: cisei-scenario-sdk-publish-prod
+      cancel-in-progress: false
+
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cisei-scenario-sdk-wheel
+          path: wheel-artifact
+
+      - name: Validate and publish wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PUBLISH_PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          from hashlib import sha256
+          from html import escape
+          import os
+          import re
+          import tempfile
+
+          source_dir = Path("wheel-artifact")
+          destination = Path("/opt/cisei/wheels")
+          index = destination / "simple/cisei-scenario-sdk/index.html"
+
+          wheels = list(source_dir.glob("*.whl"))
+          if len(wheels) != 1:
+              raise RuntimeError(f"Esperado exatamente um wheel: {wheels}")
+
+          source = wheels[0]
+          if not re.fullmatch(
+              r"cisei_scenario_sdk-[0-9A-Za-z_.+]+-py3-none-any\.whl",
+              source.name,
+          ):
+              raise RuntimeError(f"Nome de wheel inesperado: {source.name}")
+
+          with ZipFile(source) as archive:
+              if archive.testzip() is not None:
+                  raise RuntimeError("Wheel ZIP inválido")
+              if not any(n.endswith(".dist-info/METADATA") for n in archive.namelist()):
+                  raise RuntimeError("Wheel sem METADATA")
+
+          target = destination / source.name
+          digest = lambda p: sha256(p.read_bytes()).hexdigest()
+
+          if target.exists():
+              if digest(source) != digest(target):
+                  raise RuntimeError(
+                      f"Wheel existente possui conteúdo diferente: {target}"
+                  )
+              print("Wheel idêntico já publicado:", target)
+          else:
+              with tempfile.NamedTemporaryFile(
+                  dir=destination, prefix=".wheel-", delete=False
+              ) as temp:
+                  temporary = Path(temp.name)
+                  with source.open("rb") as incoming:
+                      while chunk := incoming.read(1024 * 1024):
+                          temp.write(chunk)
+                  temp.flush()
+                  os.fsync(temp.fileno())
+
+              try:
+                  os.chmod(temporary, 0o644)
+                  os.link(temporary, target)
+              finally:
+                  temporary.unlink(missing_ok=True)
+
+              print("Wheel publicado:", target)
+
+          wheel_names = sorted(
+              p.name for p in destination.glob("cisei_scenario_sdk-*.whl")
+              if p.is_file()
+          )
+
+          lines = ["<!DOCTYPE html>", "<html>", "<body>"]
+          for name in wheel_names:
+              safe = escape(name, quote=True)
+              lines.append(f'<a href="../../{safe}">{safe}</a>')
+          lines.extend(["</body>", "</html>", ""])
+          content = "\n".join(lines)
+
+          index.parent.mkdir(parents=True, exist_ok=True)
+          with tempfile.NamedTemporaryFile(
+              mode="w", encoding="utf-8", dir=index.parent,
+              prefix=".index-", delete=False
+          ) as temp:
+              temporary_index = Path(temp.name)
+              temp.write(content)
+              temp.flush()
+              os.fsync(temp.fileno())
+
+          try:
+              os.chmod(temporary_index, 0o644)
+              os.replace(temporary_index, index)
+          finally:
+              temporary_index.unlink(missing_ok=True)
+
+          print("Índice atualizado:", index)
+          PUBLISH_PY
