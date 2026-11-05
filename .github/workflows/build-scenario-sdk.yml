@@ -201,7 +201,9 @@ jobs:
           WHEEL="$(find wheel-artifact -maxdepth 1 -name 'cisei_scenario_sdk-*.whl' -print -quit)"
           test -n "$WHEEL"
 
-          VERSION="$(basename "$WHEEL" | sed -E 's/^cisei_scenario_sdk-(.*)-py3-none-any\\.whl$/\\1/')"
+          VERSION="$(basename "$WHEEL")"
+          VERSION="${VERSION#cisei_scenario_sdk-}"
+          VERSION="${VERSION%-py3-none-any.whl}"
 
           mapfile -t JUPYTERS < <(
             docker ps --format '{{.Names}}' | grep '^jupyter-' || true
@@ -410,7 +412,9 @@ jobs:
           WHEEL="$(find wheel-artifact -maxdepth 1 -name 'cisei_scenario_sdk-*.whl' -print -quit)"
           test -n "$WHEEL"
 
-          VERSION="$(basename "$WHEEL" | sed -E 's/^cisei_scenario_sdk-(.*)-py3-none-any\\.whl$/\\1/')"
+          VERSION="$(basename "$WHEEL")"
+          VERSION="${VERSION#cisei_scenario_sdk-}"
+          VERSION="${VERSION%-py3-none-any.whl}"
 
           mapfile -t JUPYTERS < <(
             docker ps --format '{{.Names}}' | grep '^jupyter-' || true
