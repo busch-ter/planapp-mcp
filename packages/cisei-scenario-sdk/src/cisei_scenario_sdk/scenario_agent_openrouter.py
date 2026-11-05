@@ -57,6 +57,34 @@ class ScenarioAgentOpenRouter(ScenarioAgentOpenAI):
             domain_context_sections=domain_context_sections,
         )
 
+    def _system_prompt(self) -> str:
+        """Complementa o contrato compartilhado para OpenRouter."""
+        base = super()._system_prompt()
+
+        return base + """
+
+ORIENTAÇÕES DE EXECUÇÃO PARA OPENROUTER
+- Priorize update_scenario quando a mensagem atual contiver
+  valores explícitos que possam ser registrados com segurança.
+- Não escolha ask_user apenas porque o cenário completo
+  ainda possui campos obrigatórios ausentes.
+- Registre primeiro os valores explícitos disponíveis.
+- A validação do ScenarioBuilder identificará os campos
+  que ainda precisam ser fornecidos.
+- Não solicite novamente valores que já constem das mensagens
+  anteriores ou do estado canônico.
+- Não invente parâmetros para completar uma atualização.
+- Não crie antenas individuais por instalação quando o usuário
+  definiu perfis de antenas reutilizáveis.
+- Preserve os identificadores e as referências informados.
+- Não substitua especificações explícitas de métricas por
+  valores genéricos ou defaults.
+- Uma mensagem que fornece requisitos técnicos não equivale
+  a uma confirmação do cenário.
+- Somente confirme ou finalize quando houver autorização
+  explícita do usuário e o estado permitir.
+"""
+
     def _request_model(self, user_message: str) -> dict[str, Any]:
         if not isinstance(user_message, str):
             raise TypeError("user_message must be a string")
