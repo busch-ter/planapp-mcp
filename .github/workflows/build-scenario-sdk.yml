@@ -193,24 +193,55 @@ jobs:
 
           print("Índice atualizado:", index)
           PUBLISH_PY
-      - name: Install SDK and notebook in Jupyter
+      - name: Install SDK and notebook in all running Jupyter containers
         shell: bash
         run: |
           set -euo pipefail
 
-          JUPYTER="jupyter-fernando-2ebusch-40ter-2egrupomarista-2eorg-2ebr"
           WHEEL="$(find wheel-artifact -maxdepth 1 -name 'cisei_scenario_sdk-*.whl' -print -quit)"
           test -n "$WHEEL"
 
-          VERSION="$(basename "$WHEEL" | sed -E 's/^cisei_scenario_sdk-(.*)-py3-none-any\.whl$/\1/')"
+          VERSION="$(basename "$WHEEL" | sed -E 's/^cisei_scenario_sdk-(.*)-py3-none-any\\.whl$/\\1/')"
 
-          docker inspect "$JUPYTER" >/dev/null
+          mapfile -t JUPYTERS < <(
+            docker ps --format '{{.Names}}' | grep '^jupyter-' || true
+          )
 
-          docker exec -u 0 "$JUPYTER"             python -m pip install               --no-deps --no-cache-dir --upgrade               --index-url http://cisei-packages/simple/               --trusted-host cisei-packages               "cisei-scenario-sdk==$VERSION"
+          echo "Containers encontrados: ${#JUPYTERS[@]}"
 
-          docker exec -u jovyan "$JUPYTER"             python -m cisei_scenario_sdk.install_notebooks --update
+          failures=0
 
-          docker exec -i -u jovyan "$JUPYTER"             python - "$VERSION" <<'VERIFY_PY'
+          for JUPYTER in "${JUPYTERS[@]}"; do
+            echo "===== $JUPYTER ====="
+
+            if ! docker exec -u jovyan "$JUPYTER" \
+              test -d /home/jovyan/work; then
+              echo "IGNORADO: workspace JupyterHub não identificado"
+              continue
+            fi
+
+            if ! docker exec -u 0 "$JUPYTER" \
+              python -m pip install \
+              --no-deps --no-cache-dir --upgrade \
+              --index-url http://cisei-packages/simple/ \
+              --trusted-host cisei-packages \
+              "cisei-scenario-sdk==$VERSION"; then
+
+              echo "ERRO: instalação do SDK em $JUPYTER"
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if ! docker exec -u jovyan "$JUPYTER" \
+              python -m cisei_scenario_sdk.install_notebooks --update; then
+
+              echo "ERRO: instalação do notebook em $JUPYTER"
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if ! docker exec -i -u jovyan "$JUPYTER" \
+              python - "$VERSION" <<'VERIFY_PY'
           import hashlib
           import importlib.metadata
           from importlib.resources import files
@@ -222,20 +253,34 @@ jobs:
           assert installed == version, (installed, version)
 
           name = "CISEI_Scenario_Builder.ipynb"
+
           expected = files("cisei_scenario_sdk").joinpath(
               "resources", "notebooks", name
           ).read_bytes()
+
           destination = (
               Path("/home/jovyan/work/cisei_workspace/notebooks") / name
           )
+
           actual = destination.read_bytes()
 
           assert hashlib.sha256(actual).digest() == hashlib.sha256(expected).digest()
+
           print("SDK:", installed)
           print("Notebook:", destination)
-          print("SHA-256:", hashlib.sha256(actual).hexdigest())
           print("DEPLOY VALIDADO")
           VERIFY_PY
+            then
+              echo "ERRO: verificação em $JUPYTER"
+              failures=$((failures + 1))
+            fi
+          done
+
+          if (( failures > 0 )); then
+            echo "Falhas no deploy: $failures"
+            exit 1
+          fi
+
 
 
   publish_prod:
@@ -357,24 +402,55 @@ jobs:
 
           print("Índice atualizado:", index)
           PUBLISH_PY
-      - name: Install SDK and notebook in Jupyter
+      - name: Install SDK and notebook in all running Jupyter containers
         shell: bash
         run: |
           set -euo pipefail
 
-          JUPYTER="jupyter-fernando-2ebusch-40ter-2egrupomarista-2eorg-2ebr"
           WHEEL="$(find wheel-artifact -maxdepth 1 -name 'cisei_scenario_sdk-*.whl' -print -quit)"
           test -n "$WHEEL"
 
-          VERSION="$(basename "$WHEEL" | sed -E 's/^cisei_scenario_sdk-(.*)-py3-none-any\.whl$/\1/')"
+          VERSION="$(basename "$WHEEL" | sed -E 's/^cisei_scenario_sdk-(.*)-py3-none-any\\.whl$/\\1/')"
 
-          docker inspect "$JUPYTER" >/dev/null
+          mapfile -t JUPYTERS < <(
+            docker ps --format '{{.Names}}' | grep '^jupyter-' || true
+          )
 
-          docker exec -u 0 "$JUPYTER"             python -m pip install               --no-deps --no-cache-dir --upgrade               --index-url http://cisei-packages/simple/               --trusted-host cisei-packages               "cisei-scenario-sdk==$VERSION"
+          echo "Containers encontrados: ${#JUPYTERS[@]}"
 
-          docker exec -u jovyan "$JUPYTER"             python -m cisei_scenario_sdk.install_notebooks --update
+          failures=0
 
-          docker exec -i -u jovyan "$JUPYTER"             python - "$VERSION" <<'VERIFY_PY'
+          for JUPYTER in "${JUPYTERS[@]}"; do
+            echo "===== $JUPYTER ====="
+
+            if ! docker exec -u jovyan "$JUPYTER" \
+              test -d /home/jovyan/work; then
+              echo "IGNORADO: workspace JupyterHub não identificado"
+              continue
+            fi
+
+            if ! docker exec -u 0 "$JUPYTER" \
+              python -m pip install \
+              --no-deps --no-cache-dir --upgrade \
+              --index-url http://cisei-packages/simple/ \
+              --trusted-host cisei-packages \
+              "cisei-scenario-sdk==$VERSION"; then
+
+              echo "ERRO: instalação do SDK em $JUPYTER"
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if ! docker exec -u jovyan "$JUPYTER" \
+              python -m cisei_scenario_sdk.install_notebooks --update; then
+
+              echo "ERRO: instalação do notebook em $JUPYTER"
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if ! docker exec -i -u jovyan "$JUPYTER" \
+              python - "$VERSION" <<'VERIFY_PY'
           import hashlib
           import importlib.metadata
           from importlib.resources import files
@@ -386,18 +462,31 @@ jobs:
           assert installed == version, (installed, version)
 
           name = "CISEI_Scenario_Builder.ipynb"
+
           expected = files("cisei_scenario_sdk").joinpath(
               "resources", "notebooks", name
           ).read_bytes()
+
           destination = (
               Path("/home/jovyan/work/cisei_workspace/notebooks") / name
           )
+
           actual = destination.read_bytes()
 
           assert hashlib.sha256(actual).digest() == hashlib.sha256(expected).digest()
+
           print("SDK:", installed)
           print("Notebook:", destination)
-          print("SHA-256:", hashlib.sha256(actual).hexdigest())
           print("DEPLOY VALIDADO")
           VERIFY_PY
+            then
+              echo "ERRO: verificação em $JUPYTER"
+              failures=$((failures + 1))
+            fi
+          done
+
+          if (( failures > 0 )); then
+            echo "Falhas no deploy: $failures"
+            exit 1
+          fi
 
