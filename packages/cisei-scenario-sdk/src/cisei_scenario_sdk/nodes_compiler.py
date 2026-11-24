@@ -205,9 +205,20 @@ class NodesCompiler:
                 y = cls._number(row["y"], field="y", row_number=row_number, required=False)
                 if (x is None) != (y is None):
                     raise ValueError("x e y devem estar ambos preenchidos ou ambos vazios.")
-                for field in ("x", "y", "rank"):
+                for field in ("x", "y"):
                     if row[field]:
                         cls._number(row[field], field=field, row_number=row_number, required=False)
+
+                if row["rank"]:
+                    rank = float(row["rank"])
+
+                    if math.isnan(rank) or rank == float("-inf"):
+                        raise ValueError("rank inválido.")
+
+                    if math.isinf(rank) and row["connected"] != "FALSE":
+                        raise ValueError(
+                            "rank infinito permitido somente para nós desconectados."
+                        )
 
                 validated.append(row)
             except (ValueError, AssertionError) as exc:

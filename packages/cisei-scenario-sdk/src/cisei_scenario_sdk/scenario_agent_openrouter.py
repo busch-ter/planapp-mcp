@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from typing import Any
 
 from openai import OpenAI
@@ -85,6 +86,57 @@ ORIENTAÇÕES DE EXECUÇÃO PARA OPENROUTER
   explícita do usuário e o estado permitir.
 """
 
+
+    def _guard_update_action(
+        self,
+        action: dict[str, Any],
+        user_message: str,
+    ) -> dict[str, Any]:
+        """Bloqueia criação de perfis sem identificador explícito."""
+
+        if action.get("action") != "update_scenario":
+            return action
+
+        updates = action.get("updates")
+
+        if not isinstance(updates, dict):
+            return action
+
+        sections = ("antennas", "interfaces", "devices", "metrics")
+        unsupported = []
+
+        for section in sections:
+            entries = updates.get(section, {})
+
+            if not isinstance(entries, dict):
+                continue
+
+            for identifier in entries:
+                pattern = (
+                    r"(?<![A-Za-z0-9_])"
+                    + re.escape(identifier)
+                    + r"(?![A-Za-z0-9_])"
+                )
+
+                if re.search(pattern, user_message) is None:
+                    unsupported.append(f"{section}.{identifier}")
+
+        if not unsupported:
+            return action
+
+        return {
+            "action": "ask_user",
+            "question": (
+                "A atualização proposta contém perfis cujos "
+                "identificadores não foram informados explicitamente "
+                "na mensagem atual: "
+                + ", ".join(unsupported)
+                + ". Nenhuma alteração foi aplicada. "
+                "Forneça as definições técnicas explicitamente."
+            ),
+            "fields": unsupported,
+        }
+
     def _request_model(self, user_message: str) -> dict[str, Any]:
         if not isinstance(user_message, str):
             raise TypeError("user_message must be a string")
@@ -165,6 +217,78 @@ ORIENTAÇÕES DE EXECUÇÃO PARA OPENROUTER
         if not isinstance(action, dict):
             raise ScenarioAgentOpenAIError(
                 "OpenRouter response must be a JSON object"
+            )
+
+        if action.get("action") == "ask_user":
+            review_messages = [
+                *messages,
+                {
+                    "role": "assistant",
+                    "content": output,
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "REVISÃO DE AÇÃO OPENROUTER\n"
+                        "Antes de perguntar pelos campos restantes, "
+                        "verifique exclusivamente a MENSAGEM ATUAL "
+                        "DO USUÁRIO e o estado canônico. "
+                        "Se houver valores técnicos explícitos ainda "
+                        "não registrados, retorne update_scenario "
+                        "com somente esses valores. "
+                        "Não invente valores, não use defaults e "
+                        "não antecipe perguntas sobre parâmetros "
+                        "que serão fornecidos posteriormente. "
+                        "Se não houver atualização segura, "
+                        "mantenha a ação ask_user. "
+                        "Responda somente com JSON."
+                    ),
+                },
+            ]
+
+            try:
+                review_response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=review_messages,
+                    response_format={"type": "json_object"},
+                )
+
+                if (
+                    review_response.choices
+                    and review_response.choices[0].finish_reason != "length"
+                ):
+                    review_output = (
+                        review_response.choices[0].message.content
+                    )
+
+                    if isinstance(review_output, str):
+                        review_action = json.loads(review_output)
+
+                        if (
+                            isinstance(review_action, dict)
+                            and review_action.get("action")
+                            == "update_scenario"
+                            and isinstance(
+                                review_action.get("updates"), dict
+                            )
+                            and review_action["updates"]
+                        ):
+                            action = review_action
+                            output = review_output
+
+            except (ValueError, AttributeError, IndexError):
+                pass
+
+        guarded_action = self._guard_update_action(
+            action,
+            user_message,
+        )
+
+        if guarded_action is not action:
+            action = guarded_action
+            output = json.dumps(
+                action,
+                ensure_ascii=False,
             )
 
         self._pending_exchange = [

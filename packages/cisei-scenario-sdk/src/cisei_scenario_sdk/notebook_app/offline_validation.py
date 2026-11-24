@@ -128,8 +128,23 @@ def validate_project(project: str | Path, *, toml_text: str | None = None) -> di
                         if (row.get(k) or '').strip().lower() not in ('true','false','1','0'):
                             errors.append(f'nodes.csv linha {rownum}: {k} não é booleano.')
                     rank = (row.get('rank') or '').strip()
-                    if rank and _number(rank) is None:
-                        errors.append(f'nodes.csv linha {rownum}: rank inválido.')
+                    if rank:
+                        try:
+                            rank_value = float(rank)
+                            connected = (row.get('connected') or '').strip().lower()
+                            invalid_rank = (
+                                math.isnan(rank_value)
+                                or rank_value == float('-inf')
+                                or (
+                                    math.isinf(rank_value)
+                                    and connected not in ('false', '0')
+                                )
+                            )
+                        except (ValueError, OverflowError):
+                            invalid_rank = True
+
+                        if invalid_rank:
+                            errors.append(f'nodes.csv linha {rownum}: rank inválido.')
                 info['nodes_count'] = count
                 info['profiles_used'] = sorted(profiles)
                 if count == 0: errors.append('nodes.csv sem instâncias.')
